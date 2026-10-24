@@ -1,0 +1,24 @@
+[package]
+name = "novagpt-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "novagpt"
+path = "src/main.rs"
+
+[dependencies]
+novagpt-core = { path = "../novagpt-core" }
+novagpt-mcp = { path = "../novagpt-mcp" }
+novagpt-vm = { path = "../novagpt-vm" }
+novagpt-agents = { path = "../novagpt-agents" }
+novagpt-browser = { path = "../novagpt-browser" }
+tokio.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true

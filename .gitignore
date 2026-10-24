@@ -1,0 +1,7 @@
+/target/
+/.idea/
+/.vscode/
+*.local
+.env
+.env.*
+!*.example
