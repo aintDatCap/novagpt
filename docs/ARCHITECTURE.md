@@ -23,7 +23,7 @@ novagpt-cli
 
 - **novagpt-core:** workspace registry and root-derived IDs, guard/blocked paths, text reads, bounded tree/search, optimistic SHA-256 writes with per-file locks. Must never depend on MCP, HTTP or CLI.
 - **novagpt-mcp:** official rmcp adapters, tool schemas, result envelopes and HTTP/stdin transports. Stateless per-call workspace targeting with a shared registry; no chat IDs.
-- **novagpt-cli:** argument parsing, immutable startup root/allow-list settings and the `novagpt` binary. Currently stdio and token-protected loopback HTTP only. Logs go to stderr, never protocol stdout.
+- **novagpt-cli:** CLI parsing, per-workspace `.novagpt/config.json`, local Ratatui 3-tab console, interactive setup/optional read-only CodexPro port import, stdio and token-protected loopback HTTP. The TUI displays bounded launcher lifecycle events and errors; full MCP tracing and CLI feature parity are not yet implemented. MCP stdio logs go to stderr, never protocol stdout.
 - **novagpt-vm (opt-in):** independent NovaGPT VM home, approved image import, VM image listing and host create/status/destroy with Windows Hyper-V or QEMU; guest control is not implemented. See [VM_AND_SUBAGENTS.md](VM_AND_SUBAGENTS.md).
 - **novagpt-agents + novagpt-browser (opt-in):** bounded asynchronous subagent state + a dedicated visible Chrome CDP driver. Browser login/verification requires the user; live UI behavior and project automation are not verified.
 - **Future modules:** Git/commands/analysis, generic browsers, VM guest controls, skills/handoff/Pro, widgets, Codex history, tunnels and platform management. Keep optional frameworks out of the core domain dependency graph.

@@ -257,6 +257,7 @@ pub(crate) fn blocked(path: &Path) -> bool {
                 | ".gnupg"
                 | ".env"
                 | ".codexpro"
+                | ".novagpt"
                 | "node_modules"
                 | "target"
                 | "id_rsa"
@@ -307,6 +308,10 @@ mod tests {
         ));
         assert!(matches!(
             registry.resolve(None, ".git/config", false),
+            Err(NovaError::BlockedPath)
+        ));
+        assert!(matches!(
+            registry.resolve(None, ".novagpt/config.json", false),
             Err(NovaError::BlockedPath)
         ));
     }

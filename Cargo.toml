@@ -28,3 +28,5 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
+ratatui = "0.29"
+crossterm = "0.28"

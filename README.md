@@ -4,7 +4,9 @@
 
 Architecture: `novagpt-core` (workspace/security/file operations), `novagpt-mcp` (official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk), transports), and `novagpt-cli` (binary/configuration).
 
-## Build
+## Build and Ratatui TUI
+
+`novagpt` without a subcommand opens an interactive, three-tab terminal UI for the current directory (or `--root`). `novagpt --setup` opens the same TUI on its setup tab and, when you press `s`, saves the local configuration and installs a launcher under `<workspace>/.novagpt/`. The optional CodexPro import is **read-only and port-only**; no credentials or browser/VM data are copied. See [TUI setup instructions](docs/TUI_SETUP.md).
 
 ```powershell
 cargo build --workspace
@@ -22,13 +24,13 @@ The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP requires a token; stdio d
 
 ## Status
 
-This is an **early vertical slice**, not a complete port. The normal tool surface includes workspace open, tree, search, read, write and edit. Initial optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, browser projects, richer CodexPro tool behavior, CLI/release parity and all differential checks remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md). See [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
+This is an **early vertical slice**, not a complete port. The normal tool surface includes workspace open, tree, search, read, write and edit. Initial optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, browser projects, richer CodexPro tool behavior, CLI/release parity and all differential checks remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
 
 CodexPro remains the reference oracle and production implementation until parity and rollback have been validated.
 
 ## Optional VMs and ChatGPT Browser subagents
 
-Both are **off by default**, require explicit runtime flags and are not part of ordinary file operations. For managed Hyper-V/QEMU images use `--vm-home <NEW_DIRECTORY>` and the human-only `vm-import` CLI command. For browser subagents use `--chatgpt-chrome <CHROME_EXE> --chatgpt-profile <FRESH_PROFILE_DIRECTORY>`; login and verification must be manual. See [setup, capabilities, security and gaps](docs/VM_AND_SUBAGENTS.md).
+Both are **off by default**, can be enabled either by explicit runtime flags or by a saved per-workspace TUI configuration, and are not part of ordinary file operations. For managed Hyper-V/QEMU images use `--vm-home <NEW_DIRECTORY>` and the human-only `vm-import` CLI command. For browser subagents use `--chatgpt-chrome <CHROME_EXE> --chatgpt-profile <FRESH_PROFILE_DIRECTORY>`; login and verification must be manual. See [setup, capabilities, security and gaps](docs/VM_AND_SUBAGENTS.md).
 
 ## Contributing and scaling
 

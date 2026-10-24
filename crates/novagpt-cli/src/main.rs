@@ -1,14 +1,18 @@
 //! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
+mod settings;
+mod tui;
+
 use clap::{Parser, Subcommand};
 use novagpt_agents::{AgentManager, ChatGptBackend};
 use novagpt_browser::ChatGptBrowser;
 use novagpt_core::WorkspaceRegistry;
 use novagpt_mcp::NovaExtras;
 use novagpt_vm::VmManager;
-use std::sync::Arc;
+use settings::LocalSettings;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    sync::Arc,
 };
 
 #[derive(Parser)]
@@ -18,19 +22,25 @@ use std::{
     about = "NovaGPT — independent Rust MCP coding server"
 )]
 struct Cli {
-    /// Default allowed workspace. Omitted workspace_id always resolves here.
+    /// Workspace directory (defaults to the current working directory).
     #[arg(long, default_value = ".")]
     root: PathBuf,
-    /// Additional approved workspace root (repeatable).
+    /// Launch interactive Ratatui setup for the selected workspace.
+    #[arg(long)]
+    setup: bool,
+    /// Read-only directory containing CodexPro profiles for optional import.
+    #[arg(long)]
+    codexpro_home: Option<PathBuf>,
+    /// Extra explicitly approved workspace root; repeatable.
     #[arg(long = "allow-root")]
     allow_root: Vec<PathBuf>,
-    /// Explicit, separate NovaGPT VM home. VM operations are disabled unless set.
+    /// Explicit NovaGPT VM storage path; overrides local settings.
     #[arg(long)]
     vm_home: Option<PathBuf>,
-    /// Local visible Chrome executable for opt-in ChatGPT Browser subagents.
+    /// Dedicated Chrome executable; overrides local settings.
     #[arg(long)]
     chatgpt_chrome: Option<PathBuf>,
-    /// Dedicated persistent Chrome profile for subagents, never a personal or CodexPro profile.
+    /// Dedicated browser profile path; never reuse a personal or CodexPro profile.
     #[arg(long)]
     chatgpt_profile: Option<PathBuf>,
     #[command(subcommand)]
@@ -39,14 +49,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the MCP server via standard input/output.
+    /// Run the MCP server over stdin/stdout (for MCP clients).
     Stdio,
     /// Start a token-protected Streamable HTTP MCP server on loopback.
     Http {
-        #[arg(long, default_value_t = 8787)]
-        port: u16,
+        /// Explicit port overrides the workspace's saved port.
+        #[arg(long)]
+        port: Option<u16>,
     },
-    /// Human-only import of an approved qcow2/VHDX disk into NovaGPT's isolated VM image store.
+    /// Import an approved qcow2/VHDX disk to NovaGPT's owned VM image store.
     VmImport {
         #[arg(long)]
         name: String,
@@ -62,6 +73,23 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let root = std::fs::canonicalize(&cli.root)?;
+    if !root.is_dir() {
+        return Err("workspace root must be an existing directory".into());
+    }
+    if cli.setup && cli.command.is_some() {
+        return Err("--setup cannot be combined with a server subcommand".into());
+    }
+    let local = LocalSettings::load(&root)?;
+    if cli.setup || cli.command.is_none() {
+        let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
+        let profiles = settings::discover_codexpro_profiles(&home)?;
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || tui::run(root, local, cli.setup, profiles, handle))
+            .await??;
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -69,9 +97,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "novagpt=info".into()),
         )
         .init();
-    let workspaces = WorkspaceRegistry::new(cli.root, &cli.allow_root)?;
-    let vm = cli.vm_home.map(VmManager::new).transpose()?;
-    let agents = match (cli.chatgpt_chrome, cli.chatgpt_profile) {
+
+    let mut approved_roots = local.allowed_roots;
+    approved_roots.extend(cli.allow_root);
+    let workspaces = WorkspaceRegistry::new(&root, &approved_roots)?;
+    let vm_home = cli.vm_home.or_else(|| {
+        local
+            .vm_enabled
+            .then(|| settings::local_dir(&root).join("vms"))
+    });
+    let vm = vm_home.map(VmManager::new).transpose()?;
+    let browser_enabled = local.browser_enabled;
+    let chrome = cli.chatgpt_chrome.or(if browser_enabled {
+        local.chrome_executable
+    } else {
+        None
+    });
+    let profile = cli
+        .chatgpt_profile
+        .or_else(|| browser_enabled.then(|| settings::local_dir(&root).join("browser")));
+    let agents = match (chrome, profile) {
         (Some(executable), Some(profile)) => {
             let browser = ChatGptBrowser::new(executable, profile)?;
             Some(AgentManager::new(
@@ -83,28 +128,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
     };
     let extras = NovaExtras { vm, agents };
-    match cli.command.unwrap_or(Command::Stdio) {
-        Command::Stdio => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
-        Command::Http { port } => {
+    match cli.command {
+        Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
+        Some(Command::Http { port }) => {
             let token = std::env::var("NOVAGPT_HTTP_TOKEN")
                 .map_err(|_| "NOVAGPT_HTTP_TOKEN is required for HTTP transport")?;
             novagpt_mcp::run_http_with(
                 workspaces,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.unwrap_or(local.port)),
                 token,
                 extras,
             )
             .await?;
         }
-        Command::VmImport {
+        Some(Command::VmImport {
             name,
             source,
             cpus,
             memory_mb,
-        } => {
+        }) => {
             let vm = extras
                 .vm
-                .ok_or("--vm-home must be provided for vm-import")?;
+                .ok_or("--vm-home or local VM configuration required")?;
             let image = vm.import_image(&name, &source, cpus, memory_mb)?;
             println!(
                 "Imported approved {} VM image {} ({} bytes)",
@@ -116,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.bytes
             );
         }
+        None => unreachable!("TUI was handled before server startup"),
     }
     Ok(())
 }

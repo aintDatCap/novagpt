@@ -1,4 +1,5 @@
 /target/
+.novagpt/
 /.idea/
 /.vscode/
 *.local
