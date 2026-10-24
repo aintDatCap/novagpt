@@ -1,0 +1,70 @@
+# NovaGPT ↔ CodexPro parity ledger
+
+For requirements and how to record actual evidence, see [QUALITY_GATES.md](QUALITY_GATES.md). For the multi-chat design and module boundaries, see [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md).
+
+Baseline: CodexPro TypeScript commit `ae2562d`, 2026-10-24. This document belongs to **NovaGPT**, a separate repository. No changes to CodexPro, launcher, installed profiles or state are authorized by this ledger.
+
+**Statuses:** `INITIAL` = Rust code exists but TS differential parity has **not** been demonstrated; `NOT STARTED` = no Rust port; `VERIFIED` = recorded TS/Rust oracle comparison with matching external behavior. Neither INITIAL nor compilation alone means parity.
+
+| Contract and exact TypeScript tool names | CodexPro TS source | NovaGPT Rust source / owner | Status |
+| --- | --- | --- | --- |
+| `open_current_workspace`, `open_workspace` | `src/server.ts`, `src/guard.ts` | `novagpt-core/src/workspace.rs`, `novagpt-mcp/src/lib.rs` | INITIAL; output/schema parity pending |
+| `tree`, `search`, `read` | `src/server.ts`, `src/fsOps.ts`, `src/searchOps.ts` | `novagpt-core/src/fs_ops.rs`, `novagpt-mcp/src/lib.rs` | INITIAL; depth, regex/search, output caps and schema parity pending |
+| `write`, `edit` | `src/server.ts`, `src/fsOps.ts`, `src/guard.ts` | `novagpt-core/src/fs_ops.rs`, `novagpt-mcp/src/lib.rs` | INITIAL; Windows atomicity, complete CAS/schema parity pending |
+| `runtime_status`, `reconnect_workspace`, `read_output`, `codexpro`, `server_config`, `codexpro_self_test`, `codexpro_inventory` | `src/server.ts`, `src/runtimeServices.ts`, `src/outputStore.ts` | planned `novagpt-mcp`, `novagpt-core` | NOT STARTED |
+| `list_workspaces`, `workspace_snapshot`, `inspect_workspace` | `src/server.ts`, `src/analysis/` | planned `novagpt-core` | NOT STARTED |
+| `view_image`, `apply_patch`, `import_file` | `src/imageOps.ts`, `src/server.ts`, `src/importOps.ts` | planned `novagpt-core` | NOT STARTED |
+| `git_status`, `git_diff`, `git`, `show_changes` | `src/gitOps.ts`, `src/gitService.ts`, `src/server.ts` | planned `novagpt-core::git` | NOT STARTED |
+| `bash` | `src/bashOps.ts`, `src/commandSafety.ts`, `src/commandShell.ts` | planned `novagpt-core::command` | NOT STARTED |
+| `load_skill`, `read_handoff`, `wait_for_handoff`, `codex_context`, `export_pro_context`, `handoff_to_agent`, `handoff_to_codex` | `src/capabilitiesOps.ts`, `src/workspaceOps.ts`, `src/proContext.ts` | planned optional adapters | NOT STARTED |
+| `vm` (images/create/status/destroy), `vm_guest_status` | `src/vm/` | `novagpt-vm`, `novagpt-mcp` | INITIAL; owned store/host actions implemented; Hyper-V/QEMU real integration and TS parity unverified, guest status reports unavailable |
+| `vm_exec`, `vm_upload`, `vm_download` | `src/vm/guestControl.ts`, `src/vm/mcp.ts` | planned guest-control adapter | NOT STARTED; guest credentials, QGA and PowerShell Direct require secure implementation |
+| `browser`, `browser_preview` (generic web Playwright tools) | `src/browserManager.ts` | planned generic browser adapter | NOT STARTED; ChatGPT subagent CDP driver is a distinct feature |
+| `subagent_spawn`, `subagent_message`, `subagent_resume`, `subagent_browser_diagnostics`, `subagent_status`, `subagent_result`, `subagent_cancel` | `src/agentManager.ts`, `src/chatgptBrowser*.ts` | `novagpt-agents`, `novagpt-browser`, `novagpt-mcp` | INITIAL; server-scoped async manager + Chrome CDP; live browser/project, implementer worktree and TS differential parity NOT VERIFIED |
+| `codex_sessions`, `read_codex_session` (opt-in) | `src/codexSessions.ts`, `src/server.ts` | planned optional history adapter | NOT STARTED |
+| MCP tool-card resource, legacy URIs/metadata | `src/toolCardWidget.ts`, `src/server.ts` | planned optional `novagpt-mcp` resource module | NOT STARTED |
+| MCP stdio transport | `src/stdio.ts` | `novagpt-mcp/src/lib.rs` | INITIAL; wire parity pending |
+| MCP Streamable HTTP (POST/GET/DELETE /mcp), SSE lifecycle, auth/session limits/TTL | `src/http.ts` | `novagpt-mcp/src/lib.rs` via official `rmcp` 3.7.0 | INITIAL; full legacy multi-connection/TTL/auth parity pending |
+| CLI setup/start/settings/doctor/connection-test/inspect/review | `scripts/codexpro.mjs`, `src/config.ts`, `src/profileStore.ts` | `novagpt-cli` (stdio/http startup only) | NOT STARTED for CodexPro CLI parity |
+| CLI VM, browser profiles, Pro, handoff/watch/loop, tunnels, release/Windows keep-awake | `scripts/codexpro.mjs`, `scripts/vm-cli.mjs`, `scripts/pro-*.mjs`, `scripts/windows-keep-awake.*` | `novagpt-cli` for human-only `vm-import`, `--vm-home`, `--chatgpt-chrome`, `--chatgpt-profile`; other adapters planned | INITIAL for listed flags/import only; all other CLI parity NOT STARTED |
+
+Source-of-truth for exposed tool sets: `src/server.ts` (`MINIMAL_TOOL_NAMES`, `STANDARD_TOOL_NAMES`, `FULL_TOOL_NAMES`, `toolNamesForMode`, `shouldRegisterTool`). The TS standard/full surfaces are **not** exposed by NovaGPT yet. Enabled/disabled, write/handoff, bash modes, optional histories and connection-test must be frozen into golden fixtures and implemented explicitly, never falsely advertised.
+
+## Required product guarantees
+
+Source: CodexPro `docs/PRODUCT_USE_CASE.md`.
+
+1. One MCP server can serve multiple ordinary ChatGPT conversations simultaneously, intentionally sharing one real filesystem/Git tree without mandatory client ID or per-chat lease.
+2. A protocol `Mcp-Session-Id` is a **transport** identifier, not a ChatGPT conversation identity; auth is not conversation identity either.
+3. Missing workspace ID always resolves to one configured default root; opening another allowed root cannot implicitly retarget a different caller.
+4. Concurrent independent edits must remain possible; stale `expected_sha256` rejects conflicts. Git index and shell effects remain shared.
+5. Optional browser/VM/subagent/Pro must never become prerequisites for ordinary file/Git tools.
+6. Allowed roots, blocked sensitive files, symlink and traversal restrictions, output redaction, bounded resources and safe shutdown hold under concurrency.
+
+## Gates (none are TS/Rust differential VERIFIED)
+
+| Gate | Acceptance evidence required | Current |
+| --- | --- | --- |
+| G0 TS oracle | Extract exact tool descriptors/input schemas, `content`/`structuredContent`/`isError`/metadata, errors, resources, flags/modes from TS; record fixture hashes | PENDING |
+| G1 basic tools | Same success/error fixtures and filesystem postconditions for workspace/tree/search/read/write/edit in TS/Rust | PENDING |
+| G2 multi-chat | Separate transports against same root, different edits, stale-hash conflict, root isolation, reconnect | PENDING |
+| G3 security | traversal, symlink swap/TOCTOU, blocked keys, binary/read/write size limits, secrets in logs, permissions, CAS | PENDING |
+| G4 HTTP/stdio | protocol initialize, tools/list, POST/GET/DELETE, SSE held open, parallel initializations, exhausted sessions, TTL/pause/recovery, auth | PENDING |
+| G5 CLI/config | `codexpro` launcher parity captured via new `novagpt` commands, env/config precedence, profiles, tunnels, setup/doctor, rollback | PENDING |
+| G6 optional integrations | Git/commands/analysis, browser/subagents, VM QEMU+Hyper-V, widgets, handoff/skills/history | PENDING |
+| G7 Rust quality | fmt, clippy -D warnings, check, tests, Windows release and cross-platform builds with output recorded | Verify after every milestone |
+| G8 release | independent security review, complete regression/stress suite, no destructive profile migration, explicit rollback and parent authorization | PENDING |
+
+Candidate TS smoke oracles: `scripts/http-multiconnection-smoke.mjs`, `scripts/shared-workspace-smoke.mjs`, `scripts/http-smoke.mjs`, `scripts/skill-precedence-smoke.mjs`, `scripts/agent-harness-smoke.mjs`, `scripts/vm-guest-smoke.mjs`, `scripts/hyperv-smoke.mjs`, `scripts/logging-smoke.mjs`, `scripts/launcher-liveness-smoke.mjs`, and the `npm test` script in CodexPro `package.json`. Listing a test does **not** mean it was executed or passed.
+
+### Evidence ledger
+
+| Date | Component | Command/runtime | Actual output | Status |
+| --- | --- | --- | --- | --- |
+| 2026-10-24 | Rust quality (6 crates) | `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace` (Windows, Rust 1.97.1) | Formatting applied, Clippy and check passed, exit code 0 | INITIAL; no TS parity |
+| 2026-10-24 | Core + VM + browser + subagents + stdio protocol | `cargo test --workspace` (Windows) | 16 tests passed across core (6), VM (3), browser (2), agents (3), real stdio MCP (2, including enabled VM images); 0 failures; exit code 0. No real guest/Chrome ChatGPT runtime exercised | INITIAL; no TS parity |
+| 2026-10-24 | Documentation consistency | Local Markdown target scan | 10 Markdown files scanned, 0 missing local links; exit code 0 | Documentation check only |
+
+See [VM_AND_SUBAGENTS.md](VM_AND_SUBAGENTS.md) for exactly implemented and unavailable VM/ChatGPT Browser features. New optional tools are currently listed even when disabled; invocation fails. This differs from CodexPro's registration gating.
+
+Change this ledger only after actual command output; TS vs Rust comparison is still unperformed.
