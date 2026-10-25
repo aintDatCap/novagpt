@@ -21,7 +21,7 @@ novagpt-cli
   └─ novagpt-core
 ```
 
-- **novagpt-core:** workspace registry and root-derived IDs, guard/blocked paths, text reads, bounded tree/search, optimistic SHA-256 writes, initial guarded Git/command/patch/attachment import operations, per-file mutation locks and per-root async Git locks. Must never depend on MCP, HTTP or CLI.
+- **novagpt-core:** workspace registry and root-derived IDs, guard/blocked paths, text reads, bounded tree/search, optimistic SHA-256 writes, initial guarded Git/command/patch/attachment import and raster-image read operations, per-file mutation locks and per-root async Git locks. Must never depend on MCP, HTTP or CLI.
 - **novagpt-mcp:** official rmcp adapters, tool schemas, result envelopes and HTTP/stdin transports. Stateless per-call workspace targeting with a shared registry; no chat IDs.
 - **novagpt-cli:** CLI parsing, per-workspace `.novagpt/config.json`, local Ratatui 3-tab console, guided setup/optional read-only CodexPro port import, stdio and token-protected loopback HTTP. CLI-only ngrok exposure is experimental and strictly opt-in; the ngrok subprocess is owned by the HTTP launcher and its request inspector is disabled. Bash modes are configured at startup. Full MCP tracing and CLI feature parity are not yet implemented. MCP stdio logs go to stderr, never protocol stdout.
 - **novagpt-vm (opt-in):** independent NovaGPT VM home, approved image import, VM image listing and host create/status/destroy with Windows Hyper-V or QEMU; guest control is not implemented. See [VM_AND_SUBAGENTS.md](VM_AND_SUBAGENTS.md).

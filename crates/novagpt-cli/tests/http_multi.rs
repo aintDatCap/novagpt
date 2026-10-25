@@ -53,6 +53,8 @@ async fn rpc(
 async fn separate_http_sessions_share_files_and_conflicts() {
     let root = tempfile::tempdir().expect("workspace");
     std::fs::write(root.path().join("shared.txt"), "original").expect("fixture");
+    let alternate = tempfile::tempdir().expect("second authorized root");
+    std::fs::write(alternate.path().join("alternate.txt"), "separate").expect("second fixture");
     let private = tempfile::tempdir().expect("private state");
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("temporary TCP port");
     let port = listener.local_addr().expect("addr").port();
@@ -61,6 +63,8 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_novagpt"));
     cmd.arg("--root")
         .arg(root.path())
+        .arg("--allow-root")
+        .arg(alternate.path())
         .arg("http")
         .arg("--port")
         .arg(port.to_string())
@@ -115,6 +119,39 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         "second initialization"
     );
     assert_ne!(sid_a, sid_b, "independent protocol transports must differ");
+
+    let open_alternate = json!({"jsonrpc":"2.0","id":20,"method":"tools/call",
+    "params":{"name":"open_workspace","arguments":{
+        "root": alternate.path().to_string_lossy()
+    }}});
+    let (opened, _) = rpc(&client, port, &token, Some(&sid_a), open_alternate)
+        .await
+        .expect("explicit alternate root");
+    let other_id = opened["result"]["structuredContent"]["workspace_id"]
+        .as_str()
+        .expect("alternate workspace id");
+    let selected = json!({"jsonrpc":"2.0","id":21,"method":"tools/call",
+    "params":{"name":"read","arguments":{
+        "workspace_id":other_id,"path":"alternate.txt"
+    }}});
+    let (alt_read, _) = rpc(&client, port, &token, Some(&sid_b), selected)
+        .await
+        .expect("other transport can explicitly select root");
+    assert_eq!(alt_read["result"]["structuredContent"]["text"], "separate");
+    let omitted = json!({"jsonrpc":"2.0","id":22,"method":"tools/call",
+        "params":{"name":"read","arguments":{"path":"alternate.txt"}}});
+    let (denied, _) = rpc(&client, port, &token, Some(&sid_b), omitted)
+        .await
+        .expect("default root unchanged");
+    assert_eq!(denied["result"]["isError"], true);
+    let unknown = json!({"jsonrpc":"2.0","id":23,"method":"tools/call",
+    "params":{"name":"read","arguments":{
+        "workspace_id":"ws_unrecognized","path":"shared.txt"
+    }}});
+    let (invalid, _) = rpc(&client, port, &token, Some(&sid_a), unknown)
+        .await
+        .expect("unknown root denied");
+    assert_eq!(invalid["result"]["isError"], true);
 
     let read = |id| {
         json!({"jsonrpc":"2.0","id":id,"method":"tools/call",

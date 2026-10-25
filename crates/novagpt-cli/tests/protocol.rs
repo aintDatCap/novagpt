@@ -61,6 +61,11 @@ use std::{
 fn stdio_initialize_list_and_call_use_the_real_protocol() {
     let workspace = tempfile::tempdir().expect("create isolated fixture root");
     fs::write(workspace.path().join("hello.txt"), "test text").expect("write fixture");
+    fs::write(
+        workspace.path().join("image.png"),
+        b"\x89PNG\r\n\x1a\nfixture",
+    )
+    .expect("image fixture");
     fs::write(workspace.path().join(".env"), "do not expose").expect("write blocked fixture");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
@@ -94,6 +99,9 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{
                 "name":"subagent_status","arguments":{}
             }}),
+            json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
+                "name":"view_image","arguments":{"path":"image.png"}
+            }}),
         ];
         for message in messages {
             writeln!(input, "{message}").expect("send MCP request");
@@ -124,6 +132,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     for name in [
         "read",
         "write",
+        "view_image",
         "git",
         "git_status",
         "git_diff",
@@ -154,8 +163,13 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 31);
+    assert_eq!(listed.len(), 32);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
+    assert_eq!(
+        by_id(7)["result"]["structuredContent"]["mime_type"],
+        "image/png"
+    );
+    assert_eq!(by_id(7)["result"]["content"][0]["type"], "image");
     assert_eq!(by_id(4)["result"]["isError"], true);
     assert!(
         by_id(4)["result"]["structuredContent"]["error"]

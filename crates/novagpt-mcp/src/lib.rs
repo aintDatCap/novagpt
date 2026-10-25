@@ -8,6 +8,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use base64::Engine;
 use novagpt_agents::{AgentManager, AgentRole, SpawnAgent};
 use novagpt_core::{
     BashMode, BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
@@ -475,6 +476,35 @@ impl NovaMcp {
             state.read_file(args.workspace_id.as_deref(), &args.path)
         })
         .await
+    }
+
+    #[tool(
+        description = "Read a bounded PNG, JPEG, GIF or WebP from an explicitly guarded workspace path"
+    )]
+    async fn view_image(&self, Parameters(args): Parameters<FileArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            state.view_image(args.workspace_id.as_deref(), &args.path)
+        })
+        .await;
+        let reply = match result {
+            Ok(Ok(image)) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
+                let mut answer = CallToolResult::success(vec![ContentBlock::image(
+                    data,
+                    image.mime_type.to_string(),
+                )]);
+                answer.structured_content = Some(serde_json::json!({
+                    "path": image.path,
+                    "mime_type": image.mime_type,
+                    "bytes": image.bytes.len()
+                }));
+                answer
+            }
+            Ok(Err(error)) => tool_reply::<()>(Err(error)),
+            Err(_) => tool_reply::<()>(Err(NovaError::StatePoisoned)),
+        };
+        self.observed("view_image", reply)
     }
 
     #[tool(
