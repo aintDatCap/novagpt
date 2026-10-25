@@ -226,6 +226,7 @@ impl Controller {
         let tx = self.tx.clone();
         let task = self.runtime.spawn(async move {
             let tx_info = tx.clone();
+            let ngrok_domain = config.ngrok_domain.clone();
             let setup = tokio::task::spawn_blocking(move || -> Result<_, String> {
                 config
                     .validate()
@@ -296,7 +297,7 @@ impl Controller {
                         }
                     });
                     let result: Result<(), Box<dyn std::error::Error>> = if ngrok {
-                        match tunnel::NgrokTunnel::start(address.port(), None).await {
+                        match tunnel::NgrokTunnel::start(address.port(), ngrok_domain).await {
                             Ok(mut tunnel) => {
                                 let server = async { novagpt_mcp::run_http_with(workspaces, address, token, extras).await.is_ok() };
                                 tokio::pin!(server);

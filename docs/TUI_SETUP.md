@@ -38,7 +38,7 @@ Durante l'editing, `Tab`, `q` e le frecce non spostano il focus. Invio applica d
 
 Usa le frecce e Invio, non necessariamente i tasti numerici.
 
-- **Avvia MCP HTTP:** server protetto sulla sola interfaccia di loopback `127.0.0.1`, con impostazioni precedentemente salvate. Se non esiste una variabile `NOVAGPT_HTTP_TOKEN`, genera automaticamente un token crittograficamente sicuro al primo avvio e lo riutilizza nelle sessioni successive. Non lo mostra nei log.
+- **Avvia MCP HTTP:** avvia il server protetto su `127.0.0.1` usando la configurazione salvata; se **Ngrok automatico** e' ON avvia anche il tunnel, usando l'eventuale dominio salvato. Per un avvio soltanto locale tramite CLI: `novagpt http --no-ngrok`. Il token viene generato al primo avvio e non compare nei log.
 - **Arresta MCP HTTP:** apre una conferma; interrompe solo il server creato dalla sessione TUI, non eventuali processi esterni.
 - **Diagnostica workspace:** controlli locali e registrazione delle directory autorizzate eseguiti fuori dal ciclo input.
 - **Inventario VM:** legge lo store locale approvato se VM e' abilitata nella configurazione salvata.
@@ -72,7 +72,7 @@ La dashboard include workspace, stato del server e endpoint, VM/browser (configu
 
 ## Config
 
-Menu navigabile con porta HTTP, attivazione VM, attivazione ChatGPT Browser, percorso assoluto dell'eseguibile Chrome, aggiunta/rimozione di directory autorizzate, scelta profilo CodexPro, anteprima importazione, Salva, Annulla e **Genera / verifica token HTTP**. L'asterisco (`*`) indica i valori modificati. Errori di input, percorso Chrome non valido e salvataggio fallito sono visibili. Le directory devono esistere, sono canonicalizzate e limitate a 16 radici aggiuntive.
+Menu navigabile con porta HTTP, attivazione VM, attivazione ChatGPT Browser, percorso assoluto dell'eseguibile Chrome, aggiunta/rimozione di directory autorizzate, scelta profilo CodexPro, anteprima importazione, **Ngrok automatico (ON/OFF)**, **Dominio ngrok** modificabile, Salva, Annulla e **Genera / verifica token HTTP**. L'asterisco (`*`) indica i valori modificati. Errori di input, percorso Chrome non valido e salvataggio fallito sono visibili. Le directory devono esistere, sono canonicalizzate e limitate a 16 radici aggiuntive.
 
 La configurazione viene mantenuta in **bozza** fino alla conferma del salvataggio e persiste in `<workspace>/.novagpt/config.json`. Il segreto HTTP non viene scritto in `config.json`: e' conservato separatamente nell'area privata dell'utente. I nuovi valori salvati richiedono un riavvio HTTP se un task server usa ancora i precedenti.
 
@@ -85,7 +85,7 @@ Apre la **stessa TUI** inizialmente su Config. Segui il banner:
 3. **Import facoltativo:** scegli un profilo CodexPro e visualizza l'anteprima prima della conferma.
 4. **Revisione:** salva solo dopo conferma esplicita; il risultato finale e' visualizzato. In questa fase NovaGPT genera automaticamente anche il token HTTP, salvo override tramite ambiente.
 
-L'importazione CodexPro riguarda **esclusivamente la porta HTTP**. Profili Chrome, token, credenziali, dati VM, permessi filesystem e qualsiasi altro campo sono ignorati. La directory sorgente viene soltanto letta (di default `~/.codexpro/profiles`, personalizzabile con `CODEXPRO_HOME` o `--codexpro-home`). Non viene salvato niente automaticamente dopo l'importazione.
+L'importazione CodexPro legge **porta HTTP**, preferenza `tunnel` e, solo quando `tunnel=ngrok` e l'hostname e' valido, il **dominio ngrok**. Importare un profilo con tunnel differente disabilita l'avvio automatico ngrok; un hostname ngrok mancante o non valido non abilita automaticamente il tunnel. L'anteprima e la conferma sono obbligatorie; la modifica resta **in bozza** fino a Salva. Token, file `ngrokConfig` e relativo contenuto, profili Chrome, credenziali, dati VM e permessi filesystem non vengono copiati. La directory sorgente (`~/.codexpro/profiles` o `--codexpro-home`) viene **solo letta**; CodexPro non viene modificato.
 
 Il setup, dopo il salvataggio, installa in modo locale:
 

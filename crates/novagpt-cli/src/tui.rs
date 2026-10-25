@@ -246,12 +246,14 @@ mod tests {
         assert!(!a.dirty());
     }
     #[test]
-    fn import_only_port_and_only_after_approval() {
+    fn import_port_ngrok_and_only_after_approval() {
         let dir = tempfile::tempdir().unwrap();
         let profile = CodexProfile {
             origin: PathBuf::from("fixture.json"),
             root_label: "sample".into(),
             port: Some(9393),
+            tunnel: Some("ngrok".into()),
+            ngrok_domain: Some("nova-fixture.ngrok-free.dev".into()),
         };
         let mut a = App::new(
             dir.path().to_path_buf(),
@@ -263,6 +265,7 @@ mod tests {
         a.config = 7;
         a.key(key(KeyCode::Enter));
         assert_eq!(a.draft.port, 8787);
+        assert!(!a.draft.ngrok_enabled);
         a.key(key(KeyCode::Esc));
         assert_eq!(a.draft.port, 8787);
         a.key(key(KeyCode::Enter));
@@ -270,12 +273,48 @@ mod tests {
         assert_eq!(a.draft.port, 8787);
         a.key(key(KeyCode::Char('y')));
         assert_eq!(a.draft.port, 9393);
+        assert!(a.draft.ngrok_enabled);
+        assert_eq!(
+            a.draft.ngrok_domain.as_deref(),
+            Some("nova-fixture.ngrok-free.dev")
+        );
         assert!(!a.draft.vm_enabled);
         assert!(!a.draft.browser_enabled);
         assert!(!crate::settings::config_path(dir.path()).exists());
+        // Imported ngrok preference is honored by the normal start command.
+        a.tab = 0;
+        assert!(a.key(key(KeyCode::Enter)).is_none()); // Unsaved changes block launch.
+        a.tab = 2;
         a.key(key(KeyCode::Char('n')));
         assert_eq!(a.step, 3);
     }
+    #[test]
+    fn saved_ngrok_preference_controls_normal_http_start() {
+        let settings = LocalSettings {
+            ngrok_enabled: true,
+            ngrok_domain: Some("fixture.ngrok-free.dev".into()),
+            ..LocalSettings::default()
+        };
+        let mut a = App::new(PathBuf::from("."), settings, false, vec![]);
+        assert!(matches!(a.key(key(KeyCode::Enter)),
+            Some(Effect::StartNgrok(config)) if config.ngrok_domain.as_deref() == Some("fixture.ngrok-free.dev")));
+        let mut b = app();
+        b.tab = 2;
+        b.config = 11;
+        b.key(key(KeyCode::Enter));
+        assert!(b.draft.ngrok_enabled);
+        b.config = 12;
+        b.key(key(KeyCode::Enter));
+        assert!(matches!(b.modal, Some(Modal::Edit(Field::NgrokDomain))));
+        for character in "https://bad.example/path".chars() {
+            b.key(key(KeyCode::Char(character)));
+        }
+        b.key(key(KeyCode::Enter));
+        assert!(b.input_error.is_some());
+        b.key(key(KeyCode::Esc));
+        assert!(b.draft.ngrok_domain.is_none());
+    }
+
     #[test]
     fn ngrok_url_is_revealed_only_on_demand_and_copy_is_explicit() {
         let mut a = app();

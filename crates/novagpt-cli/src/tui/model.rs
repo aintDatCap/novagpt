@@ -45,7 +45,7 @@ pub(super) const COMMANDS: [(&str, &str); 9] = [
         "Mostra l'URL riservato solo su richiesta; premi C per copiarlo.",
     ),
 ];
-pub(super) const CONFIG_ITEMS: [&str; 12] = [
+pub(super) const CONFIG_ITEMS: [&str; 14] = [
     "Porta HTTP",
     "Abilita VM",
     "Abilita ChatGPT Browser",
@@ -53,10 +53,12 @@ pub(super) const CONFIG_ITEMS: [&str; 12] = [
     "Aggiungi directory autorizzata",
     "Rimuovi directory autorizzata",
     "Scegli profilo CodexPro",
-    "Importa porta (anteprima)",
+    "Importa porta + ngrok (anteprima)",
     "Salva configurazione",
     "Annulla modifiche",
     "Genera / verifica token HTTP",
+    "Ngrok automatico (ON/OFF)",
+    "Dominio ngrok",
     "Prossimo passo setup",
 ];
 const LOG_CAP: usize = 250;
@@ -86,6 +88,7 @@ pub(super) enum Field {
     Port,
     Chrome,
     Root,
+    NgrokDomain,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Confirm {
@@ -211,7 +214,7 @@ impl App {
                 .is_some_and(|c| *c != self.persisted)
     }
     pub fn config_len(&self) -> usize {
-        if self.setup { 12 } else { 11 }
+        if self.setup { 14 } else { 13 }
     }
     pub fn log(&mut self, level: Level, message: impl Into<String>) {
         let message = message.into();
@@ -367,7 +370,11 @@ impl App {
                             self.persisted.port
                         ),
                     );
-                    Some(Effect::Start(self.persisted.clone()))
+                    Some(if self.persisted.ngrok_enabled {
+                        Effect::StartNgrok(self.persisted.clone())
+                    } else {
+                        Effect::Start(self.persisted.clone())
+                    })
                 }
             }
             1 => {
@@ -458,6 +465,7 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             Field::Root => String::new(),
+            Field::NgrokDomain => self.draft.ngrok_domain.clone().unwrap_or_default(),
         };
         self.input_error = None;
         self.modal = Some(Modal::Edit(field));
@@ -483,6 +491,14 @@ impl App {
                 self.modal = None;
                 self.input.clear();
                 return path.map(Effect::ValidateChrome);
+            }
+            Field::NgrokDomain => {
+                if !value.is_empty() && !crate::tunnel::valid_domain(value) {
+                    self.input_error =
+                        Some("Inserisci un hostname valido, senza schema o percorso.".into());
+                    return None;
+                }
+                self.draft.ngrok_domain = (!value.is_empty()).then(|| value.to_string());
             }
             Field::Root => {
                 if value.is_empty() {
@@ -537,11 +553,9 @@ impl App {
                 }
             }
             7 => {
-                if self
-                    .profiles
-                    .get(self.profile)
-                    .is_some_and(|p| p.port.is_some())
-                {
+                if self.profiles.get(self.profile).is_some_and(|p| {
+                    p.port.is_some() || p.ngrok_domain.is_some() || p.tunnel.is_some()
+                }) {
                     self.modal = Some(Modal::ImportPreview);
                 } else {
                     self.log(Level::Warn, "Nessuna porta importabile nel profilo.");
@@ -566,7 +580,15 @@ impl App {
                     return Some(Effect::EnsureToken);
                 }
             }
-            11 if self.setup && self.step < 4 => {
+            11 => {
+                self.draft.ngrok_enabled = !self.draft.ngrok_enabled;
+                self.log(
+                    Level::Info,
+                    "Preferenza ngrok modificata; salva per confermare.",
+                );
+            }
+            12 => self.start_edit(Field::NgrokDomain),
+            13 if self.setup && self.step < 4 => {
                 self.step = (self.step + 1).min(3);
             }
             _ => {}
@@ -595,7 +617,7 @@ impl App {
                     crate::settings::import_supported(&mut self.draft, profile);
                     self.log(
                         Level::Success,
-                        "Solo la porta HTTP importata in memoria; non ancora salvata.",
+                        "Porta e impostazioni ngrok consentite importate nella bozza; salva per applicarle.",
                     );
                 }
                 None

@@ -41,6 +41,8 @@ pub struct LocalSettings {
     pub vm_enabled: bool,
     pub browser_enabled: bool,
     pub chrome_executable: Option<PathBuf>,
+    pub ngrok_enabled: bool,
+    pub ngrok_domain: Option<String>,
 }
 impl Default for LocalSettings {
     fn default() -> Self {
@@ -51,6 +53,8 @@ impl Default for LocalSettings {
             vm_enabled: false,
             browser_enabled: false,
             chrome_executable: None,
+            ngrok_enabled: false,
+            ngrok_domain: None,
         }
     }
 }
@@ -71,6 +75,13 @@ impl LocalSettings {
                     "allowed root must be an existing absolute directory",
                 ));
             }
+        }
+        if self
+            .ngrok_domain
+            .as_deref()
+            .is_some_and(|host| !crate::tunnel::valid_domain(host))
+        {
+            return Err(invalid("invalid ngrok hostname"));
         }
         if self.browser_enabled
             && !self
@@ -135,6 +146,8 @@ pub struct CodexProfile {
     pub origin: PathBuf,
     pub root_label: String,
     pub port: Option<u16>,
+    pub tunnel: Option<String>,
+    pub ngrok_domain: Option<String>,
 }
 /// Reads only selected public configuration fields from CodexPro workspace profiles.
 pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<CodexProfile>> {
@@ -169,10 +182,32 @@ pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<CodexProfile>> 
                 _ => None,
             })
             .filter(|p| *p > 0);
+        // Allowlist only the public connection settings; never import
+        // token, ngrokConfig, allowedRoots, browser or guest state.
+        let tunnel = v
+            .get("tunnel")
+            .and_then(Value::as_str)
+            .filter(|s| {
+                matches!(
+                    *s,
+                    "ngrok" | "none" | "cloudflare" | "cloudflare-named" | "tailscale"
+                )
+            })
+            .map(str::to_owned);
+        let ngrok_domain = if tunnel.as_deref() == Some("ngrok") {
+            v.get("hostname")
+                .and_then(Value::as_str)
+                .filter(|host| crate::tunnel::valid_domain(host))
+                .map(str::to_owned)
+        } else {
+            None
+        };
         found.push(CodexProfile {
             origin: path,
             root_label: root.to_string(),
             port,
+            tunnel,
+            ngrok_domain,
         });
     }
     found.sort_by(|a, b| a.root_label.cmp(&b.root_label));
@@ -187,10 +222,23 @@ pub fn codexpro_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codexpro")
 }
-/// Never imports secret-bearing fields, granted roots, private browser profiles, or VM state.
+/// Never imports secrets, ngrok configuration file contents, granted roots,
+/// private browser profiles, or VM state. Called only after TUI confirmation.
 pub fn import_supported(settings: &mut LocalSettings, profile: &CodexProfile) {
     if let Some(port) = profile.port {
         settings.port = port;
+    }
+    if let Some(ref tunnel) = profile.tunnel {
+        if tunnel == "ngrok" {
+            // A malformed/absent hostname must not enable a misleading public tunnel.
+            if let Some(ref domain) = profile.ngrok_domain {
+                settings.ngrok_enabled = true;
+                settings.ngrok_domain = Some(domain.clone());
+            }
+        } else {
+            settings.ngrok_enabled = false;
+            settings.ngrok_domain = None;
+        }
     }
 }
 #[cfg(test)]
@@ -210,13 +258,15 @@ mod tests {
         assert_eq!(LocalSettings::load(dir.path()).unwrap(), cfg);
     }
     #[test]
-    fn explicit_import_only_copies_supported_port() {
+    fn explicit_import_only_copies_safe_public_connection_fields() {
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         fs::create_dir(home.path().join("profiles")).unwrap();
         fs::write(
             home.path().join("profiles").join("one.json"),
             serde_json::json!({"root":"C:/example","port":"9091","allowedRoots":["C:/other"],
+                "tunnel":"ngrok","hostname":"project.ngrok-free.dev",
+                "ngrokConfig":"C:/private/custom-ngrok.yml",
                 "token":"[REDACTED_SECRET]","chatgptBrowserProfile":"not-used"})
             .to_string(),
         )
@@ -226,12 +276,61 @@ mod tests {
         assert_eq!(cfg.port, 8787);
         import_supported(&mut cfg, &profiles[0]);
         assert_eq!(cfg.port, 9091);
+        assert!(cfg.ngrok_enabled);
+        assert_eq!(cfg.ngrok_domain.as_deref(), Some("project.ngrok-free.dev"));
         assert!(cfg.allowed_roots.is_empty());
         cfg.save(dir.path()).unwrap();
+        let saved = fs::read_to_string(config_path(dir.path())).unwrap();
+        for excluded in [
+            "not-used",
+            "REDACTED_SECRET",
+            "custom-ngrok.yml",
+            "C:/other",
+        ] {
+            assert!(!saved.contains(excluded), "unexpected imported field");
+        }
+        assert_eq!(LocalSettings::load(dir.path()).unwrap(), cfg);
+    }
+    #[test]
+    fn invalid_or_unrelated_profile_tunnels_never_enable_ngrok() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(home.path().join("profiles")).unwrap();
+        fs::write(
+            home.path().join("profiles").join("bad.json"),
+            serde_json::json!({"root":"A","port":9020,"tunnel":"ngrok",
+                "hostname":"https://unsafe.example/path","token":"[REDACTED_SECRET]"})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            home.path().join("profiles").join("other.json"),
+            serde_json::json!({"root":"B","tunnel":"cloudflare","hostname":"wrong.example"})
+                .to_string(),
+        )
+        .unwrap();
+        let profiles = discover_codexpro_profiles(home.path()).unwrap();
+        assert_eq!(profiles.len(), 2);
+        let mut settings = LocalSettings {
+            ngrok_enabled: true,
+            ngrok_domain: Some("prior.ngrok-free.dev".into()),
+            ..LocalSettings::default()
+        };
+        import_supported(&mut settings, &profiles[0]);
+        assert_eq!(settings.port, 9020);
+        assert_eq!(
+            settings.ngrok_domain.as_deref(),
+            Some("prior.ngrok-free.dev")
+        );
+        import_supported(&mut settings, &profiles[1]);
+        assert!(!settings.ngrok_enabled);
+        assert_eq!(settings.ngrok_domain, None);
         assert!(
-            !fs::read_to_string(config_path(dir.path()))
-                .unwrap()
-                .contains("not-used")
+            LocalSettings {
+                ngrok_domain: Some("https://host.example".into()),
+                ..LocalSettings::default()
+            }
+            .validate()
+            .is_err()
         );
     }
     #[test]

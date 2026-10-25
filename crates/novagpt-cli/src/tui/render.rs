@@ -110,6 +110,19 @@ fn config_value(app: &App, index: usize) -> String {
         }
         9 => "ripristina ultimo salvataggio".into(),
         10 => app.auth_state.clone(),
+        11 => format!(
+            "{}{}",
+            on(app.draft.ngrok_enabled),
+            dirty_mark(app.draft.ngrok_enabled != app.persisted.ngrok_enabled)
+        ),
+        12 => format!(
+            "{}{}",
+            app.draft
+                .ngrok_domain
+                .as_deref()
+                .unwrap_or("(non impostato)"),
+            dirty_mark(app.draft.ngrok_domain != app.persisted.ngrok_domain)
+        ),
         _ => format!("passo {}/4", app.step.min(3) + 1),
     }
 }
@@ -490,7 +503,7 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
         ),
         Modal::SetupResult(message) => ("Setup terminato".into(), message.clone(), "Invio / Esc per chiudere".into()),
         Modal::Edit(field) => {
-            let title = match field { Field::Port => "Modifica porta HTTP", Field::Chrome => "Percorso Chrome", Field::Root => "Aggiungi directory autorizzata" };
+            let title = match field { Field::Port => "Modifica porta HTTP", Field::Chrome => "Percorso Chrome", Field::Root => "Aggiungi directory autorizzata", Field::NgrokDomain => "Dominio ngrok (hostname)" };
             let error = app.input_error.clone().unwrap_or_default();
             (title.into(), format!("Inserisci il valore e premi Invio:\n\n{}▏\n\n{}", app.input, error),
                 "Invio applica • Esc annulla".into())
@@ -503,8 +516,9 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
         Modal::ImportPreview => {
             let selected = app.profiles.get(app.profile);
             ("Anteprima importazione".into(), selected.map_or("Nessun profilo.".into(), |p|
-                format!("Sorgente: {}\nWorkspace profilo: {}\nPorta HTTP attuale: {}\nPorta proposta: {:?}\n\nSolo la porta sara' copiata in memoria.\nToken, root, dati VM e Chrome sono ignorati.",
-                    p.origin.display(), p.root_label, app.draft.port, p.port)),
+                format!("Sorgente: {}\nWorkspace profilo: {}\nPorta HTTP: {} -> {:?}\nTunnel CodexPro: {}\nDominio ngrok importabile: {}\n\nImporta nella bozza solo porta, tunnel ngrok e hostname valido. Non importa token, file ngrokConfig, root, dati VM o browser.\nNessuna modifica finche' non confermi e salvi.",
+                    p.origin.display(), p.root_label, app.draft.port, p.port,
+                    p.tunnel.as_deref().unwrap_or("(assente)"), p.ngrok_domain.as_deref().unwrap_or("(non disponibile)"))),
             "Invio prosegui alla conferma • Esc annulla".into())
         }
         Modal::Confirm(action) => {
@@ -512,7 +526,7 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
                 Confirm::Save => if app.setup {
                     "Salvare la configurazione NovaGPT e installare il launcher locale? Nessun file esistente sara' sovrascritto."
                 } else { "Salvare la configurazione in .novagpt/config.json?" },
-                Confirm::Import => "Importare SOLO la porta HTTP del profilo in memoria?",
+                Confirm::Import => "Importare nella bozza porta HTTP e preferenze ngrok supportate? I token non saranno importati.",
                 Confirm::RemoveRoot => "Revocare questa directory autorizzata dalla bozza?",
                 Confirm::Discard => "Annullare tutte le modifiche non salvate?",
                 Confirm::Stop => "Interrompere il server HTTP avviato da questa TUI?",

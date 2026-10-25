@@ -103,8 +103,11 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
         /// Explicitly expose token-protected MCP HTTP through an owned ngrok process.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_ngrok")]
         ngrok: bool,
+        /// Disable ngrok even if imported workspace settings enable it.
+        #[arg(long)]
+        no_ngrok: bool,
         /// Optional stable ngrok hostname (must already be available to your account).
         #[arg(long, requires = "ngrok")]
         ngrok_domain: Option<String>,
@@ -372,9 +375,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Http {
             port,
             ngrok,
+            no_ngrok,
             ngrok_domain,
         }) => {
             let port = port.unwrap_or(local.port);
+            let ngrok = !no_ngrok && (ngrok || local.ngrok_enabled);
+            let ngrok_domain = ngrok_domain.or_else(|| local.ngrok_domain.clone());
             let token = token::resolve(&root)?.value;
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             if ngrok {
