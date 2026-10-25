@@ -277,6 +277,37 @@ mod tests {
         assert_eq!(a.step, 3);
     }
     #[test]
+    fn ngrok_url_is_revealed_only_on_demand_and_copy_is_explicit() {
+        let mut a = app();
+        a.command = 7;
+        assert!(matches!(
+            a.key(key(KeyCode::Enter)),
+            Some(Effect::StartNgrok(_))
+        ));
+        assert!(a.modal.is_none());
+        a.on_event(OperationEvent::Server(ServerState::Running));
+        a.command = 8;
+        assert!(matches!(
+            a.key(key(KeyCode::Enter)),
+            Some(Effect::ShowConnectorUrl(8787))
+        ));
+        let token = "T".repeat(40);
+        let link = format!(
+            "https://example.ngrok-free.app/mcp?{}={token}",
+            "codexpro_token"
+        );
+        a.on_event(OperationEvent::ConnectorUrlReady(Ok(link.clone())));
+        assert!(matches!(a.modal, Some(Modal::ConnectorUrl(_))));
+        assert!(a.logs.iter().all(|entry| !entry.message.contains(&token)));
+        assert!(a.key(key(KeyCode::Char('x'))).is_none());
+        assert!(matches!(a.key(key(KeyCode::Char('c'))),
+            Some(Effect::CopyConnectorUrl(value)) if value == link));
+        a.on_event(OperationEvent::CopyFinished(Ok(())));
+        assert!(a.logs.iter().all(|entry| !entry.message.contains(&token)));
+        a.key(key(KeyCode::Esc));
+        assert!(a.modal.is_none());
+    }
+    #[test]
     fn resize_and_tiny_rendering_with_testbackend() {
         let mut a = app();
         a.tab = 0;

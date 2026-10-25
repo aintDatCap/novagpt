@@ -69,14 +69,22 @@ MCP `browser_tabs` lists up to 32 tabs **only** on the approved origin (title an
 
 ## Experimental ngrok exposure
 
-The CLI can optionally run a managed ngrok agent for the **still loopback-bound** bearer-protected HTTP MCP server:
+The CLI can run a managed ngrok v3 tunnel for the loopback MCP service. Both bearer authentication and a CodexPro-compatible `codexpro_token` URL query parameter are supported; this permits a ChatGPT MCP connector configured with **No authentication**. The query URL is itself a password.
 
 ```powershell
 novagpt --root C:\path\to\repo http --port 8787 --ngrok
 novagpt --root C:\path\to\repo http --port 8787 --ngrok --ngrok-domain your-owned-domain.ngrok-free.app
 ```
 
-This feature requires an independently installed and configured ngrok v3 client and explicit `--ngrok` opt-in. The agent's HTTP inspection is disabled, and the CLI prints a public `/mcp` URL only if its local API reports a tunnel matching the chosen loopback port. The token is not printed; never paste it into logs. **Real ChatGPT remote connection, SSE/GET/DELETE compatibility, and long-lived tunnel reliability remain unverified.** The ngrok integration is CLI-only; it is not yet configurable in the Ratatui TUI.
+After starting the server, in a **second terminal** run:
+
+```powershell
+novagpt --root C:\Projects\novagpt connector-url --port 8787
+```
+
+This on-demand command verifies authenticated local MCP readiness, confirms that ngrok forwards the chosen loopback port, and prints the full HTTPS connector URL, including its URL-encoded workspace credential, **only when explicitly requested**. Startup prints only the public endpoint, never the token; no automatic clipboard copying occurs. A stable domain assigned to your ngrok account can be selected with `--ngrok-domain` and reused on later starts.
+
+In the Ratatui TUI choose **Avvia MCP + ngrok**, then **Mostra / copia URL ChatGPT**. The URL is shown only in a modal; press **C** to copy it explicitly via your system clipboard, or close the modal without copying. Paste the URL into your ChatGPT MCP connector and choose **No authentication**. Treat that URL like a password: don't share it or include it in logs; ngrok as the tunnel provider can still see tunneled requests. The local ngrok inspection and ngrok logs are disabled. Query-authenticated MCP POST, GET/SSE and DELETE are covered by real local HTTP tests; **the remote ChatGPT connector still needs an end-to-end user test**. Keep permitted workspace roots and shell privileges restricted.
 
 ## Status
 

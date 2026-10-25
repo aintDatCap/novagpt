@@ -157,7 +157,7 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, (name, _))| {
             let badge = match i {
-                0 | 1 => state(app.server),
+                0 | 1 | 7 => state(app.server),
                 3 => {
                     if app.persisted.vm_enabled {
                         "ABILITATA"
@@ -178,7 +178,7 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled(format!(" {} ", name), Style::default().fg(Color::White)),
                 Span::styled(
                     badge.to_owned(),
-                    Style::default().fg(if i < 2 {
+                    Style::default().fg(if i < 2 || i == 7 {
                         state_color(app.server)
                     } else {
                         MUTED
@@ -432,7 +432,7 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Line::from("Altri dati ignorati; nessun accesso in scrittura a CodexPro."),
             Line::from(""),
             Line::from(Span::styled(
-                "Token HTTP (mai mostrato nella TUI):",
+                "Token HTTP (mostrato solo su richiesta nella finestra URL):",
                 Style::default().fg(ACCENT),
             )),
             Line::from(app.auth_state.clone()),
@@ -483,6 +483,11 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
             "Tab / Shift+Tab: cambia scheda\n← →: cambia scheda (fuori dai campi)\n↑ ↓: scegli un comando/campo o scorri i log\nEnter: esegui, modifica o conferma\nEsc: chiudi/indietro   q: esci\n?: aiuto   Ctrl+C: uscita controllata\nStato: PgUp/PgDn, Home/End scorrono i log\nConfig: * indica un campo modificato\nSetup: n avanti, b indietro\nI tasti numerici 1–4 sono opzionali nei Comandi.".into(),
             "Esc / Enter per chiudere".into()),
         Modal::Notice {title, body} => (title.clone(), body.clone(), "Esc / Enter per chiudere".into()),
+        Modal::ConnectorUrl(url) => (
+            "URL ChatGPT (riservato)".into(),
+            format!("In ChatGPT scegli No authentication e incolla questo URL:\n\n{url}\n\nL'URL contiene una credenziale. Non condividerlo."),
+            "C = copia adesso negli appunti • Enter / Esc = chiudi (nessuna copia automatica)".into(),
+        ),
         Modal::SetupResult(message) => ("Setup terminato".into(), message.clone(), "Invio / Esc per chiudere".into()),
         Modal::Edit(field) => {
             let title = match field { Field::Port => "Modifica porta HTTP", Field::Chrome => "Percorso Chrome", Field::Root => "Aggiungi directory autorizzata" };

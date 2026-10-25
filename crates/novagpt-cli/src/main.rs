@@ -109,6 +109,12 @@ enum Command {
         #[arg(long, requires = "ngrok")]
         ngrok_domain: Option<String>,
     },
+    /// Explicitly reveal the protected ChatGPT connector URL of a running ngrok tunnel.
+    /// Never copies to clipboard or writes it to a log.
+    ConnectorUrl {
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Manage the auto-generated per-workspace MCP HTTP token.
     Token {
         #[command(subcommand)]
@@ -197,6 +203,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(action) = &cli.command {
         match action {
+            Command::ConnectorUrl { port } => {
+                let port = port.unwrap_or(local.port);
+                let resolved = token::resolve(&root)?;
+                connection::probe(port, &resolved.value).await?;
+                let endpoint = tunnel::NgrokTunnel::discover_endpoint(port, None)
+                    .await
+                    .ok_or("Nessun tunnel ngrok attivo per questa porta")?;
+                // Secret revealed only by an explicit user command. No clipboard automation.
+                println!("{}", tunnel::connector_url(&endpoint, &resolved.value)?);
+                return Ok(());
+            }
             Command::ConnectionTest { port, json } => {
                 let token = token::resolve(&root)?.value;
                 let result = connection::probe(port.unwrap_or(local.port), &token).await?;
@@ -361,7 +378,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let token = token::resolve(&root)?.value;
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             if ngrok {
-                let mut tunnel = tunnel::NgrokTunnel::start(port, ngrok_domain).await?;
+                let mut tunnel = tunnel::NgrokTunnel::start(port, ngrok_domain)
+                    .await
+                    .map_err(|_| "Impossibile avviare ngrok")?;
                 let server = novagpt_mcp::run_http_with(workspaces, address, token, extras);
                 tokio::pin!(server);
                 let mut published = false;
@@ -382,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // URL is from the local ngrok API and matched to the configured port.
                         // This does not establish that a real ChatGPT remote MCP client works.
                         eprintln!(
-                            "ngrok MCP endpoint: {endpoint} (ChatGPT compatibility not yet verified)"
+                            "ngrok MCP endpoint pronto: {endpoint} (usa connector-url --port {port} per mostrare l'URL riservato; ChatGPT non ancora verificato)"
                         );
                         published = true;
                     }
@@ -418,7 +437,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Command::Doctor { .. }
             | Command::Inspect { .. }
             | Command::Review { .. }
-            | Command::ConnectionTest { .. },
+            | Command::ConnectionTest { .. }
+            | Command::ConnectorUrl { .. },
         ) => {
             unreachable!("read-only commands handled above")
         }

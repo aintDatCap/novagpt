@@ -42,7 +42,10 @@ pub fn valid_domain(value: &str) -> bool {
 }
 
 impl NgrokTunnel {
-    pub async fn start(port: u16, domain: Option<String>) -> Result<Self, Box<dyn Error>> {
+    pub async fn start(
+        port: u16,
+        domain: Option<String>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         if let Some(value) = domain.as_deref()
             && !valid_domain(value)
         {
@@ -87,6 +90,23 @@ impl NgrokTunnel {
     }
 
     pub async fn endpoint(&self) -> Option<String> {
+        Self::discover_endpoint(self.port, self.configured_domain.as_deref()).await
+    }
+
+    /// Local discovery never prints or persists a token and does not start a tunnel.
+    pub async fn discover_endpoint(port: u16, configured_domain: Option<&str>) -> Option<String> {
+        Self::discover_endpoint_at(port, configured_domain, "http://127.0.0.1:4040/api/tunnels")
+            .await
+    }
+
+    async fn discover_endpoint_at(
+        port: u16,
+        configured_domain: Option<&str>,
+        api: &str,
+    ) -> Option<String> {
+        if port == 0 {
+            return None;
+        }
         // Agent API is loopback-only. Confirm this process' intended upstream port;
         // never present the address of an unrelated tunnel as ready.
         let client = reqwest::Client::builder()
@@ -94,22 +114,25 @@ impl NgrokTunnel {
             .no_proxy()
             .build()
             .ok()?;
-        let list: TunnelList = client
-            .get("http://127.0.0.1:4040/api/tunnels")
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let response = client.get(api).send().await.ok()?;
+        if !response.status().is_success()
+            || response.content_length().is_some_and(|len| len > 64 * 1024)
+        {
+            return None;
+        }
+        let body = response.bytes().await.ok()?;
+        if body.len() > 64 * 1024 {
+            return None;
+        }
+        let list: TunnelList = serde_json::from_slice(&body).ok()?;
         for item in list.tunnels {
             let Some(address) = item.config.and_then(|config| config.addr) else {
                 continue;
             };
             let allowed_targets = [
-                format!("http://127.0.0.1:{}", self.port),
-                format!("http://localhost:{}", self.port),
-                format!("127.0.0.1:{}", self.port),
+                format!("http://127.0.0.1:{port}"),
+                format!("http://localhost:{port}"),
+                format!("127.0.0.1:{port}"),
             ];
             if !allowed_targets.contains(&address) {
                 continue;
@@ -128,7 +151,7 @@ impl NgrokTunnel {
             {
                 continue;
             }
-            if let Some(domain) = self.configured_domain.as_deref()
+            if let Some(domain) = configured_domain
                 && parsed.host_str() != Some(domain)
             {
                 continue;
@@ -144,9 +167,84 @@ impl NgrokTunnel {
     }
 }
 
+/// Only caller-initiated rendering of this secret-bearing URL is permitted.
+/// Do not send the result to tracing, TUI log entries or the clipboard implicitly.
+pub fn connector_url(endpoint: &str, token: &str) -> Result<String, &'static str> {
+    let mut url = reqwest::Url::parse(endpoint).map_err(|_| "Invalid ngrok endpoint")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.port().is_some()
+        || url.path() != "/mcp"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || token.len() < 24
+        || token.len() > 256
+    {
+        return Err("Invalid endpoint or workspace token");
+    }
+    url.query_pairs_mut().append_pair("codexpro_token", token);
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn tunnel_discovery_rejects_foreign_upstreams_and_unsafe_urls() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("agent API mock");
+        let api = format!("http://{}/api/tunnels", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0u8; 2048];
+            let len = stream.read(&mut buffer).await.expect("read request");
+            assert!(String::from_utf8_lossy(&buffer[..len]).contains("GET /api/tunnels"));
+            let body = serde_json::json!({"tunnels":[
+                {"public_url":"https://wrong.ngrok-free.app","config":{"addr":"127.0.0.1:9999"}},
+                {"public_url":"https://host.ngrok-free.app/other","config":{"addr":"127.0.0.1:8787"}},
+                {"public_url":"https://right.ngrok-free.app","config":{"addr":"http://127.0.0.1:8787"}}
+            ]}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("HTTP response");
+        });
+        let result = NgrokTunnel::discover_endpoint_at(8787, Some("right.ngrok-free.app"), &api)
+            .await
+            .expect("matching destination");
+        assert_eq!(result, "https://right.ngrok-free.app/mcp");
+        server.await.expect("API fixture");
+    }
+
+    #[test]
+    fn connector_url_is_canonical_percent_encoded_and_explicit() {
+        let value = "ABCD+&EFGH".repeat(4);
+        let complete = connector_url("https://test.ngrok-free.app/mcp", &value).expect("url");
+        let parsed = reqwest::Url::parse(&complete).expect("valid HTTPS URL");
+        assert_eq!(parsed.path(), "/mcp");
+        assert_eq!(parsed.query_pairs().count(), 1);
+        assert_eq!(parsed.query_pairs().next().unwrap().1, value);
+        for invalid in [
+            "http://test.ngrok-free.app/mcp",
+            "https://test.ngrok-free.app/other",
+            "https://test.ngrok-free.app/mcp?existing=1",
+            "https://other@host.ngrok-free.app/mcp",
+        ] {
+            assert!(connector_url(invalid, &value).is_err(), "{invalid}");
+        }
+    }
+
     #[test]
     fn ngrok_domain_is_plain_hostname_and_rejects_url_injection() {
         assert!(valid_domain("my-space.ngrok-free.app"));

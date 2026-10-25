@@ -3,6 +3,7 @@ use super::launcher::install_launcher;
 use super::model::{Effect, Level, OperationEvent, ServerState};
 use crate::settings::{self, LocalSettings};
 use crate::token;
+use crate::{connection, tunnel};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -33,7 +34,73 @@ impl Controller {
                 self.stop();
                 return false;
             }
-            Effect::Start(settings) => self.start(root, settings),
+            Effect::Start(settings) => self.start(root, settings, false),
+            Effect::StartNgrok(settings) => self.start(root, settings, true),
+            Effect::ShowConnectorUrl(port) => {
+                let tx = self.tx.clone();
+                self.runtime.spawn(async move {
+                    let result: Result<String, String> = async {
+                        let resolved = tokio::task::spawn_blocking(move || token::resolve(&root))
+                            .await
+                            .map_err(|_| "Token non disponibile".to_string())?
+                            .map_err(|_| "Token non disponibile".to_string())?;
+                        connection::probe(port, &resolved.value)
+                            .await
+                            .map_err(|_| {
+                                "Server MCP non raggiungibile o autenticazione non valida"
+                                    .to_string()
+                            })?;
+                        let endpoint = tunnel::NgrokTunnel::discover_endpoint(port, None)
+                            .await
+                            .ok_or("Tunnel ngrok non ancora disponibile".to_string())?;
+                        tunnel::connector_url(&endpoint, &resolved.value)
+                            .map_err(|_| "URL del tunnel non valido".to_string())
+                    }
+                    .await;
+                    let _ = tx.send(OperationEvent::ConnectorUrlReady(result));
+                });
+            }
+            Effect::CopyConnectorUrl(url) => {
+                let tx = self.tx.clone();
+                self.runtime.spawn_blocking(move || {
+                    use std::{
+                        io::Write,
+                        process::{Command, Stdio},
+                    };
+                    let program = if cfg!(windows) {
+                        "clip.exe"
+                    } else if cfg!(target_os = "macos") {
+                        "pbcopy"
+                    } else {
+                        "wl-copy"
+                    };
+                    let result = (|| -> Result<(), String> {
+                        let mut process = Command::new(program)
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .map_err(|_| {
+                                "Clipboard non disponibile: seleziona manualmente l'URL".to_string()
+                            })?;
+                        process
+                            .stdin
+                            .take()
+                            .ok_or("Clipboard senza stdin".to_string())?
+                            .write_all(url.as_bytes())
+                            .map_err(|_| "Scrittura clipboard fallita".to_string())?;
+                        if !process
+                            .wait()
+                            .map_err(|_| "Clipboard non riuscito".to_string())?
+                            .success()
+                        {
+                            return Err("Clipboard non riuscito".into());
+                        }
+                        Ok(())
+                    })();
+                    let _ = tx.send(OperationEvent::CopyFinished(result));
+                });
+            }
             Effect::Stop => self.stop(),
             Effect::Inventory => {
                 let tx = self.tx.clone();
@@ -150,7 +217,7 @@ impl Controller {
         }
         true
     }
-    fn start(&mut self, root: PathBuf, config: LocalSettings) {
+    fn start(&mut self, root: PathBuf, config: LocalSettings, ngrok: bool) {
         if self.server.as_ref().is_some_and(|h| !h.is_finished()) {
             self.report(Level::Warn, "Un server HTTP e' gia avviato.");
             return;
@@ -228,8 +295,38 @@ impl Controller {
                             }
                         }
                     });
-                    let result =
-                        novagpt_mcp::run_http_with(workspaces, address, token, extras).await;
+                    let result: Result<(), Box<dyn std::error::Error>> = if ngrok {
+                        match tunnel::NgrokTunnel::start(address.port(), None).await {
+                            Ok(mut tunnel) => {
+                                let server = async { novagpt_mcp::run_http_with(workspaces, address, token, extras).await.is_ok() };
+                                tokio::pin!(server);
+                                let mut published = false;
+                                loop {
+                                    tokio::select! {
+                                        output = &mut server => {
+                                            // Child also has kill_on_drop: never detach ngrok from the TUI.
+                                            let _ = tunnel.child.start_kill();
+                                            break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
+                                        }
+                                        output = tunnel.child.wait() => {
+                                            let _ = output;
+                                            break Err("Il tunnel ngrok si è chiuso".into());
+                                        }
+                                        () = tokio::time::sleep(Duration::from_millis(450)) => {
+                                            if !published && tunnel.endpoint().await.is_some() {
+                                                published = true;
+                                                let _ = tx.send(OperationEvent::Log(Level::Success,
+                                                    "Tunnel ngrok pronto. Seleziona 'Mostra / copia URL ChatGPT'.".into()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => Err("ngrok non disponibile o configurazione account non valida".into()),
+                        }
+                    } else {
+                        novagpt_mcp::run_http_with(workspaces, address, token, extras).await
+                    };
                     probe.abort();
                     if result.is_err() {
                         let _ = tx.send(OperationEvent::Server(ServerState::Failed));

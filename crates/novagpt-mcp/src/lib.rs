@@ -1172,12 +1172,19 @@ fn is_authorized(token: &str, request: &Request) -> bool {
     }
 }
 
-async fn authorize(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
-    if is_authorized(&token, &request) {
-        next.run(request).await
-    } else {
-        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+async fn authorize(State(token): State<Arc<String>>, mut request: Request, next: Next) -> Response {
+    if !is_authorized(&token, &request) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
+    // After authentication, remove query credentials *before* entering rmcp.
+    // Avoid a downstream request debug formatter accidentally recording a token.
+    if request.uri().query().is_some() {
+        let Ok(safe_uri) = request.uri().path().parse() else {
+            return (StatusCode::BAD_REQUEST, "Invalid request path").into_response();
+        };
+        *request.uri_mut() = safe_uri;
+    }
+    next.run(request).await
 }
 
 pub async fn run_http(

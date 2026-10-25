@@ -7,7 +7,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub(super) const COMMANDS: [(&str, &str); 7] = [
+pub(super) const COMMANDS: [(&str, &str); 9] = [
     (
         "Avvia MCP HTTP",
         "Avvia il server autenticato su 127.0.0.1 (token da ambiente).",
@@ -35,6 +35,14 @@ pub(super) const COMMANDS: [(&str, &str); 7] = [
     (
         "Client e CLI",
         "Accesso stdio, HTTP esterno e comando vm-import.",
+    ),
+    (
+        "Avvia MCP + ngrok",
+        "Avvia il server e il tunnel pubblico. Non copia l'URL negli appunti.",
+    ),
+    (
+        "Mostra / copia URL ChatGPT",
+        "Mostra l'URL riservato solo su richiesta; premi C per copiarlo.",
     ),
 ];
 pub(super) const CONFIG_ITEMS: [&str; 12] = [
@@ -97,10 +105,14 @@ pub(super) enum Modal {
     Roots,
     ImportPreview,
     SetupResult(String),
+    ConnectorUrl(String),
 }
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
     Start(LocalSettings),
+    StartNgrok(LocalSettings),
+    ShowConnectorUrl(u16),
+    CopyConnectorUrl(String),
     Stop,
     Diagnose(LocalSettings),
     Inventory,
@@ -119,6 +131,8 @@ pub(super) enum OperationEvent {
     VmInventory(Result<usize, String>),
     TokenReady(Result<String, String>),
     TokenPresent(String),
+    ConnectorUrlReady(Result<String, String>),
+    CopyFinished(Result<(), String>),
     Saved {
         settings: LocalSettings,
         outcome: Result<String, String>,
@@ -247,6 +261,23 @@ impl App {
                     Err(message) => self.log(Level::Error, message),
                 }
             }
+            OperationEvent::ConnectorUrlReady(result) => {
+                self.busy = false;
+                match result {
+                    Ok(url) => {
+                        self.modal = Some(Modal::ConnectorUrl(url));
+                        self.log(
+                            Level::Info,
+                            "URL ChatGPT visualizzato solo in finestra riservata.",
+                        );
+                    }
+                    Err(message) => self.log(Level::Warn, message),
+                }
+            }
+            OperationEvent::CopyFinished(result) => match result {
+                Ok(()) => self.log(Level::Success, "URL copiato negli appunti su richiesta."),
+                Err(message) => self.log(Level::Error, message),
+            },
             OperationEvent::TokenPresent(message) => {
                 self.auth_state = "Pronto".to_string();
                 self.log(Level::Info, message);
@@ -369,10 +400,42 @@ impl App {
                 self.notice("Sottoagenti MCP", "Tool disponibili: subagent_spawn, subagent_status, subagent_message, subagent_result, subagent_cancel, subagent_resume, subagent_browser_diagnostics. Servono browser ChatGPT abilitato, Chrome dedicato e autenticazione manuale; nessuna automazione e' avviata da questo menu.");
                 None
             }
-            _ => {
-                self.notice("Accesso CLI", "MCP stdio: novagpt stdio\nHTTP da CLI: novagpt http --port PORT\nVM import: novagpt vm-import --name N --source FILE\nSono comandi espliciti, non azioni eseguite dalla TUI.");
+            6 => {
+                self.notice("Accesso CLI", "MCP stdio: novagpt stdio\nHTTP da CLI: novagpt http --ngrok\nMostra URL: novagpt connector-url\nVM import: novagpt vm-import --name N --source FILE");
                 None
             }
+            7 => {
+                if matches!(self.server, ServerState::Starting | ServerState::Running) {
+                    self.log(
+                        Level::Warn,
+                        "Arresta il server HTTP prima di avviare ngrok.",
+                    );
+                    None
+                } else if self.dirty() {
+                    self.log(
+                        Level::Warn,
+                        "Salva la configurazione prima di avviare ngrok.",
+                    );
+                    None
+                } else {
+                    self.server = ServerState::Starting;
+                    self.running_config = Some(self.persisted.clone());
+                    self.log(Level::Info, "Avvio del tunnel ngrok richiesto...");
+                    Some(Effect::StartNgrok(self.persisted.clone()))
+                }
+            }
+            8 => {
+                if self.server != ServerState::Running {
+                    self.log(Level::Warn, "Avvia prima MCP + ngrok.");
+                    None
+                } else if self.busy {
+                    None
+                } else {
+                    self.busy = true;
+                    Some(Effect::ShowConnectorUrl(self.persisted.port))
+                }
+            }
+            _ => None,
         }
     }
     fn notice(&mut self, title: &str, body: &str) {
@@ -618,6 +681,13 @@ impl App {
                             .min(self.draft.allowed_roots.len().saturating_sub(1))
                     }
                     KeyCode::Enter => self.confirm(Confirm::RemoveRoot),
+                    _ => {}
+                },
+                Modal::ConnectorUrl(url) => match key.code {
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        return Some(Effect::CopyConnectorUrl(url));
+                    }
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.modal = None,
                     _ => {}
                 },
                 Modal::Help | Modal::Notice { .. } | Modal::SetupResult(_) => {
