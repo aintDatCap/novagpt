@@ -384,10 +384,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let token = token::resolve(&root)?.value;
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             if ngrok {
-                let mut tunnel = tunnel::NgrokTunnel::start(port, ngrok_domain)
-                    .await
-                    .map_err(|_| "Impossibile avviare ngrok")?;
-                let server = novagpt_mcp::run_http_with(workspaces, address, token, extras);
+                // Own the loopback socket BEFORE starting a public tunnel.
+                let audit = extras.audit.clone();
+                let listener = match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => listener,
+                    Err(_) => {
+                        audit.record("http_bind_failed", true);
+                        audit.flush().await;
+                        return Err(
+                            "Porta MCP occupata: impossibile avviare ngrok verso un altro processo"
+                                .into(),
+                        );
+                    }
+                };
+                let mut tunnel = match tunnel::NgrokTunnel::start(port, ngrok_domain).await {
+                    Ok(tunnel) => tunnel,
+                    Err(_) => {
+                        audit.record("http_tunnel_start_failed", true);
+                        audit.flush().await;
+                        return Err("Impossibile avviare ngrok".into());
+                    }
+                };
+                let server =
+                    novagpt_mcp::run_http_on_listener_with(workspaces, listener, token, extras);
                 tokio::pin!(server);
                 let mut published = false;
                 loop {
@@ -399,11 +418,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         result = tunnel.child.wait() => {
                             let _ = result?;
+                            audit.record("http_tunnel_stopped", true);
+                            audit.flush().await;
                             return Err("ngrok terminated; public MCP endpoint unavailable".into());
                         }
                         () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                     }
                     if !published && let Some(endpoint) = tunnel.endpoint().await {
+                        audit.record("http_tunnel_ready", false);
                         // URL is from the local ngrok API and matched to the configured port.
                         // This does not establish that a real ChatGPT remote MCP client works.
                         eprintln!(

@@ -279,51 +279,69 @@ impl Controller {
             match setup {
                 Ok(Ok((workspaces, extras, token))) => {
                     let tx_check = tx.clone();
+                    let probe_token = token.clone();
                     let probe = tokio::spawn(async move {
-                        // Indicates only that the configured TCP endpoint answers, not authenticated MCP readiness.
+                        // An unrelated listener (e.g. CodexPro) must never mark NovaGPT ready.
                         for _ in 0..25 {
                             tokio::time::sleep(Duration::from_millis(100)).await;
-                            if tokio::net::TcpStream::connect(address).await.is_ok() {
+                            if connection::probe(address.port(), &probe_token).await.is_ok() {
                                 let _ = tx_check.send(OperationEvent::Server(ServerState::Running));
                                 let _ = tx_check.send(OperationEvent::Log(
                                     Level::Success,
-                                    format!(
-                                        "Porta TCP {} raggiungibile; MCP su http://{address}/mcp",
-                                        address.port()
-                                    ),
+                                    "Server NovaGPT MCP autenticato e pronto sulla porta locale.".into(),
                                 ));
                                 break;
                             }
                         }
                     });
                     let result: Result<(), Box<dyn std::error::Error>> = if ngrok {
-                        match tunnel::NgrokTunnel::start(address.port(), ngrok_domain).await {
-                            Ok(mut tunnel) => {
-                                let server = async { novagpt_mcp::run_http_with(workspaces, address, token, extras).await.is_ok() };
-                                tokio::pin!(server);
-                                let mut published = false;
-                                loop {
-                                    tokio::select! {
-                                        output = &mut server => {
-                                            // Child also has kill_on_drop: never detach ngrok from the TUI.
-                                            let _ = tunnel.child.start_kill();
-                                            break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
-                                        }
-                                        output = tunnel.child.wait() => {
-                                            let _ = output;
-                                            break Err("Il tunnel ngrok si è chiuso".into());
-                                        }
-                                        () = tokio::time::sleep(Duration::from_millis(450)) => {
-                                            if !published && tunnel.endpoint().await.is_some() {
-                                                published = true;
-                                                let _ = tx.send(OperationEvent::Log(Level::Success,
-                                                    "Tunnel ngrok pronto. Seleziona 'Mostra / copia URL ChatGPT'.".into()));
+                        let audit = extras.audit.clone();
+                        match tokio::net::TcpListener::bind(address).await {
+                            Ok(listener) => {
+                                // Do not start a public tunnel unless NovaGPT owns this port.
+                                match tunnel::NgrokTunnel::start(address.port(), ngrok_domain).await {
+                                    Ok(mut tunnel) => {
+                                        let server = async {
+                                            novagpt_mcp::run_http_on_listener_with(
+                                                workspaces, listener, token, extras
+                                            ).await.is_ok()
+                                        };
+                                        tokio::pin!(server);
+                                        let mut published = false;
+                                        loop {
+                                            tokio::select! {
+                                                output = &mut server => {
+                                                    let _ = tunnel.child.start_kill();
+                                                    break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
+                                                }
+                                                output = tunnel.child.wait() => {
+                                                    let _ = output;
+                                                    audit.record("http_tunnel_stopped", true);
+                                                    break Err("Il tunnel ngrok si è chiuso".into());
+                                                }
+                                                () = tokio::time::sleep(Duration::from_millis(450)) => {
+                                                    if !published && tunnel.endpoint().await.is_some() {
+                                                        audit.record("http_tunnel_ready", false);
+                                                        published = true;
+                                                        let _ = tx.send(OperationEvent::Log(Level::Success,
+                                                            "Tunnel ngrok pronto. Seleziona 'Mostra / copia URL ChatGPT'.".into()));
+                                                    }
+                                                }
                                             }
                                         }
                                     }
+                                    Err(_) => {
+                                        audit.record("http_tunnel_start_failed", true);
+                                        audit.flush().await;
+                                        Err("ngrok non disponibile o configurazione account non valida".into())
+                                    }
                                 }
                             }
-                            Err(_) => Err("ngrok non disponibile o configurazione account non valida".into()),
+                            Err(_) => {
+                                audit.record("http_bind_failed", true);
+                                audit.flush().await;
+                                Err("Porta HTTP occupata: tunnel NON avviato per evitare di esporre un altro server".into())
+                            }
                         }
                     } else {
                         novagpt_mcp::run_http_with(workspaces, address, token, extras).await

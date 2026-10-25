@@ -127,7 +127,7 @@ fn valid_record(event: &AuditEvent) -> bool {
         && event
             .tool
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b == b'_')
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// Loads at most 4 x 64 KiB, without following symlinks or trusting disk records
@@ -253,7 +253,9 @@ impl AuditTrail {
         // Only internal static tool identifiers are accepted, never user-controlled strings.
         if tool.is_empty()
             || tool.len() > 64
-            || !tool.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            || !tool
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         {
             return;
         }

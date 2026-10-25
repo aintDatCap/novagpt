@@ -194,6 +194,44 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         .expect("query DELETE");
     assert!(ended.status().is_success());
 
+    // Redacted persisted diagnostics must distinguish HTTP routing, auth failure
+    // reasons, and successful MCP traffic without recording the token or URL.
+    let (diagnostics, _) = rpc(
+        &client,
+        port,
+        &token,
+        Some(&sid_a),
+        json!({"jsonrpc":"2.0","id":76,"method":"tools/call",
+            "params":{"name":"runtime_status","arguments":{}}}),
+    )
+    .await
+    .expect("diagnostic snapshot");
+    let snapshot = diagnostics["result"]["structuredContent"].to_string();
+    for expected in [
+        "http_server_listening",
+        "http_request_post",
+        "http_request_get",
+        "http_request_delete",
+        "http_auth_missing",
+        "http_auth_query_invalid",
+        "http_auth_query_duplicate",
+        "http_auth_conflicting",
+        "http_auth_query_ok",
+        "http_auth_bearer_ok",
+        "http_status_401",
+        "http_status_200",
+    ] {
+        assert!(
+            snapshot.contains(expected),
+            "missing safe diagnostic {expected}"
+        );
+    }
+    assert!(!snapshot.contains(&token), "secret leaked to diagnostics");
+    assert!(
+        !snapshot.contains(&query_url),
+        "connector URL leaked to diagnostics"
+    );
+
     let mut local_probe = Command::new(env!("CARGO_BIN_EXE_novagpt"));
     local_probe
         .arg("--root")

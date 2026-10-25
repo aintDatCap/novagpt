@@ -427,7 +427,9 @@ where
 
 #[tool_router]
 impl NovaMcp {
-    #[tool(description = "Return bounded metadata-only HUMAN/LLM tool activity for this process")]
+    #[tool(
+        description = "Return bounded metadata-only tool, HTTP auth, and response-status diagnostics for this process"
+    )]
     async fn runtime_status(&self) -> CallToolResult {
         tool_reply(Ok(self.extras.audit.snapshot_flushed(50).await))
     }
@@ -1138,53 +1140,137 @@ pub async fn run_stdio_with(
     Ok(())
 }
 
-/// Auth is evaluated before the MCP service sees POST/GET/DELETE. No URI or
-/// token is ever placed in tracing or audit events.
-fn is_authorized(token: &str, request: &Request) -> bool {
+/// HTTP audit records only bounded static classifiers, never request URI,
+/// headers, identities, secrets, session IDs, bodies or remote IP addresses.
+#[derive(Clone)]
+struct HttpAuthState {
+    token: Arc<String>,
+    audit: AuditTrail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthResult {
+    Query,
+    Bearer,
+    Missing,
+    InvalidQuery,
+    InvalidBearer,
+    DuplicateQuery,
+    Conflicting,
+    QueryTooLong,
+}
+
+impl AuthResult {
+    fn event(self) -> &'static str {
+        match self {
+            Self::Query => "http_auth_query_ok",
+            Self::Bearer => "http_auth_bearer_ok",
+            Self::Missing => "http_auth_missing",
+            Self::InvalidQuery => "http_auth_query_invalid",
+            Self::InvalidBearer => "http_auth_bearer_invalid",
+            Self::DuplicateQuery => "http_auth_query_duplicate",
+            Self::Conflicting => "http_auth_conflicting",
+            Self::QueryTooLong => "http_auth_query_too_long",
+        }
+    }
+    fn accepted(self) -> bool {
+        matches!(self, Self::Query | Self::Bearer)
+    }
+}
+
+fn authorize_reason(token: &str, request: &Request) -> AuthResult {
     let supplied_header = request.headers().get(AUTHORIZATION);
     let expected = format!("Bearer {token}");
     let header_ok = supplied_header
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1);
-
     let query = request.uri().query().unwrap_or("");
     if query.len() > 2048 {
-        return false;
+        return AuthResult::QueryTooLong;
     }
     let mut query_present = false;
     let mut query_valid = false;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         if key == "codexpro_token" {
             if query_present {
-                return false;
-            } // Ambiguous credentials are forbidden.
+                return AuthResult::DuplicateQuery;
+            }
             query_present = true;
             query_valid = value.as_bytes().ct_eq(token.as_bytes()).unwrap_u8() == 1;
         }
     }
-    // If both transports present credentials, both must agree.
-    if supplied_header.is_some() && query_present {
-        header_ok && query_valid
-    } else if query_present {
-        query_valid
-    } else {
-        header_ok
+    match (
+        supplied_header.is_some(),
+        query_present,
+        header_ok,
+        query_valid,
+    ) {
+        (true, true, true, true) => AuthResult::Query,
+        (true, true, _, _) => AuthResult::Conflicting,
+        (false, true, _, true) => AuthResult::Query,
+        (false, true, _, false) => AuthResult::InvalidQuery,
+        (true, false, true, _) => AuthResult::Bearer,
+        (true, false, false, _) => AuthResult::InvalidBearer,
+        (false, false, _, _) => AuthResult::Missing,
     }
 }
 
-async fn authorize(State(token): State<Arc<String>>, mut request: Request, next: Next) -> Response {
-    if !is_authorized(&token, &request) {
+fn response_audit_event(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        200 => "http_status_200",
+        202 => "http_status_202",
+        204 => "http_status_204",
+        400 => "http_status_400",
+        401 => "http_status_401",
+        403 => "http_status_403",
+        404 => "http_status_404",
+        405 => "http_status_405",
+        406 => "http_status_406",
+        409 => "http_status_409",
+        415 => "http_status_415",
+        422 => "http_status_422",
+        500 => "http_status_500",
+        502 => "http_status_502",
+        503 => "http_status_503",
+        _ if status.is_success() => "http_status_other_success",
+        _ if status.is_client_error() => "http_status_other_client_error",
+        _ => "http_status_other_server_error",
+    }
+}
+
+async fn authorize(
+    State(state): State<HttpAuthState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let method_event = match *request.method() {
+        axum::http::Method::POST => "http_request_post",
+        axum::http::Method::GET => "http_request_get",
+        axum::http::Method::DELETE => "http_request_delete",
+        axum::http::Method::OPTIONS => "http_request_options",
+        _ => "http_request_other",
+    };
+    state.audit.record(method_event, false);
+    let decision = authorize_reason(&state.token, &request);
+    state.audit.record(decision.event(), !decision.accepted());
+    if !decision.accepted() {
+        state.audit.record("http_status_401", true);
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
-    // After authentication, remove query credentials *before* entering rmcp.
-    // Avoid a downstream request debug formatter accidentally recording a token.
+    // Strip query credentials before passing the request to the MCP SDK.
     if request.uri().query().is_some() {
         let Ok(safe_uri) = request.uri().path().parse() else {
+            state.audit.record("http_status_400", true);
             return (StatusCode::BAD_REQUEST, "Invalid request path").into_response();
         };
         *request.uri_mut() = safe_uri;
     }
-    next.run(request).await
+    let response = next.run(request).await;
+    let status = response.status();
+    state
+        .audit
+        .record(response_audit_event(status), !status.is_success());
+    response
 }
 
 pub async fn run_http(
@@ -1210,6 +1296,28 @@ pub async fn run_http_with(
                 .into(),
         );
     }
+    let listener = match tokio::net::TcpListener::bind(address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            extras.audit.record("http_bind_failed", true);
+            extras.audit.flush().await;
+            return Err(error.into());
+        }
+    };
+    run_http_on_listener_with(workspaces, listener, token, extras).await
+}
+
+/// For managed tunnels, bind *before* starting ngrok: never advertise an
+/// endpoint pointed at another process already occupying the configured port.
+pub async fn run_http_on_listener_with(
+    workspaces: WorkspaceRegistry,
+    listener: tokio::net::TcpListener,
+    token: String,
+    extras: NovaExtras,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if token.len() < 24 || !listener.local_addr()?.ip().is_loopback() {
+        return Err("MCP HTTP requires a loopback listener and a strong workspace token".into());
+    }
     let audit = extras.audit.clone();
     let service = StreamableHttpService::new(
         move || Ok(NovaMcp::with_extras(workspaces.clone(), extras.clone())),
@@ -1218,14 +1326,22 @@ pub async fn run_http_with(
     );
     let router = Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(Arc::new(token), authorize));
-    let listener = tokio::net::TcpListener::bind(address).await?;
+        .layer(middleware::from_fn_with_state(
+            HttpAuthState {
+                token: Arc::new(token),
+                audit: audit.clone(),
+            },
+            authorize,
+        ));
+    audit.record("http_server_listening", false);
+    let address = listener.local_addr()?;
     tracing::info!(%address, "NovaGPT MCP HTTP listening");
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await;
+    audit.record("http_server_stopped", result.is_err());
     audit.flush().await;
     result?;
     Ok(())
