@@ -120,6 +120,31 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     );
     assert_ne!(sid_a, sid_b, "independent protocol transports must differ");
 
+    let mut local_probe = Command::new(env!("CARGO_BIN_EXE_novagpt"));
+    local_probe
+        .arg("--root")
+        .arg(root.path())
+        .arg("connection-test")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--json")
+        .env("NOVAGPT_HTTP_TOKEN", &token);
+    if cfg!(windows) {
+        local_probe.env("LOCALAPPDATA", private.path());
+    } else {
+        local_probe.env("XDG_STATE_HOME", private.path());
+    }
+    let probe = local_probe.output().expect("local connection test");
+    assert!(
+        probe.status.success(),
+        "local connection-test failed: {}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let probe_json: Value = serde_json::from_slice(&probe.stdout).expect("connection JSON");
+    assert_eq!(probe_json["status"], "ok");
+    assert_eq!(probe_json["authenticated"], true);
+    assert!(!String::from_utf8_lossy(&probe.stdout).contains(&token));
+
     let open_alternate = json!({"jsonrpc":"2.0","id":20,"method":"tools/call",
     "params":{"name":"open_workspace","arguments":{
         "root": alternate.path().to_string_lossy()

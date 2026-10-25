@@ -1,4 +1,5 @@
 //! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
+mod connection;
 mod logging;
 mod settings;
 mod token;
@@ -77,6 +78,15 @@ enum Command {
     Inspect {
         #[arg(long, default_value_t = 300)]
         max_entries: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify an authenticated MCP initialize against the local loopback HTTP endpoint.
+    ConnectionTest {
+        /// Explicit HTTP port, otherwise the configured workspace port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Emit bounded machine-readable result.
         #[arg(long)]
         json: bool,
     },
@@ -187,6 +197,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(action) = &cli.command {
         match action {
+            Command::ConnectionTest { port, json } => {
+                let token = token::resolve(&root)?.value;
+                let result = connection::probe(port.unwrap_or(local.port), &token).await?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("Authenticated NovaGPT MCP HTTP is ready on loopback");
+                }
+                return Ok(());
+            }
             Command::Doctor { json } => {
                 let registry = WorkspaceRegistry::new(&root, &local.allowed_roots)?;
                 let current = registry.default_workspace();
@@ -394,7 +414,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Token { .. } | Command::Logs { .. }) => {
             unreachable!("local commands handled above")
         }
-        Some(Command::Doctor { .. } | Command::Inspect { .. } | Command::Review { .. }) => {
+        Some(
+            Command::Doctor { .. }
+            | Command::Inspect { .. }
+            | Command::Review { .. }
+            | Command::ConnectionTest { .. },
+        ) => {
             unreachable!("read-only commands handled above")
         }
         None => unreachable!("TUI was handled before server startup"),
