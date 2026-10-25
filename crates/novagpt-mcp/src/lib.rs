@@ -172,6 +172,20 @@ struct HandoffCreateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct HandoffWaitArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    plan_hash: Option<String>,
+    #[serde(default)]
+    since_iteration: Option<u32>,
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+    #[serde(default)]
+    poll_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct HandoffReadArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -643,6 +657,56 @@ impl NovaMcp {
             state.read_handoff(args.workspace_id.as_deref(), &args.id)
         })
         .await
+    }
+
+    #[tool(
+        description = "Read-only bounded long-poll for externally produced handoff-run-state.json; does not execute agents"
+    )]
+    async fn wait_for_handoff(
+        &self,
+        Parameters(args): Parameters<HandoffWaitArgs>,
+    ) -> CallToolResult {
+        let max_secs = args.max_wait_seconds.unwrap_or(20);
+        let poll_ms = args.poll_ms.unwrap_or(1000);
+        if !(1..=60).contains(&max_secs) || !(250..=5000).contains(&poll_ms) {
+            return self.observed(
+                "wait_for_handoff",
+                tool_reply::<()>(Err(NovaError::InvalidInput(
+                    "Invalid polling interval or wait duration".into(),
+                ))),
+            );
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+        loop {
+            let state = self.workspaces.clone();
+            let id = args.workspace_id.clone();
+            let hash = args.plan_hash.clone();
+            let iteration = args.since_iteration;
+            let result = tokio::task::spawn_blocking(move || {
+                state.handoff_status(id.as_deref(), hash.as_deref(), iteration)
+            })
+            .await;
+            match result {
+                Ok(Ok(mut status)) => {
+                    if status.awaited_terminal || tokio::time::Instant::now() >= deadline {
+                        status.next_poll_after_seconds =
+                            (!status.awaited_terminal).then_some(poll_ms.div_ceil(1000));
+                        return self.observed("wait_for_handoff", tool_reply(Ok(status)));
+                    }
+                }
+                Ok(Err(error)) => {
+                    return self.observed("wait_for_handoff", tool_reply::<()>(Err(error)));
+                }
+                Err(_) => {
+                    return self.observed(
+                        "wait_for_handoff",
+                        tool_reply::<()>(Err(NovaError::StatePoisoned)),
+                    );
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(remaining.min(std::time::Duration::from_millis(poll_ms))).await;
+        }
     }
 
     #[tool(description = "Load a guarded workspace SKILL.md file at an explicit path")]

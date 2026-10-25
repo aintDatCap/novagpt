@@ -82,6 +82,12 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "Test workspace instructions",
     )
     .expect("instructions fixture");
+    fs::create_dir_all(workspace.path().join(".ai-bridge")).expect("bridge fixture");
+    fs::write(
+        workspace.path().join(".ai-bridge/handoff-run-state.json"),
+        r#"{"state":"completed","plan_hash":"abcd1234","iteration":3,"exit_code":0}"#,
+    )
+    .expect("handoff fixture");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .arg("--root")
@@ -127,6 +133,9 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             }}),
             json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{
                 "name":"codex_context","arguments":{"target_path":"hello.txt"}
+            }}),
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{
+                "name":"wait_for_handoff","arguments":{"plan_hash":"abcd1234","max_wait_seconds":1}
             }}),
         ];
         for message in messages {
@@ -178,6 +187,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "inspect_workspace",
         "handoff_to_agent",
         "read_handoff",
+        "wait_for_handoff",
         "load_skill",
         "vm",
         "vm_guest_status",
@@ -194,13 +204,17 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 37);
+    assert_eq!(listed.len(), 38);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],
         "image/png"
     );
     assert_eq!(by_id(7)["result"]["content"][0]["type"], "image");
+    assert_eq!(
+        by_id(9)["result"]["structuredContent"]["awaited_completed"],
+        true
+    );
     assert_eq!(
         by_id(8)["result"]["structuredContent"]["instructions_changed"],
         true
