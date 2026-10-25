@@ -35,6 +35,9 @@ struct Cli {
     /// Read-only directory containing CodexPro profiles for optional import.
     #[arg(long)]
     codexpro_home: Option<PathBuf>,
+    /// Optional read-only NovaGPT workspace folder to import connection settings from.
+    #[arg(long)]
+    novagpt_source: Option<PathBuf>,
     /// Extra explicitly approved workspace root; repeatable.
     #[arg(long = "allow-root")]
     allow_root: Vec<PathBuf>,
@@ -292,7 +295,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.setup || cli.command.is_none() {
         let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
-        let profiles = settings::discover_codexpro_profiles(&home)?;
+        let mut profiles = settings::discover_codexpro_profiles(&home)?;
+        if let Some(folder) = cli.novagpt_source.as_deref() {
+            let imported = settings::discover_novagpt_workspace(folder, &root)?;
+            profiles.push(imported);
+        }
         let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || tui::run(root, local, cli.setup, profiles, handle))
             .await??;

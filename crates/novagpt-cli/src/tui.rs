@@ -4,7 +4,7 @@ mod model;
 mod operations;
 mod render;
 
-use crate::settings::{CodexProfile, LocalSettings};
+use crate::settings::{ImportProfile, LocalSettings};
 use crossterm::{
     event::{self, Event},
     execute,
@@ -74,7 +74,7 @@ pub fn run(
     root: PathBuf,
     settings: LocalSettings,
     setup: bool,
-    profiles: Vec<CodexProfile>,
+    profiles: Vec<ImportProfile>,
     handle: Handle,
 ) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -248,7 +248,8 @@ mod tests {
     #[test]
     fn import_port_ngrok_and_only_after_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let profile = CodexProfile {
+        let profile = ImportProfile {
+            source: "CodexPro",
             origin: PathBuf::from("fixture.json"),
             root_label: "sample".into(),
             port: Some(9393),
@@ -287,6 +288,45 @@ mod tests {
         a.tab = 2;
         a.key(key(KeyCode::Char('n')));
         assert_eq!(a.step, 3);
+    }
+    #[test]
+    fn nova_workspace_selection_previews_then_imports_only_after_confirmation() {
+        let mut app = app();
+        app.tab = 2;
+        app.config = 13;
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert!(matches!(app.modal, Some(Modal::Edit(Field::NovaSource))));
+        let path = if cfg!(windows) {
+            "C:\\Projects\\example"
+        } else {
+            "/tmp/example"
+        };
+        for ch in path.chars() {
+            app.key(key(KeyCode::Char(ch)));
+        }
+        assert!(matches!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::LoadNovaSource(_))
+        ));
+        assert!(app.busy);
+        app.on_event(OperationEvent::NovaSourceLoaded(Ok(ImportProfile {
+            source: "NovaGPT",
+            origin: PathBuf::from("source/.novagpt/config.json"),
+            root_label: "source".into(),
+            port: Some(9977),
+            tunnel: Some("none".into()),
+            ngrok_domain: None,
+        })));
+        assert!(matches!(app.modal, Some(Modal::ImportPreview)));
+        assert_eq!(app.draft.port, 8787);
+        app.key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm(model::Confirm::Import))
+        ));
+        app.key(key(KeyCode::Char('y')));
+        assert_eq!(app.draft.port, 9977);
+        assert!(app.dirty());
     }
     #[test]
     fn saved_ngrok_preference_controls_normal_http_start() {

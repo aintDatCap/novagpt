@@ -1,5 +1,5 @@
 //! UI state and pure keyboard transitions. Effects are executed by operations.rs.
-use crate::settings::{CodexProfile, LocalSettings};
+use crate::settings::{ImportProfile, LocalSettings};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
     collections::VecDeque,
@@ -45,20 +45,21 @@ pub(super) const COMMANDS: [(&str, &str); 9] = [
         "Mostra l'URL riservato solo su richiesta; premi C per copiarlo.",
     ),
 ];
-pub(super) const CONFIG_ITEMS: [&str; 14] = [
+pub(super) const CONFIG_ITEMS: [&str; 15] = [
     "Porta HTTP",
     "Abilita VM",
     "Abilita ChatGPT Browser",
     "Eseguibile Chrome",
     "Aggiungi directory autorizzata",
     "Rimuovi directory autorizzata",
-    "Scegli profilo CodexPro",
-    "Importa porta + ngrok (anteprima)",
+    "Scegli profilo CodexPro / NovaGPT",
+    "Importa da profilo (anteprima)",
     "Salva configurazione",
     "Annulla modifiche",
     "Genera / verifica token HTTP",
     "Ngrok automatico (ON/OFF)",
     "Dominio ngrok",
+    "Importa da cartella NovaGPT",
     "Prossimo passo setup",
 ];
 const LOG_CAP: usize = 250;
@@ -89,6 +90,7 @@ pub(super) enum Field {
     Chrome,
     Root,
     NgrokDomain,
+    NovaSource,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Confirm {
@@ -123,6 +125,7 @@ pub(super) enum Effect {
     ValidateChrome(PathBuf),
     Save(LocalSettings, bool),
     EnsureToken,
+    LoadNovaSource(PathBuf),
     Quit,
 }
 #[derive(Debug)]
@@ -136,6 +139,7 @@ pub(super) enum OperationEvent {
     TokenPresent(String),
     ConnectorUrlReady(Result<String, String>),
     CopyFinished(Result<(), String>),
+    NovaSourceLoaded(Result<ImportProfile, String>),
     Saved {
         settings: LocalSettings,
         outcome: Result<String, String>,
@@ -145,7 +149,7 @@ pub(super) struct App {
     pub root: PathBuf,
     pub draft: LocalSettings,
     pub persisted: LocalSettings,
-    pub profiles: Vec<CodexProfile>,
+    pub profiles: Vec<ImportProfile>,
     pub setup: bool,
     pub step: usize,
     pub tab: usize,
@@ -172,7 +176,7 @@ impl App {
         root: PathBuf,
         settings: LocalSettings,
         setup: bool,
-        profiles: Vec<CodexProfile>,
+        profiles: Vec<ImportProfile>,
     ) -> Self {
         let mut app = Self {
             root,
@@ -214,7 +218,7 @@ impl App {
                 .is_some_and(|c| *c != self.persisted)
     }
     pub fn config_len(&self) -> usize {
-        if self.setup { 14 } else { 13 }
+        if self.setup { 15 } else { 14 }
     }
     pub fn log(&mut self, level: Level, message: impl Into<String>) {
         let message = message.into();
@@ -281,6 +285,21 @@ impl App {
                 Ok(()) => self.log(Level::Success, "URL copiato negli appunti su richiesta."),
                 Err(message) => self.log(Level::Error, message),
             },
+            OperationEvent::NovaSourceLoaded(result) => {
+                self.busy = false;
+                match result {
+                    Ok(profile) => {
+                        self.profiles.push(profile);
+                        self.profile = self.profiles.len().saturating_sub(1);
+                        self.modal = Some(Modal::ImportPreview);
+                        self.log(
+                            Level::Info,
+                            "Cartella NovaGPT verificata: controlla l'anteprima.",
+                        );
+                    }
+                    Err(message) => self.log(Level::Error, message),
+                }
+            }
             OperationEvent::TokenPresent(message) => {
                 self.auth_state = "Pronto".to_string();
                 self.log(Level::Info, message);
@@ -466,6 +485,7 @@ impl App {
                 .unwrap_or_default(),
             Field::Root => String::new(),
             Field::NgrokDomain => self.draft.ngrok_domain.clone().unwrap_or_default(),
+            Field::NovaSource => String::new(),
         };
         self.input_error = None;
         self.modal = Some(Modal::Edit(field));
@@ -499,6 +519,18 @@ impl App {
                     return None;
                 }
                 self.draft.ngrok_domain = (!value.is_empty()).then(|| value.to_string());
+            }
+            Field::NovaSource => {
+                let folder = PathBuf::from(value);
+                if !folder.is_absolute() {
+                    self.input_error =
+                        Some("Indica un percorso assoluto della cartella NovaGPT.".into());
+                    return None;
+                }
+                self.modal = None;
+                self.input.clear();
+                self.busy = true;
+                return Some(Effect::LoadNovaSource(folder));
             }
             Field::Root => {
                 if value.is_empty() {
@@ -549,7 +581,7 @@ impl App {
                 if !self.profiles.is_empty() {
                     self.profile = (self.profile + 1) % self.profiles.len();
                 } else {
-                    self.log(Level::Warn, "Nessun profilo CodexPro disponibile.");
+                    self.log(Level::Warn, "Nessun profilo di importazione disponibile.");
                 }
             }
             7 => {
@@ -588,7 +620,12 @@ impl App {
                 );
             }
             12 => self.start_edit(Field::NgrokDomain),
-            13 if self.setup && self.step < 4 => {
+            13 => {
+                if !self.busy {
+                    self.start_edit(Field::NovaSource);
+                }
+            }
+            14 if self.setup && self.step < 4 => {
                 self.step = (self.step + 1).min(3);
             }
             _ => {}

@@ -92,6 +92,191 @@ fn make_command(shell: &str, command: &str, mode: BashMode) -> NovaResult<(Comma
     Ok((process, selected.into()))
 }
 
+#[cfg(windows)]
+fn msvc_linker_available_on_path() -> bool {
+    std::env::var_os("PATH").is_some_and(|value| {
+        // Git for Windows also ships an unrelated link.exe; that is not the
+        // Microsoft C++ linker required by Rust's MSVC target.
+        std::env::split_paths(&value).any(|dir| {
+            dir.join("link.exe").is_file()
+                && dir
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("vc\\tools\\msvc")
+        })
+    })
+}
+
+#[cfg(windows)]
+fn visual_studio_toolchain(
+    installation: &Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let versions = installation.join("VC").join("Tools").join("MSVC");
+    let mut candidates = std::fs::read_dir(versions)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    for version in candidates.into_iter().rev() {
+        for host in ["Hostx64", "Hostx86"] {
+            let binary = version.join("bin").join(host).join("x64");
+            let libraries = version.join("lib").join("x64");
+            if binary.join("link.exe").is_file() && libraries.is_dir() {
+                return Some((binary, libraries));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn installed_msvc_toolchain() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if let Some(root) = std::env::var_os("VSINSTALLDIR")
+        && let Some(toolchain) = visual_studio_toolchain(Path::new(&root))
+    {
+        return Some(toolchain);
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        let Some(base) = std::env::var_os(key) else {
+            continue;
+        };
+        let versions = Path::new(&base).join("Microsoft Visual Studio");
+        let Ok(years) = std::fs::read_dir(versions) else {
+            continue;
+        };
+        for year in years.flatten() {
+            if !year.path().is_dir() {
+                continue;
+            }
+            let Ok(editions) = std::fs::read_dir(year.path()) else {
+                continue;
+            };
+            for edition in editions.flatten() {
+                if let Some(toolchain) = visual_studio_toolchain(&edition.path()) {
+                    return Some(toolchain);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_sdk_paths() -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("WindowsSdkDir") {
+        roots.push(std::path::PathBuf::from(root));
+    }
+    if let Some(root) = std::env::var_os("ProgramFiles(x86)") {
+        roots.push(Path::new(&root).join("Windows Kits").join("10"));
+    }
+    for root in roots {
+        let mut versions = match std::fs::read_dir(root.join("Lib")) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>(),
+            Err(_) => continue,
+        };
+        versions.sort();
+        for version in versions.into_iter().rev() {
+            let version_dir = root.join("Lib").join(&version);
+            let lib_paths = [
+                version_dir.join("um").join("x64"),
+                version_dir.join("ucrt").join("x64"),
+            ];
+            if !lib_paths.iter().all(|p| p.is_dir()) {
+                continue;
+            }
+            let include_dir = root.join("Include").join(&version);
+            let includes = ["ucrt", "um", "shared", "winrt"]
+                .iter()
+                .map(|segment| include_dir.join(segment))
+                .filter(|p| p.is_dir())
+                .collect::<Vec<_>>();
+            let mut paths = lib_paths.to_vec();
+            let sdk_bin = root.join("bin").join(&version).join("x64");
+            if sdk_bin.is_dir() {
+                paths.push(sdk_bin);
+            }
+            return (paths, includes);
+        }
+    }
+    (Vec::new(), Vec::new())
+}
+
+#[cfg(windows)]
+fn add_development_paths(process: &mut Command, key: &str, extra: &[std::path::PathBuf]) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut paths = extra.to_vec();
+    if let Some(original) = std::env::var_os(key) {
+        paths.extend(std::env::split_paths(&original));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        process.env(key, joined);
+    }
+}
+
+/// Populate only approved compiler/SDK paths. No generic shell is introduced.
+/// A VS developer terminal may have these set already; otherwise look for the
+/// installed MSVC linker in Program Files, rather than claiming it is absent.
+#[cfg(windows)]
+fn configure_msvc_environment(process: &mut Command) {
+    for key in [
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "VCINSTALLDIR",
+        "VSINSTALLDIR",
+        "VCToolsInstallDir",
+        "VCToolsVersion",
+        "VisualStudioVersion",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
+        "UniversalCRTSdkDir",
+        "UCRTVersion",
+        "VSCMD_ARG_HOST_ARCH",
+        "VSCMD_ARG_TGT_ARCH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            process.env(key, value);
+        }
+    }
+    if msvc_linker_available_on_path() {
+        return;
+    }
+    let Some((linker_bin, vc_lib)) = installed_msvc_toolchain() else {
+        return;
+    };
+    let (mut sdk_paths, mut sdk_includes) = windows_sdk_paths();
+    let mut bin_paths = vec![linker_bin];
+    // Windows Kit 'bin' contains rc.exe and mt.exe, needed by build scripts.
+    sdk_paths.retain(|p| {
+        if p.join("rc.exe").is_file() {
+            bin_paths.push(p.clone());
+            false
+        } else {
+            true
+        }
+    });
+    add_development_paths(process, "PATH", &bin_paths);
+    let mut lib_paths = vec![vc_lib];
+    lib_paths.extend(sdk_paths);
+    add_development_paths(process, "LIB", &lib_paths);
+    if let Some(vc_version) = lib_paths
+        .first()
+        .and_then(|path| path.parent())
+        .and_then(Path::parent)
+    {
+        sdk_includes.insert(0, vc_version.join("include"));
+    }
+    add_development_paths(process, "INCLUDE", &sdk_includes);
+}
+
 impl WorkspaceRegistry {
     pub async fn run_bash(&self, mode: BashMode, request: BashRequest) -> NovaResult<BashResult> {
         if mode == BashMode::Off {
@@ -157,6 +342,9 @@ impl WorkspaceRegistry {
                 "HOMEPATH",
                 "APPDATA",
                 "LOCALAPPDATA",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
                 "CARGO_HOME",
                 "RUSTUP_HOME",
                 "RUSTUP_TOOLCHAIN",
@@ -168,6 +356,8 @@ impl WorkspaceRegistry {
             process
                 .env("CARGO_TERM_COLOR", "never")
                 .env("NO_COLOR", "1");
+            #[cfg(windows)]
+            configure_msvc_environment(&mut process);
         }
 
         let start = Instant::now();
@@ -239,6 +429,46 @@ impl WorkspaceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn discovers_valid_msvc_linker_with_matching_libraries() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let vc_tools = fixture.path().join("VC").join("Tools").join("MSVC");
+        let old_version = vc_tools.join("14.37");
+        let newest = vc_tools.join("14.42");
+        for version in [&old_version, &newest] {
+            std::fs::create_dir_all(version.join("bin").join("Hostx64").join("x64"))
+                .expect("binary dir");
+            std::fs::create_dir_all(version.join("lib").join("x64")).expect("library dir");
+        }
+        std::fs::write(
+            old_version
+                .join("bin")
+                .join("Hostx64")
+                .join("x64")
+                .join("link.exe"),
+            b"fixture",
+        )
+        .expect("old linker");
+        // An incomplete new version must not be selected.
+        let (binary, library) = visual_studio_toolchain(fixture.path()).expect("valid linker");
+        assert!(binary.starts_with(&old_version));
+        assert!(library.starts_with(&old_version));
+        std::fs::write(
+            newest
+                .join("bin")
+                .join("Hostx64")
+                .join("x64")
+                .join("link.exe"),
+            b"fixture",
+        )
+        .expect("new linker");
+        let (binary, library) =
+            visual_studio_toolchain(fixture.path()).expect("newest valid linker");
+        assert!(binary.starts_with(&newest));
+        assert!(library.starts_with(&newest));
+    }
+
     #[tokio::test]
     async fn safe_mode_denies_shell_mischief_and_traversal() {
         let home = tempfile::tempdir().expect("workspace");

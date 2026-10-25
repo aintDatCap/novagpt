@@ -101,6 +101,14 @@ impl Controller {
                     let _ = tx.send(OperationEvent::CopyFinished(result));
                 });
             }
+            Effect::LoadNovaSource(source) => {
+                let tx = self.tx.clone();
+                self.runtime.spawn_blocking(move || {
+                    let result = settings::discover_novagpt_workspace(&source, &root)
+                        .map_err(|_| "Impossibile importare la cartella: verifica percorso e .novagpt/config.json.".to_string());
+                    let _ = tx.send(OperationEvent::NovaSourceLoaded(result));
+                });
+            }
             Effect::Stop => self.stop(),
             Effect::Inventory => {
                 let tx = self.tx.clone();

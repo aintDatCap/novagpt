@@ -142,7 +142,8 @@ impl LocalSettings {
     }
 }
 #[derive(Clone, Debug)]
-pub struct CodexProfile {
+pub struct ImportProfile {
+    pub source: &'static str,
     pub origin: PathBuf,
     pub root_label: String,
     pub port: Option<u16>,
@@ -150,7 +151,7 @@ pub struct CodexProfile {
     pub ngrok_domain: Option<String>,
 }
 /// Reads only selected public configuration fields from CodexPro workspace profiles.
-pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<CodexProfile>> {
+pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<ImportProfile>> {
     let dir = home.join("profiles");
     if !dir.exists() {
         return Ok(Vec::new());
@@ -202,7 +203,8 @@ pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<CodexProfile>> 
         } else {
             None
         };
-        found.push(CodexProfile {
+        found.push(ImportProfile {
+            source: "CodexPro",
             origin: path,
             root_label: root.to_string(),
             port,
@@ -213,6 +215,55 @@ pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<CodexProfile>> 
     found.sort_by(|a, b| a.root_label.cmp(&b.root_label));
     Ok(found)
 }
+/// Read public settings from another NovaGPT workspace without loading its
+/// token, permissions, browser or VM state. The source must be a real directory.
+pub fn discover_novagpt_workspace(source: &Path, target: &Path) -> io::Result<ImportProfile> {
+    if !source.is_absolute() {
+        return Err(invalid("source workspace must be an absolute path"));
+    }
+    real_dir(source)?;
+    let source = fs::canonicalize(source)?;
+    let target = fs::canonicalize(target)?;
+    if source == target {
+        return Err(invalid("cannot import from the active workspace"));
+    }
+    real_dir(&source)?;
+    let config_dir = local_dir(&source);
+    real_dir(&config_dir)?;
+    let origin = config_path(&source);
+    let settings: LocalSettings = serde_json::from_slice(&read_limited(&origin)?)?;
+    // The imported connection values are independently validated; other fields
+    // are parsed solely for schema compatibility and are never copied.
+    if settings.version != 1
+        || settings.port == 0
+        || settings
+            .ngrok_domain
+            .as_deref()
+            .is_some_and(|domain| !crate::tunnel::valid_domain(domain))
+    {
+        return Err(invalid("unsupported NovaGPT source connection settings"));
+    }
+    Ok(ImportProfile {
+        source: "NovaGPT",
+        origin,
+        root_label: source.display().to_string(),
+        port: Some(settings.port),
+        tunnel: Some(
+            if settings.ngrok_enabled {
+                "ngrok"
+            } else {
+                "none"
+            }
+            .into(),
+        ),
+        ngrok_domain: if settings.ngrok_enabled {
+            settings.ngrok_domain
+        } else {
+            None
+        },
+    })
+}
+
 pub fn codexpro_home() -> PathBuf {
     if let Some(home) = std::env::var_os("CODEXPRO_HOME") {
         return PathBuf::from(home);
@@ -224,14 +275,19 @@ pub fn codexpro_home() -> PathBuf {
 }
 /// Never imports secrets, ngrok configuration file contents, granted roots,
 /// private browser profiles, or VM state. Called only after TUI confirmation.
-pub fn import_supported(settings: &mut LocalSettings, profile: &CodexProfile) {
+pub fn import_supported(settings: &mut LocalSettings, profile: &ImportProfile) {
     if let Some(port) = profile.port {
         settings.port = port;
     }
     if let Some(ref tunnel) = profile.tunnel {
         if tunnel == "ngrok" {
-            // A malformed/absent hostname must not enable a misleading public tunnel.
-            if let Some(ref domain) = profile.ngrok_domain {
+            if profile.source == "NovaGPT" {
+                // NovaGPT permits on-demand ngrok domains. Preserve its tunnel
+                // preference even without a fixed hostname.
+                settings.ngrok_enabled = true;
+                settings.ngrok_domain = profile.ngrok_domain.clone();
+            } else if let Some(ref domain) = profile.ngrok_domain {
+                // CodexPro imports still require a validated static hostname.
                 settings.ngrok_enabled = true;
                 settings.ngrok_domain = Some(domain.clone());
             }
@@ -333,6 +389,63 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn imports_only_connection_settings_from_other_novagpt_directory() {
+        let source = tempfile::tempdir().expect("source");
+        let destination = tempfile::tempdir().expect("destination");
+        let source_cfg = LocalSettings {
+            port: 9431,
+            ngrok_enabled: true,
+            ngrok_domain: Some("imported.ngrok-free.dev".into()),
+            vm_enabled: true,
+            allowed_roots: vec![source.path().to_path_buf()],
+            ..LocalSettings::default()
+        };
+        source_cfg.save(source.path()).expect("save source");
+        let profile =
+            discover_novagpt_workspace(source.path(), destination.path()).expect("discover");
+        assert_eq!(profile.source, "NovaGPT");
+        assert_eq!(profile.port, Some(9431));
+        let mut imported = LocalSettings::default();
+        import_supported(&mut imported, &profile);
+        assert_eq!(imported.port, 9431);
+        assert!(imported.ngrok_enabled);
+        assert_eq!(
+            imported.ngrok_domain.as_deref(),
+            Some("imported.ngrok-free.dev")
+        );
+        assert!(!imported.vm_enabled);
+        assert!(imported.allowed_roots.is_empty());
+        assert!(
+            !config_path(destination.path()).exists(),
+            "import must only modify draft"
+        );
+        assert!(discover_novagpt_workspace(source.path(), source.path()).is_err());
+        assert!(discover_novagpt_workspace(destination.path(), source.path()).is_err());
+    }
+    #[test]
+    fn dynamic_ngrok_preference_roundtrips_without_a_static_hostname() {
+        let source = tempfile::tempdir().expect("source");
+        let target = tempfile::tempdir().expect("target");
+        let source_config = LocalSettings {
+            port: 9300,
+            ngrok_enabled: true,
+            ngrok_domain: None,
+            ..LocalSettings::default()
+        };
+        source_config.save(source.path()).expect("source settings");
+        let profile = discover_novagpt_workspace(source.path(), target.path()).expect("profile");
+        let mut destination = LocalSettings {
+            ngrok_enabled: false,
+            ngrok_domain: Some("old.ngrok-free.dev".into()),
+            ..LocalSettings::default()
+        };
+        import_supported(&mut destination, &profile);
+        assert!(destination.ngrok_enabled);
+        assert_eq!(destination.ngrok_domain, None);
+        assert_eq!(destination.port, 9300);
+    }
+
     #[test]
     fn bad_settings_rejected() {
         let cfg = LocalSettings {

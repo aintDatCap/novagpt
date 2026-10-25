@@ -123,6 +123,7 @@ fn config_value(app: &App, index: usize) -> String {
                 .unwrap_or("(non impostato)"),
             dirty_mark(app.draft.ngrok_domain != app.persisted.ngrok_domain)
         ),
+        13 => "scegli cartella sorgente".into(),
         _ => format!("passo {}/4", app.step.min(3) + 1),
     }
 }
@@ -349,7 +350,7 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(instructions),
-                Line::from("Le autorizzazioni e le credenziali CodexPro non sono mai importate."),
+                Line::from("Permessi, token e file dei progetti non vengono importati da CodexPro o NovaGPT."),
             ])
             .wrap(Wrap { trim: true })
             .block(panel(" Setup guidato ")),
@@ -503,7 +504,7 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
         ),
         Modal::SetupResult(message) => ("Setup terminato".into(), message.clone(), "Invio / Esc per chiudere".into()),
         Modal::Edit(field) => {
-            let title = match field { Field::Port => "Modifica porta HTTP", Field::Chrome => "Percorso Chrome", Field::Root => "Aggiungi directory autorizzata", Field::NgrokDomain => "Dominio ngrok (hostname)" };
+            let title = match field { Field::Port => "Modifica porta HTTP", Field::Chrome => "Percorso Chrome", Field::Root => "Aggiungi directory autorizzata", Field::NgrokDomain => "Dominio ngrok (hostname)", Field::NovaSource => "Percorso workspace NovaGPT sorgente" };
             let error = app.input_error.clone().unwrap_or_default();
             (title.into(), format!("Inserisci il valore e premi Invio:\n\n{}▏\n\n{}", app.input, error),
                 "Invio applica • Esc annulla".into())
@@ -516,8 +517,8 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
         Modal::ImportPreview => {
             let selected = app.profiles.get(app.profile);
             ("Anteprima importazione".into(), selected.map_or("Nessun profilo.".into(), |p|
-                format!("Sorgente: {}\nWorkspace profilo: {}\nPorta HTTP: {} -> {:?}\nTunnel CodexPro: {}\nDominio ngrok importabile: {}\n\nImporta nella bozza solo porta, tunnel ngrok e hostname valido. Non importa token, file ngrokConfig, root, dati VM o browser.\nNessuna modifica finche' non confermi e salvi.",
-                    p.origin.display(), p.root_label, app.draft.port, p.port,
+                format!("Sorgente: {}\nProfilo {}\nWorkspace profilo: {}\nPorta HTTP: {} -> {:?}\nTunnel sorgente: {}\nDominio ngrok importabile: {}\n\nImporta nella bozza solo porta, tunnel ngrok e hostname valido. Non importa token, file ngrokConfig, root, dati VM o browser.\nNessuna modifica finche' non confermi e salvi.",
+                    p.origin.display(), p.source, p.root_label, app.draft.port, p.port,
                     p.tunnel.as_deref().unwrap_or("(assente)"), p.ngrok_domain.as_deref().unwrap_or("(non disponibile)"))),
             "Invio prosegui alla conferma • Esc annulla".into())
         }

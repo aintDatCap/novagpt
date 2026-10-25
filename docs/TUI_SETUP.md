@@ -85,6 +85,8 @@ Apre la **stessa TUI** inizialmente su Config. Segui il banner:
 3. **Import facoltativo:** scegli un profilo CodexPro e visualizza l'anteprima prima della conferma.
 4. **Revisione:** salva solo dopo conferma esplicita; il risultato finale e' visualizzato. In questa fase NovaGPT genera automaticamente anche il token HTTP, salvo override tramite ambiente.
 
+L'importazione da un altro workspace NovaGPT è disponibile direttamente nel menu **Config → Importa da cartella NovaGPT**, indicando un percorso assoluto, oppure all'avvio con `novagpt --novagpt-source C:\\path\\to\\other-workspace`. Legge in sola lettura `<sorgente>/.novagpt/config.json` e propone **solo porta HTTP, stato ngrok e dominio ngrok**; anteprima, conferma e salvataggio sono separati. Non copia i file di progetto, i token, le autorizzazioni alle directory, VM, browser o altre impostazioni sensibili. La cartella sorgente non viene modificata.
+
 L'importazione CodexPro legge **porta HTTP**, preferenza `tunnel` e, solo quando `tunnel=ngrok` e l'hostname e' valido, il **dominio ngrok**. Importare un profilo con tunnel differente disabilita l'avvio automatico ngrok; un hostname ngrok mancante o non valido non abilita automaticamente il tunnel. L'anteprima e la conferma sono obbligatorie; la modifica resta **in bozza** fino a Salva. Token, file `ngrokConfig` e relativo contenuto, profili Chrome, credenziali, dati VM e permessi filesystem non vengono copiati. La directory sorgente (`~/.codexpro/profiles` o `--codexpro-home`) viene **solo letta**; CodexPro non viene modificato.
 
 Il setup, dopo il salvataggio, installa in modo locale:
