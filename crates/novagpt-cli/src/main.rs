@@ -1,5 +1,6 @@
 //! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
 mod settings;
+mod token;
 mod tui;
 
 use clap::{Parser, Subcommand};
@@ -57,6 +58,11 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Manage the auto-generated per-workspace MCP HTTP token.
+    Token {
+        #[command(subcommand)]
+        action: TokenCommand,
+    },
     /// Import an approved qcow2/VHDX disk to NovaGPT's owned VM image store.
     VmImport {
         #[arg(long)]
@@ -70,6 +76,14 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Reveal the active token to the invoking terminal (handle as a password).
+    Show,
+    /// Print the local token-file path without revealing the token.
+    Path,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -81,6 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--setup cannot be combined with a server subcommand".into());
     }
     let local = LocalSettings::load(&root)?;
+    if let Some(Command::Token { action }) = &cli.command {
+        match action {
+            TokenCommand::Show => println!("{}", token::resolve(&root)?.value),
+            TokenCommand::Path => println!("{}", token::path(&root)?.display()),
+        }
+        return Ok(());
+    }
     if cli.setup || cli.command.is_none() {
         let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
         let profiles = settings::discover_codexpro_profiles(&home)?;
@@ -131,8 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
         Some(Command::Http { port }) => {
-            let token = std::env::var("NOVAGPT_HTTP_TOKEN")
-                .map_err(|_| "NOVAGPT_HTTP_TOKEN is required for HTTP transport")?;
+            let token = token::resolve(&root)?.value;
             novagpt_mcp::run_http_with(
                 workspaces,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.unwrap_or(local.port)),
@@ -161,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.bytes
             );
         }
+        Some(Command::Token { .. }) => unreachable!("token commands handled above"),
         None => unreachable!("TUI was handled before server startup"),
     }
     Ok(())
