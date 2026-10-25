@@ -6,7 +6,7 @@ Architecture: `novagpt-core` (workspace/security/file operations), `novagpt-mcp`
 
 ## Build and Ratatui TUI
 
-`novagpt` without a subcommand opens an interactive, three-tab terminal UI for the current directory (or `--root`). `novagpt --setup` opens the same TUI on its setup tab and, when you press `s`, saves the local configuration and installs a launcher under `<workspace>/.novagpt/`. The optional CodexPro import is **read-only and port-only**; no credentials or browser/VM data are copied. See [TUI setup instructions](docs/TUI_SETUP.md).
+`novagpt` without a subcommand opens an interactive, three-tab terminal UI for the current directory (or `--root`). Navigate its stateful command/config menus with arrows and `Enter`; `?` shows help. `novagpt --setup` opens the same TUI with a guided, four-step configuration flow. Choose Save (`s` is optional) and **explicitly confirm** before writing local settings and installing a non-overwriting launcher under `<workspace>/.novagpt/`. CodexPro import is **read-only and port-only**, with preview and separate confirmation; no credentials or browser/VM data are copied. HTTP tokens are automatically generated per workspace, kept in per-user private state outside the repository, and revealed only on explicit `novagpt token show`. See [TUI setup instructions](docs/TUI_SETUP.md).
 
 ```powershell
 cargo build --workspace
@@ -14,13 +14,13 @@ cargo test --workspace
 cargo run -p novagpt-cli -- --root C:\path\to\repo stdio
 ```
 
-For Streamable HTTP on localhost, set a strong token in the `NOVAGPT_HTTP_TOKEN` environment variable, then:
+For Streamable HTTP on localhost, NovaGPT automatically generates and reuses a strong per-workspace token when `NOVAGPT_HTTP_TOKEN` is unset (the environment variable still takes precedence):
 
 ```powershell
 cargo run -p novagpt-cli -- --root C:\path\to\repo http --port 8787
 ```
 
-The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP requires a token; stdio does not.
+The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP always requires a token; stdio does not. Retrieve the active token locally with `novagpt token show` (secret output) or view its path with `novagpt token path`. Do not paste the token into logs, screenshots or Git.
 
 ## Status
 
