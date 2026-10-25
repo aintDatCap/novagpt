@@ -215,7 +215,11 @@ fn ensure_at(file: &Path) -> io::Result<Resolved> {
                     Err(err) if err.kind() == io::ErrorKind::InvalidData => {
                         private_file(file)?; // fail immediately for symlink, permissions or unexpected type
                         let meta = fs::metadata(file)?;
-                        if meta.len() != 0 {
+                        // create_new publishes the empty file before its contents are
+                        // written. A short read can therefore be an in-flight write,
+                        // not necessarily a corrupted persisted token.
+                        // A full-length malformed token must still fail closed.
+                        if meta.len() >= 64 {
                             return Err(err);
                         }
                         thread::sleep(Duration::from_millis(20));
