@@ -44,7 +44,9 @@ Usa le frecce e Invio, non necessariamente i tasti numerici.
 - **Inventario VM:** legge lo store locale approvato se VM e' abilitata nella configurazione salvata.
 - **Operazioni VM / Sottoagenti / Client e CLI:** modali con gli strumenti **MCP realmente disponibili** e relativi comandi espliciti. Non simulano operazioni host, browser o subagenti. Con un client MCP: `vm` supporta `images/create/status/destroy`; gli strumenti `subagent_*` richiedono il browser dedicato configurato. L'import VM manuale rimane la CLI esplicita `novagpt vm-import --name NAME --source PATH`. Per stdio: `novagpt stdio`. Per HTTP da CLI: `novagpt http --port 8787`.
 
-L'indicazione **TCP raggiungibile** in Stato e' un probe locale; non e' un handshake MCP autenticato. Non sono presenti tunnel o pannelli web.
+L'indicazione **TCP raggiungibile** in Stato e' un probe locale; non e' un handshake MCP autenticato. La TUI non avvia o visualizza tunnel: ngrok e' disponibile soltanto con l'avvio CLI esplicito `novagpt http --ngrok` e non ha ancora una verifica ChatGPT remota. Non e' presente alcun pannello web.
+
+La TUI abilita il set iniziale di comandi Rust Bash in modalita' `safe`: solo verifiche Rust predefinite, senza interpretazione shell. Le opzioni CLI `--bash-mode off` e `--bash-mode full --allow-full-shell` si applicano all'avvio esplicito `stdio`/`http` e non sono ancora un controllo della TUI. Gli strumenti Git, patch e import sono invocabili tramite MCP e non costituiscono menu TUI dedicati.
 
 ## Token HTTP automatico
 

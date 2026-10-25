@@ -1101,6 +1101,7 @@ dependencies = [
  "novagpt-mcp",
  "novagpt-vm",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1115,6 +1116,7 @@ name = "novagpt-core"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "reqwest",
  "serde",
  "sha2",
  "tempfile",

@@ -124,6 +124,13 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     for name in [
         "read",
         "write",
+        "git",
+        "git_status",
+        "git_diff",
+        "show_changes",
+        "bash",
+        "apply_patch",
+        "import_file",
         "vm",
         "vm_guest_status",
         "subagent_spawn",
@@ -139,7 +146,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 16);
+    assert_eq!(listed.len(), 23);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(by_id(4)["result"]["isError"], true);
     assert!(

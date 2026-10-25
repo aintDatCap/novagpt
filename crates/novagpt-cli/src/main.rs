@@ -2,11 +2,12 @@
 mod settings;
 mod token;
 mod tui;
+mod tunnel;
 
 use clap::{Parser, Subcommand};
 use novagpt_agents::{AgentManager, ChatGptBackend};
 use novagpt_browser::ChatGptBrowser;
-use novagpt_core::WorkspaceRegistry;
+use novagpt_core::{BashMode, WorkspaceRegistry};
 use novagpt_mcp::NovaExtras;
 use novagpt_vm::VmManager;
 use settings::LocalSettings;
@@ -44,6 +45,12 @@ struct Cli {
     /// Dedicated browser profile path; never reuse a personal or CodexPro profile.
     #[arg(long)]
     chatgpt_profile: Option<PathBuf>,
+    /// Shell access mode: off, safe (fixed quality commands), or explicitly approved full.
+    #[arg(long, value_parser = ["off", "safe", "full"], default_value = "safe")]
+    bash_mode: String,
+    /// Explicit acknowledgement required for unrestricted shell execution.
+    #[arg(long)]
+    allow_full_shell: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -57,6 +64,12 @@ enum Command {
         /// Explicit port overrides the workspace's saved port.
         #[arg(long)]
         port: Option<u16>,
+        /// Explicitly expose token-protected MCP HTTP through an owned ngrok process.
+        #[arg(long)]
+        ngrok: bool,
+        /// Optional stable ngrok hostname (must already be available to your account).
+        #[arg(long, requires = "ngrok")]
+        ngrok_domain: Option<String>,
     },
     /// Manage the auto-generated per-workspace MCP HTTP token.
     Token {
@@ -148,18 +161,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
     };
-    let extras = NovaExtras { vm, agents };
+    let bash_mode = match cli.bash_mode.as_str() {
+        "off" => BashMode::Off,
+        "safe" => BashMode::Safe,
+        "full" if cli.allow_full_shell => BashMode::Full,
+        "full" => return Err("full Bash access requires --allow-full-shell".into()),
+        _ => return Err("invalid Bash mode".into()),
+    };
+    let extras = NovaExtras {
+        vm,
+        agents,
+        bash_mode,
+    };
     match cli.command {
         Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
-        Some(Command::Http { port }) => {
+        Some(Command::Http {
+            port,
+            ngrok,
+            ngrok_domain,
+        }) => {
+            let port = port.unwrap_or(local.port);
             let token = token::resolve(&root)?.value;
-            novagpt_mcp::run_http_with(
-                workspaces,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port.unwrap_or(local.port)),
-                token,
-                extras,
-            )
-            .await?;
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            if ngrok {
+                let mut tunnel = tunnel::NgrokTunnel::start(port, ngrok_domain).await?;
+                let server = novagpt_mcp::run_http_with(workspaces, address, token, extras);
+                tokio::pin!(server);
+                let mut published = false;
+                loop {
+                    tokio::select! {
+                        result = &mut server => {
+                            tunnel.stop().await;
+                            result?;
+                            break;
+                        }
+                        result = tunnel.child.wait() => {
+                            let _ = result?;
+                            return Err("ngrok terminated; public MCP endpoint unavailable".into());
+                        }
+                        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                    }
+                    if !published && let Some(endpoint) = tunnel.endpoint().await {
+                        // URL is from the local ngrok API and matched to the configured port.
+                        // This does not establish that a real ChatGPT remote MCP client works.
+                        eprintln!(
+                            "ngrok MCP endpoint: {endpoint} (ChatGPT compatibility not yet verified)"
+                        );
+                        published = true;
+                    }
+                }
+            } else {
+                novagpt_mcp::run_http_with(workspaces, address, token, extras).await?;
+            }
         }
         Some(Command::VmImport {
             name,

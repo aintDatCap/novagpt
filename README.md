@@ -22,9 +22,28 @@ cargo run -p novagpt-cli -- --root C:\path\to\repo http --port 8787
 
 The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP always requires a token; stdio does not. Retrieve the active token locally with `novagpt token show` (secret output) or view its path with `novagpt token path`. Do not paste the token into logs, screenshots or Git.
 
+## Git, Bash, patch and attachment import (INITIAL)
+
+NovaGPT now also exposes MCP tools `git`, `git_status`, `git_diff`, `show_changes`, `bash`, `apply_patch` and `import_file`. These are **initial guarded implementations**, not complete CodexPro parity. Git supports status/history, guarded single-file diff, branches, staging and unstaging. Destructive Git restore, commit and worktree actions explicitly reject requests; workspace-wide raw diff is refused unless a safe individual file path is supplied. A workspace-wide summary remains available with `include_diff=false`. Git index mutations are serialized per canonical root; other independent reads are not.
+
+Bash defaults to `safe`, a fixed list of Rust quality commands launched **without shell interpretation**. Use `--bash-mode off` to disable it. `--bash-mode full` requires the additional `--allow-full-shell` startup flag; it grants arbitrary host command execution and must only be enabled with deliberate trust. Subprocess output is bounded and timeout-controlled, but neither safe mode nor full mode constitutes a Windows sandbox.
+
+`apply_patch` accepts one ordinary unified update diff targeting an existing guarded file, rejects stale hunks and multiple targets, and checks before applying. It does not promise crash-atomic updates or multi-file transactions. `import_file` accepts ChatGPT Apps SDK attachment objects, requires a guarded destination, approved HTTPS hosts, pinned public IPv4 DNS resolution, no redirects, a 5 MiB byte cap and an optional SHA-256 precondition. Real remote attachment transfer and MIME verification have **not** been demonstrated.
+
+## Experimental ngrok exposure
+
+The CLI can optionally run a managed ngrok agent for the **still loopback-bound** bearer-protected HTTP MCP server:
+
+```powershell
+novagpt --root C:\path\to\repo http --port 8787 --ngrok
+novagpt --root C:\path\to\repo http --port 8787 --ngrok --ngrok-domain your-owned-domain.ngrok-free.app
+```
+
+This feature requires an independently installed and configured ngrok v3 client and explicit `--ngrok` opt-in. The agent's HTTP inspection is disabled, and the CLI prints a public `/mcp` URL only if its local API reports a tunnel matching the chosen loopback port. The token is not printed; never paste it into logs. **Real ChatGPT remote connection, SSE/GET/DELETE compatibility, and long-lived tunnel reliability remain unverified.** The ngrok integration is CLI-only; it is not yet configurable in the Ratatui TUI.
+
 ## Status
 
-This is an **early vertical slice**, not a complete port. The normal tool surface includes workspace open, tree, search, read, write and edit. Initial optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, browser projects, richer CodexPro tool behavior, CLI/release parity and all differential checks remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
+This is an **early vertical slice**, not a complete port. In addition to the initial coding tools above, optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, browser projects, complete CodexPro Git/CLI/analysis/logging behavior, and all differential checks remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
 
 CodexPro remains the reference oracle and production implementation until parity and rollback have been validated.
 

@@ -7,7 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use novagpt_agents::{AgentManager, AgentRole, SpawnAgent};
-use novagpt_core::{EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry};
+use novagpt_core::{
+    BashMode, BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
+};
 use novagpt_vm::{VmCreate, VmManager};
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -29,6 +31,7 @@ use subtle::ConstantTimeEq;
 pub struct NovaExtras {
     pub vm: Option<VmManager>,
     pub agents: Option<AgentManager>,
+    pub bash_mode: BashMode,
 }
 
 #[derive(Clone)]
@@ -105,6 +108,103 @@ struct EditArgs {
     expected_sha256: Option<String>,
     #[serde(default)]
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ImportAttachment {
+    download_url: String,
+    file_id: String,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ImportArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    file: ImportAttachment,
+    destination: String,
+    #[serde(default)]
+    overwrite: Option<bool>,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct PatchArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    patch: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BashArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    command: String,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GitArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    action: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    staged: Option<bool>,
+    #[serde(default)]
+    include_diff: Option<bool>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default, rename = "ref")]
+    reference: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    start_point: Option<String>,
+    #[serde(default)]
+    create: Option<bool>,
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GitReviewArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    staged: Option<bool>,
+    #[serde(default)]
+    include_diff: Option<bool>,
+}
+
+impl GitArgs {
+    fn into_request(self) -> novagpt_core::GitRequest {
+        novagpt_core::GitRequest {
+            workspace_id: self.workspace_id,
+            action: self.action,
+            path: self.path,
+            staged: self.staged.unwrap_or(false),
+            include_diff: self.include_diff.unwrap_or(true),
+            count: self.count,
+            reference: self.reference,
+            name: self.name,
+            start_point: self.start_point,
+            create: self.create.unwrap_or(false),
+            files: self.files,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -294,6 +394,117 @@ impl NovaMcp {
             })
         })
         .await
+    }
+
+    #[tool(
+        description = "Import a ChatGPT Apps SDK HTTPS attachment into a guarded workspace destination; never download arbitrary hosts"
+    )]
+    async fn import_file(&self, Parameters(args): Parameters<ImportArgs>) -> CallToolResult {
+        tool_reply(
+            self.workspaces
+                .import_attachment(novagpt_core::ImportRequest {
+                    workspace_id: args.workspace_id,
+                    file: novagpt_core::AttachmentRef {
+                        download_url: args.file.download_url,
+                        file_id: args.file.file_id,
+                        mime_type: args.file.mime_type,
+                        file_name: args.file.file_name,
+                    },
+                    destination: args.destination,
+                    overwrite: args.overwrite.unwrap_or(false),
+                    expected_sha256: args.expected_sha256,
+                })
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Apply one guarded unified diff to an existing file; reject stale context and multi-file patches"
+    )]
+    async fn apply_patch(&self, Parameters(args): Parameters<PatchArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        compute(move || state.apply_unified_patch(args.workspace_id.as_deref(), &args.patch)).await
+    }
+
+    #[tool(
+        description = "Execute a bounded local command under the startup-configured off/safe/full shell policy"
+    )]
+    async fn bash(&self, Parameters(args): Parameters<BashArgs>) -> CallToolResult {
+        tool_reply(
+            self.workspaces
+                .run_bash(
+                    self.extras.bash_mode,
+                    BashRequest {
+                        workspace_id: args.workspace_id,
+                        command: args.command,
+                        shell: args.shell,
+                        cwd: args.cwd,
+                        timeout_ms: args.timeout_ms,
+                    },
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Run bounded, structured Git operations; unsafe or unimplemented write actions fail closed"
+    )]
+    async fn git(&self, Parameters(args): Parameters<GitArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        tool_reply(state.git_operation(args.into_request()).await)
+    }
+
+    #[tool(description = "Read the workspace Git branch and working tree status")]
+    async fn git_status(&self, Parameters(args): Parameters<GitReviewArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        tool_reply(
+            state
+                .git_operation(novagpt_core::GitRequest {
+                    workspace_id: args.workspace_id,
+                    action: "git_status".into(),
+                    path: args.path,
+                    ..Default::default()
+                })
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Show Git diff for one guarded path, or workspace stats with include_diff=false"
+    )]
+    async fn git_diff(&self, Parameters(args): Parameters<GitReviewArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        tool_reply(
+            state
+                .git_operation(novagpt_core::GitRequest {
+                    workspace_id: args.workspace_id,
+                    action: "git_diff".into(),
+                    path: args.path,
+                    staged: args.staged.unwrap_or(false),
+                    include_diff: args.include_diff.unwrap_or(true),
+                    ..Default::default()
+                })
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Inspect guarded Git changes; raw patch requires path, workspace-wide summary requires include_diff=false"
+    )]
+    async fn show_changes(&self, Parameters(args): Parameters<GitReviewArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        tool_reply(
+            state
+                .git_operation(novagpt_core::GitRequest {
+                    workspace_id: args.workspace_id,
+                    action: "show_changes".into(),
+                    path: args.path,
+                    staged: args.staged.unwrap_or(false),
+                    include_diff: args.include_diff.unwrap_or(false),
+                    ..Default::default()
+                })
+                .await,
+        )
     }
 
     #[tool(

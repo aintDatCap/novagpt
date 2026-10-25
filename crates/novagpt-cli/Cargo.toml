@@ -22,6 +22,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+reqwest.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 

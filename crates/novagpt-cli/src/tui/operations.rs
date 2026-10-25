@@ -192,7 +192,11 @@ impl Controller {
                 let _ = tx_info.send(OperationEvent::TokenPresent(resolved.description()));
                 Ok((
                     workspaces,
-                    novagpt_mcp::NovaExtras { vm, agents },
+                    novagpt_mcp::NovaExtras {
+                        vm,
+                        agents,
+                        bash_mode: novagpt_core::BashMode::Safe,
+                    },
                     resolved.value,
                 ))
             })

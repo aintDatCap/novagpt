@@ -32,6 +32,8 @@ For a release candidate also run `cargo build --release --workspace` on target p
 
 Track test evidence as a short reproducible record: **command**, git revision, OS/Rust version, relevant feature flags, fixture location, exit status and the meaningful output excerpt. A named test file or a compilation result is not protocol parity.
 
+For the INITIAL Git/Bash/patch/import/ngrok slice (2026-10-25), acceptance evidence is limited to isolated temporary Git repositories, `novagpt-core` safety/negative/concurrency tests, real stdio `tools/list` and `tools/call`, unit-only attachment URL/destination checks, and a CLI ngrok argument/help check. This does **not** satisfy the differential Git/command contract, external network attachment/SSRF penetration, child-process-tree cancellation, public tunnel/ChatGPT protocol smoke test, TUI ngrok state, or security review. Record concrete command outcomes only in [PARITY.md](PARITY.md).
+
 ### Testing pyramid and deterministic cases
 
 1. **Unit tests next to domain modules:** guard decisions, canonical IDs, blocked paths, hashing, CAS, text encoding, limits and error categories.

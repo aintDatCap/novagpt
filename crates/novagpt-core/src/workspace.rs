@@ -48,6 +48,7 @@ struct SharedState {
     allowed_roots: Vec<PathBuf>,
     known: Mutex<HashMap<String, PathBuf>>,
     write_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    git_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Clone)]
@@ -83,6 +84,7 @@ impl WorkspaceRegistry {
                 allowed_roots,
                 known: Mutex::new(known),
                 write_locks: Mutex::new(HashMap::new()),
+                git_locks: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -204,6 +206,24 @@ impl WorkspaceRegistry {
         };
         let _guard = lock.lock().map_err(|_| NovaError::StatePoisoned)?;
         operation()
+    }
+
+    pub(crate) async fn git_mutation_lock(
+        &self,
+        root: &Path,
+    ) -> NovaResult<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut table = self
+                .inner
+                .git_locks
+                .lock()
+                .map_err(|_| NovaError::StatePoisoned)?;
+            table
+                .entry(root.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        Ok(lock.lock_owned().await)
     }
 
     pub(crate) fn max_read_bytes(&self) -> usize {
