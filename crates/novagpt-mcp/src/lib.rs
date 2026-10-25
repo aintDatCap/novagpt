@@ -1138,14 +1138,42 @@ pub async fn run_stdio_with(
     Ok(())
 }
 
+/// Auth is evaluated before the MCP service sees POST/GET/DELETE. No URI or
+/// token is ever placed in tracing or audit events.
+fn is_authorized(token: &str, request: &Request) -> bool {
+    let supplied_header = request.headers().get(AUTHORIZATION);
+    let expected = format!("Bearer {token}");
+    let header_ok = supplied_header
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1);
+
+    let query = request.uri().query().unwrap_or("");
+    if query.len() > 2048 {
+        return false;
+    }
+    let mut query_present = false;
+    let mut query_valid = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key == "codexpro_token" {
+            if query_present {
+                return false;
+            } // Ambiguous credentials are forbidden.
+            query_present = true;
+            query_valid = value.as_bytes().ct_eq(token.as_bytes()).unwrap_u8() == 1;
+        }
+    }
+    // If both transports present credentials, both must agree.
+    if supplied_header.is_some() && query_present {
+        header_ok && query_valid
+    } else if query_present {
+        query_valid
+    } else {
+        header_ok
+    }
+}
+
 async fn authorize(State(token): State<Arc<String>>, request: Request, next: Next) -> Response {
-    let supplied = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let expected = format!("Bearer {}", token);
-    if supplied.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1 {
+    if is_authorized(&token, &request) {
         next.run(request).await
     } else {
         (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()

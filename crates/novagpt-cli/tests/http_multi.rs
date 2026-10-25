@@ -120,6 +120,80 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     );
     assert_ne!(sid_a, sid_b, "independent protocol transports must differ");
 
+    // "No authentication" client: token is provided only in the query URL.
+    let base = format!("http://127.0.0.1:{port}/mcp");
+    let key = "codexpro_token";
+    let query_url = format!("{base}?{key}={token}");
+    let unauth = client
+        .post(&base)
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .json(&initialize(70))
+        .send()
+        .await
+        .expect("unauthorized request");
+    assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let wrong = client
+        .post(format!("{base}?{key}={}", "incorrect"))
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .json(&initialize(71))
+        .send()
+        .await
+        .expect("invalid token");
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let duplicated = client
+        .post(format!("{query_url}&{key}={token}"))
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .json(&initialize(72))
+        .send()
+        .await
+        .expect("duplicate");
+    assert_eq!(duplicated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let incompatible = client
+        .post(&query_url)
+        .bearer_auth("wrong")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .json(&initialize(73))
+        .send()
+        .await
+        .expect("mismatched header");
+    assert_eq!(incompatible.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let response = client
+        .post(&query_url)
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&initialize(74))
+        .send()
+        .await
+        .expect("query authenticated init");
+    assert!(
+        response.status().is_success(),
+        "query initialize must succeed"
+    );
+    let query_sid = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("query session")
+        .to_owned();
+    let initialize_body = response.text().await.expect("initialize response");
+    assert!(initialize_body.contains("novagpt"));
+    let stream_by_query = client
+        .get(&query_url)
+        .header(header::ACCEPT, "text/event-stream")
+        .header("Mcp-Session-Id", &query_sid)
+        .send()
+        .await
+        .expect("query SSE GET");
+    assert!(stream_by_query.status().is_success());
+    drop(stream_by_query);
+    let ended = client
+        .delete(&query_url)
+        .header("Mcp-Session-Id", query_sid)
+        .send()
+        .await
+        .expect("query DELETE");
+    assert!(ended.status().is_success());
+
     let mut local_probe = Command::new(env!("CARGO_BIN_EXE_novagpt"));
     local_probe
         .arg("--root")
