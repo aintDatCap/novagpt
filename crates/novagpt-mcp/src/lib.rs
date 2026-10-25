@@ -172,6 +172,14 @@ struct HandoffCreateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProContextArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    title: String,
+    selected_paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct HandoffWaitArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -707,6 +715,24 @@ impl NovaMcp {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             tokio::time::sleep(remaining.min(std::time::Duration::from_millis(poll_ms))).await;
         }
+    }
+
+    #[tool(
+        description = "Export a bounded offline context from explicitly selected workspace files; never overwrites a previous bundle"
+    )]
+    async fn export_pro_context(
+        &self,
+        Parameters(args): Parameters<ProContextArgs>,
+    ) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("export_pro_context", move || {
+            state.export_selected_pro_context(
+                args.workspace_id.as_deref(),
+                &args.title,
+                &args.selected_paths,
+            )
+        })
+        .await
     }
 
     #[tool(description = "Load a guarded workspace SKILL.md file at an explicit path")]

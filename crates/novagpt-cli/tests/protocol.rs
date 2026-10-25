@@ -137,6 +137,11 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{
                 "name":"wait_for_handoff","arguments":{"plan_hash":"abcd1234","max_wait_seconds":1}
             }}),
+            json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{
+                "name":"export_pro_context","arguments":{
+                    "title":"Selected fixture","selected_paths":["hello.txt"]
+                }
+            }}),
         ];
         for message in messages {
             writeln!(input, "{message}").expect("send MCP request");
@@ -188,6 +193,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "handoff_to_agent",
         "read_handoff",
         "wait_for_handoff",
+        "export_pro_context",
         "load_skill",
         "vm",
         "vm_guest_status",
@@ -204,13 +210,18 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 38);
+    assert_eq!(listed.len(), 39);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],
         "image/png"
     );
     assert_eq!(by_id(7)["result"]["content"][0]["type"], "image");
+    assert_eq!(by_id(10)["result"]["isError"], false);
+    assert_eq!(
+        by_id(10)["result"]["structuredContent"]["files_included"][0],
+        "hello.txt"
+    );
     assert_eq!(
         by_id(9)["result"]["structuredContent"]["awaited_completed"],
         true
