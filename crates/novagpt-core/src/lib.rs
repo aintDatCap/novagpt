@@ -1,5 +1,6 @@
 //! The domain and safety boundary for NovaGPT; no MCP or CLI dependencies.
 mod command_ops;
+mod context_ops;
 mod fs_ops;
 mod git_ops;
 mod handoff_ops;
@@ -12,6 +13,7 @@ mod workspace;
 mod worktree_ops;
 
 pub use command_ops::{BashMode, BashRequest, BashResult};
+pub use context_ops::CodexInstructions;
 pub use fs_ops::{EditRequest, FileDocument, FileReceipt, FileWriteRequest, SearchHit, TreeEntry};
 pub use git_ops::{GitRequest, GitResult};
 pub use handoff_ops::HandoffReceipt;

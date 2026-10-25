@@ -109,6 +109,28 @@ impl WorkspaceRegistry {
         Ok(result)
     }
 
+    pub fn reconnect_workspace(&self, id: &str, root: Option<&str>) -> NovaResult<Workspace> {
+        if id.trim().is_empty() {
+            return Err(NovaError::InvalidInput("workspace_id is required".into()));
+        }
+        let ws = if let Some(original_root) = root {
+            let canonical = fs::canonicalize(original_root)?;
+            if !canonical.is_dir() || !self.is_allowed(&canonical) {
+                return Err(NovaError::OutsideAllowedRoot);
+            }
+            let expected = self.describe(&canonical);
+            if expected.workspace_id != id {
+                return Err(NovaError::InvalidInput(
+                    "Workspace ID does not match supplied root".into(),
+                ));
+            }
+            self.open_workspace(&canonical)?
+        } else {
+            self.workspace(Some(id))?
+        };
+        Ok(ws)
+    }
+
     pub fn workspace(&self, id: Option<&str>) -> NovaResult<Workspace> {
         let Some(id) = id.filter(|v| !v.is_empty()) else {
             return Ok(self.default_workspace());
@@ -386,6 +408,44 @@ mod tests {
                 .unwrap()
                 .workspace_id,
             alternate.workspace_id
+        );
+    }
+
+    #[test]
+    fn reconnect_rejects_spoofed_ids_and_preserves_default() {
+        let base = tempfile::tempdir().expect("default");
+        let alternate = tempfile::tempdir().expect("alternate");
+        let excluded = tempfile::tempdir().expect("outside");
+        let state = WorkspaceRegistry::new(base.path(), &[alternate.path().to_path_buf()])
+            .expect("workspace");
+        let default = state.default_workspace();
+        let other = state
+            .open_workspace(alternate.path())
+            .expect("open approved");
+        assert_eq!(
+            state
+                .reconnect_workspace(&other.workspace_id, Some(&other.root))
+                .expect("reconnect")
+                .workspace_id,
+            other.workspace_id
+        );
+        assert!(
+            state
+                .reconnect_workspace(&default.workspace_id, Some(&other.root))
+                .is_err()
+        );
+        assert!(state.reconnect_workspace("ws_unknown", None).is_err());
+        assert!(
+            state
+                .reconnect_workspace(
+                    &default.workspace_id,
+                    Some(excluded.path().to_str().expect("UTF-8 test fixture"))
+                )
+                .is_err()
+        );
+        assert_eq!(
+            state.workspace(None).expect("default").workspace_id,
+            default.workspace_id
         );
     }
 

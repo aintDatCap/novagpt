@@ -76,6 +76,23 @@ struct OpenWorkspaceArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CodexContextArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    target_path: Option<String>,
+    #[serde(default)]
+    instruction_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReconnectArgs {
+    workspace_id: String,
+    #[serde(default)]
+    root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WorkspaceArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -400,6 +417,38 @@ impl NovaMcp {
         let state = self.workspaces.clone();
         self.observed_compute("open_workspace", move || state.open_workspace(args.root))
             .await
+    }
+
+    #[tool(
+        description = "Revalidate a known workspace ID or match it against an explicitly supplied allowed canonical root"
+    )]
+    async fn reconnect_workspace(
+        &self,
+        Parameters(args): Parameters<ReconnectArgs>,
+    ) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("reconnect_workspace", move || {
+            state.reconnect_workspace(&args.workspace_id, args.root.as_deref())
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read bounded root-to-target AGENTS.md instructions; unchanged fingerprints omit instructions"
+    )]
+    async fn codex_context(
+        &self,
+        Parameters(args): Parameters<CodexContextArgs>,
+    ) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("codex_context", move || {
+            state.codex_instructions(
+                args.workspace_id.as_deref(),
+                args.target_path.as_deref(),
+                args.instruction_fingerprint.as_deref(),
+            )
+        })
+        .await
     }
 
     #[tool(

@@ -67,6 +67,11 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     )
     .expect("image fixture");
     fs::write(workspace.path().join(".env"), "do not expose").expect("write blocked fixture");
+    fs::write(
+        workspace.path().join("AGENTS.md"),
+        "Test workspace instructions",
+    )
+    .expect("instructions fixture");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .arg("--root")
@@ -101,6 +106,9 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             }}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
                 "name":"view_image","arguments":{"path":"image.png"}
+            }}),
+            json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{
+                "name":"codex_context","arguments":{"target_path":"hello.txt"}
             }}),
         ];
         for message in messages {
@@ -141,6 +149,8 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "apply_patch",
         "import_file",
         "runtime_status",
+        "reconnect_workspace",
+        "codex_context",
         "server_config",
         "list_workspaces",
         "workspace_snapshot",
@@ -163,13 +173,23 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 32);
+    assert_eq!(listed.len(), 34);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],
         "image/png"
     );
     assert_eq!(by_id(7)["result"]["content"][0]["type"], "image");
+    assert_eq!(
+        by_id(8)["result"]["structuredContent"]["instructions_changed"],
+        true
+    );
+    assert!(
+        by_id(8)["result"]["structuredContent"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Test workspace instructions")
+    );
     assert_eq!(by_id(4)["result"]["isError"], true);
     assert!(
         by_id(4)["result"]["structuredContent"]["error"]
