@@ -50,6 +50,19 @@ novagpt --root C:\path\to\repo logs tail --lines 50 --json
 
 `--log-format human|llm` controls separate stderr diagnostics and **not** the persistent metadata-only audit format. Unix-created directories/files use private permissions (0700/0600), and symlinked log targets are rejected; Windows access additionally depends on inherited user-profile ACLs. Concurrent independent NovaGPT **processes** sharing one log directory, OS-level path-swap attacks, cross-platform ACL auditing and exact CodexPro logging parity are not yet verified.
 
+## Optional Browser Bridge (INITIAL; separate from subagents)
+
+The new **Browser Bridge** is independent of the dedicated `ChatGptBrowser` subagent driver. It attaches only to a **separately started** Chrome debugging endpoint on loopback, and must be explicitly enabled with both a port and one approved public HTTPS origin:
+
+```powershell
+# First start a separate Chrome instance with its own NEW profile and
+# --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222.
+# Open the desired site yourself, then start NovaGPT:
+novagpt --root C:\path\to\repo --browser-bridge-port 9222 --browser-bridge-origin https://www.instagram.com http
+```
+
+MCP `browser_tabs` lists up to 32 tabs **only** on the approved origin (title and opaque CDP target ID). MCP `browser_tab_read` takes that exact ID and returns up to 32K characters of rendered visible text. URL query strings are not returned. It rechecks the origin both at discovery and in the browser-side fixed read-only JavaScript before collecting text. Arbitrary JavaScript, browsing/navigating, clicking, passwords, cookies and other origins are not exposed. A browser opened with remote debugging is sensitive: **never expose its debugging port publicly or point this bridge at the Chrome used by subagents**. This does not yet support Chrome extension attachment, screenshots or fully verified live Instagram.
+
 ## Experimental ngrok exposure
 
 The CLI can optionally run a managed ngrok agent for the **still loopback-bound** bearer-protected HTTP MCP server:

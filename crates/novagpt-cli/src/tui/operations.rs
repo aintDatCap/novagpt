@@ -195,6 +195,7 @@ impl Controller {
                     novagpt_mcp::NovaExtras {
                         vm,
                         agents,
+                        browser_bridge: None,
                         bash_mode: novagpt_core::BashMode::Safe,
                         audit: novagpt_mcp::AuditTrail::persistent(
                             crate::logging::audit_directory(&root)

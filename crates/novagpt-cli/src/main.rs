@@ -7,7 +7,7 @@ mod tunnel;
 
 use clap::{Parser, Subcommand};
 use novagpt_agents::{AgentManager, ChatGptBackend};
-use novagpt_browser::ChatGptBrowser;
+use novagpt_browser::{BrowserBridge, ChatGptBrowser};
 use novagpt_core::{BashMode, WorkspaceRegistry};
 use novagpt_mcp::NovaExtras;
 use novagpt_vm::VmManager;
@@ -46,6 +46,12 @@ struct Cli {
     /// Dedicated browser profile path; never reuse a personal or CodexPro profile.
     #[arg(long)]
     chatgpt_profile: Option<PathBuf>,
+    /// Opt in to an already-running, separate local Chrome CDP endpoint; never uses the ChatGPT subagent Chrome.
+    #[arg(long, requires = "browser_bridge_origin")]
+    browser_bridge_port: Option<u16>,
+    /// Explicit HTTPS origin authorized for read-only tab access; never permits other origins.
+    #[arg(long, requires = "browser_bridge_port")]
+    browser_bridge_origin: Option<String>,
     /// Shell access mode: off, safe (fixed quality commands), or explicitly approved full.
     #[arg(long, value_parser = ["off", "safe", "full"], default_value = "safe")]
     bash_mode: String,
@@ -304,9 +310,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "full" => return Err("full Bash access requires --allow-full-shell".into()),
         _ => return Err("invalid Bash mode".into()),
     };
+    let browser_bridge = match (
+        cli.browser_bridge_port,
+        cli.browser_bridge_origin.as_deref(),
+    ) {
+        (Some(port), Some(origin)) => Some(BrowserBridge::new(port, origin)?),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "Browser Bridge requires --browser-bridge-port and --browser-bridge-origin".into(),
+            );
+        }
+    };
     let extras = NovaExtras {
         vm,
         agents,
+        browser_bridge,
         bash_mode,
         audit: novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?,
     };

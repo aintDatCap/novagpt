@@ -1131,6 +1131,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "novagpt-agents",
+ "novagpt-browser",
  "novagpt-core",
  "novagpt-vm",
  "rmcp",

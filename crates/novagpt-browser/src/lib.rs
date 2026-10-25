@@ -1,5 +1,7 @@
 //! Dedicated visible Chrome CDP transport for ChatGPT subagents.
 //! Never reads Chrome cookies/credentials; manual challenges are for the user.
+mod bridge;
+pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};

@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::Engine;
 use novagpt_agents::{AgentManager, AgentRole, SpawnAgent};
+use novagpt_browser::BrowserBridge;
 use novagpt_core::{
     BashMode, BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
 };
@@ -34,6 +35,7 @@ use subtle::ConstantTimeEq;
 pub struct NovaExtras {
     pub vm: Option<VmManager>,
     pub agents: Option<AgentManager>,
+    pub browser_bridge: Option<BrowserBridge>,
     pub bash_mode: BashMode,
     pub audit: AuditTrail,
 }
@@ -310,6 +312,12 @@ struct IdArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserReadArgs {
+    /// Explicit CDP target ID from browser_tabs, not a URL or free-form JavaScript.
+    tab_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentSpawnArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -396,6 +404,7 @@ impl NovaMcp {
                 },
                 "vm_enabled": self.extras.vm.is_some(),
                 "subagents_enabled": self.extras.agents.is_some(),
+            "browser_bridge_enabled": self.extras.browser_bridge.is_some(),
                 "audit_mode": self.extras.audit.snapshot(1).mode,
                 "write_mode": "workspace-guarded",
                 "transport_session_is_conversation_identity": false,
@@ -749,6 +758,35 @@ impl NovaMcp {
                 .await,
         );
         self.observed("show_changes", response)
+    }
+
+    #[tool(
+        description = "List only manually open Chrome tabs at the explicit approved HTTPS origin; bridge must be opt-in at startup"
+    )]
+    async fn browser_tabs(&self) -> CallToolResult {
+        let reply = match &self.extras.browser_bridge {
+            Some(bridge) => external_reply(bridge.tabs().await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Browser Bridge disabled; enable it explicitly at startup".into(),
+            ))),
+        };
+        self.observed("browser_tabs", reply)
+    }
+
+    #[tool(
+        description = "Read visible text of a selected approved Chrome tab without navigation or browser input"
+    )]
+    async fn browser_tab_read(
+        &self,
+        Parameters(args): Parameters<BrowserReadArgs>,
+    ) -> CallToolResult {
+        let reply = match &self.extras.browser_bridge {
+            Some(bridge) => external_reply(bridge.read_tab(&args.tab_id).await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Browser Bridge disabled; enable it explicitly at startup".into(),
+            ))),
+        };
+        self.observed("browser_tab_read", reply)
     }
 
     #[tool(

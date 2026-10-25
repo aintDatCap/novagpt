@@ -9,6 +9,7 @@ license.workspace = true
 novagpt-core = { path = "../novagpt-core" }
 novagpt-vm = { path = "../novagpt-vm" }
 novagpt-agents = { path = "../novagpt-agents" }
+novagpt-browser = { path = "../novagpt-browser" }
 rmcp.workspace = true
 tokio.workspace = true
 serde.workspace = true

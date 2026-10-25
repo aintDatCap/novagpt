@@ -166,6 +166,8 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "bash",
         "apply_patch",
         "import_file",
+        "browser_tabs",
+        "browser_tab_read",
         "runtime_status",
         "reconnect_workspace",
         "codex_context",
@@ -191,7 +193,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 34);
+    assert_eq!(listed.len(), 36);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],
