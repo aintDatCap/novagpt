@@ -131,6 +131,14 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "bash",
         "apply_patch",
         "import_file",
+        "runtime_status",
+        "server_config",
+        "list_workspaces",
+        "workspace_snapshot",
+        "inspect_workspace",
+        "handoff_to_agent",
+        "read_handoff",
+        "load_skill",
         "vm",
         "vm_guest_status",
         "subagent_spawn",
@@ -146,7 +154,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 23);
+    assert_eq!(listed.len(), 31);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(by_id(4)["result"]["isError"], true);
     assert!(

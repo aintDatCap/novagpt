@@ -196,6 +196,7 @@ impl Controller {
                         vm,
                         agents,
                         bash_mode: novagpt_core::BashMode::Safe,
+                        audit: novagpt_mcp::AuditTrail::default(),
                     },
                     resolved.value,
                 ))

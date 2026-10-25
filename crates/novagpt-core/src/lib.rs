@@ -2,14 +2,20 @@
 mod command_ops;
 mod fs_ops;
 mod git_ops;
+mod handoff_ops;
 mod import_ops;
+mod inspect_ops;
 mod patch_ops;
 mod process_output;
 mod workspace;
+mod worktree_ops;
 
 pub use command_ops::{BashMode, BashRequest, BashResult};
 pub use fs_ops::{EditRequest, FileDocument, FileReceipt, FileWriteRequest, SearchHit, TreeEntry};
 pub use git_ops::{GitRequest, GitResult};
+pub use handoff_ops::HandoffReceipt;
 pub use import_ops::{AttachmentRef, ImportRequest, ImportResult};
+pub use inspect_ops::WorkspaceInspection;
 pub use patch_ops::PatchResult;
 pub use workspace::{NovaError, NovaResult, Workspace, WorkspaceRegistry};
+pub use worktree_ops::OwnedWorktree;

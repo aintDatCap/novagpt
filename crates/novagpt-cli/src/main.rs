@@ -48,6 +48,9 @@ struct Cli {
     /// Shell access mode: off, safe (fixed quality commands), or explicitly approved full.
     #[arg(long, value_parser = ["off", "safe", "full"], default_value = "safe")]
     bash_mode: String,
+    /// Log format for server diagnostics on stderr: human text or LLM JSON lines.
+    #[arg(long, value_parser = ["human", "llm"], default_value = "human")]
+    log_format: String,
     /// Explicit acknowledgement required for unrestricted shell execution.
     #[arg(long)]
     allow_full_shell: bool,
@@ -57,6 +60,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect safe workspace information and enabled configuration without launching optional services.
+    Doctor {
+        /// Emit machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize a bounded and guarded workspace file inventory.
+    Inspect {
+        #[arg(long, default_value_t = 300)]
+        max_entries: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show safe Git status without a raw diff or a repository write.
+    Review {
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the MCP server over stdin/stdout (for MCP clients).
     Stdio,
     /// Start a token-protected Streamable HTTP MCP server on loopback.
@@ -115,6 +136,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if let Some(action) = &cli.command {
+        match action {
+            Command::Doctor { json } => {
+                let registry = WorkspaceRegistry::new(&root, &local.allowed_roots)?;
+                let current = registry.default_workspace();
+                let report = serde_json::json!({
+                    "workspace_id": current.workspace_id,
+                    "root": current.root,
+                    "allowed_extra_roots": local.allowed_roots.len(),
+                    "vm_configured": local.vm_enabled || cli.vm_home.is_some(),
+                    "browser_configured": local.browser_enabled ||
+                        (cli.chatgpt_chrome.is_some() && cli.chatgpt_profile.is_some()),
+                    "http_listen_address": "127.0.0.1",
+                    "codexpro_installation_modified": false,
+                    "verified_remote_mcp": false,
+                    "feature_parity": "INITIAL",
+                });
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "NovaGPT doctor\nWorkspace: {}\nID: {}\nFeature parity: INITIAL\nVM configured: {}\nBrowser configured: {}",
+                        current.root,
+                        current.workspace_id,
+                        report["vm_configured"],
+                        report["browser_configured"]
+                    );
+                }
+                return Ok(());
+            }
+            Command::Inspect { max_entries, json } => {
+                let registry = WorkspaceRegistry::new(&root, &local.allowed_roots)?;
+                let report = registry.inspect_workspace(None, *max_entries)?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "Workspace: {}\nFiles: {}\nDirectories: {}\nEntries limited: {}\nTest files: {}",
+                        report.root,
+                        report.files,
+                        report.directories,
+                        report.truncated,
+                        report.test_files
+                    );
+                }
+                return Ok(());
+            }
+            Command::Review { json } => {
+                let registry = WorkspaceRegistry::new(&root, &local.allowed_roots)?;
+                let status = registry
+                    .git_operation(novagpt_core::GitRequest {
+                        action: "status".into(),
+                        ..Default::default()
+                    })
+                    .await?;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!("Git status:\n{}", status.stdout);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if cli.setup || cli.command.is_none() {
         let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
         let profiles = settings::discover_codexpro_profiles(&home)?;
@@ -124,13 +210,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "novagpt=info".into());
+    let diagnostics = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "novagpt=info".into()),
-        )
-        .init();
+        .with_env_filter(filter);
+    if cli.log_format == "llm" {
+        diagnostics
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        diagnostics.init();
+    }
 
     let mut approved_roots = local.allowed_roots;
     approved_roots.extend(cli.allow_root);
@@ -172,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vm,
         agents,
         bash_mode,
+        audit: novagpt_mcp::AuditTrail::default(),
     };
     match cli.command {
         Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
@@ -235,6 +329,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Some(Command::Token { .. }) => unreachable!("token commands handled above"),
+        Some(Command::Doctor { .. } | Command::Inspect { .. } | Command::Review { .. }) => {
+            unreachable!("read-only commands handled above")
+        }
         None => unreachable!("TUI was handled before server startup"),
     }
     Ok(())

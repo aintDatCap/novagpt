@@ -63,6 +63,8 @@ novagpt --root C:\Projects\my-workspace token path
 
 Il token e' richiesto dal server come credenziale di autenticazione MCP. Non condividere mai l'output di `token show`, non inserirlo in commit, messaggi o screenshot. Se cambi il token mentre HTTP e' in esecuzione, il server deve essere riavviato per applicare la modifica. La generazione non abilita di per se' l'accesso dalla rete: il server resta in ascolto solo su loopback.
 
+Le operazioni CLI di ispezione e diagnostica sono disponibili senza TUI: `novagpt doctor --json`, `novagpt inspect --json`, `novagpt review --json`. `--log-format human|llm` seleziona il formato diagnostico **stderr** del server; il tool MCP `runtime_status` restituisce soltanto metadati di alcune operazioni, condivisi nello stesso processo e non persistenti. Non e' un registro completo delle chiamate.
+
 ## Stato e log
 
 La dashboard include workspace, stato del server e endpoint, VM/browser (configurati, **non** dichiarati avviati), ultimo errore noto e indicazione di riavvio. I log INFO, WARN, ERROR e OK con timestamp UTC sono conservati in un buffer di massimo **250 eventi**. Si possono scorrere anche mentre arrivano nuovi eventi. Sono eventi di lifecycle/operazione della TUI, **non** la traccia completa delle invocazioni MCP; nessun token viene registrato.

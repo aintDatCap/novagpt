@@ -21,6 +21,10 @@ pub struct GitRequest {
     pub start_point: Option<String>,
     pub create: bool,
     pub files: Vec<String>,
+    pub message: Option<String>,
+    pub discard_changes: bool,
+    pub worktree_id: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,7 +51,7 @@ fn valid_ref(value: &str) -> bool {
             .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
 }
 
-fn limited_ref(value: &str) -> NovaResult<String> {
+pub(crate) fn limited_ref(value: &str) -> NovaResult<String> {
     if !valid_ref(value) {
         return Err(NovaError::InvalidInput(
             "Invalid Git ref or branch name".into(),
@@ -103,9 +107,45 @@ impl WorkspaceRegistry {
         ))
     }
 
+    async fn verify_staged_paths(&self, request: &GitRequest) -> NovaResult<()> {
+        let root = self.workspace(request.workspace_id.as_deref())?.root;
+        let staged = run_git(
+            Path::new(&root),
+            "staged_names",
+            vec![
+                "diff".into(),
+                "--cached".into(),
+                "--name-only".into(),
+                "-z".into(),
+            ],
+        )
+        .await?;
+        if staged.stdout.contains('\u{fffd}') {
+            return Err(NovaError::InvalidInput(
+                "Unsupported staged path encoding".into(),
+            ));
+        }
+        let mut count = 0;
+        for name in staged.stdout.split('\0').filter(|path| !path.is_empty()) {
+            // A commit cannot bypass the protected-path policy via pre-existing index changes.
+            self.resolve(request.workspace_id.as_deref(), name, false)?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(NovaError::InvalidInput("No staged files to commit".into()));
+        }
+        Ok(())
+    }
+
     pub async fn git_operation(&self, request: GitRequest) -> NovaResult<GitResult> {
         let root = self.workspace(request.workspace_id.as_deref())?.root;
         let action = request.action.clone();
+        if matches!(
+            action.as_str(),
+            "worktree_create" | "worktree_remove" | "worktree_list"
+        ) {
+            return self.worktree_action(request).await;
+        }
         let mut args: Vec<String> = match action.as_str() {
             "status" => vec!["status", "--short", "--branch"],
             "current_branch" => vec!["branch", "--show-current"],
@@ -121,7 +161,9 @@ impl WorkspaceRegistry {
             "switch_branch" => vec!["switch"],
             "stage" => vec!["add"],
             "unstage" => vec!["restore", "--staged"],
-            "restore" | "commit" | "worktree_create" | "worktree_remove" | "worktree_list" =>
+            "restore" => vec!["restore", "--worktree"],
+            "commit" => vec!["commit", "--no-verify", "-m"],
+            "worktree_create" | "worktree_remove" | "worktree_list" =>
                 return Err(NovaError::InvalidInput(format!(
                     "Git action {action} is disabled until ownership and destructive-operation checks are implemented"
                 ))),
@@ -195,9 +237,30 @@ impl WorkspaceRegistry {
                 args.push(limited_ref(name)?);
                 index_mutation = true;
             }
-            "stage" | "unstage" => {
+            "stage" | "unstage" | "restore" => {
+                if action == "restore" && !request.discard_changes {
+                    return Err(NovaError::InvalidInput(
+                        "restore requires discard_changes=true".into(),
+                    ));
+                }
                 args.push("--".into());
                 args.extend(self.git_file_args(&request)?);
+                index_mutation = true;
+            }
+            "commit" => {
+                let message = request
+                    .message
+                    .as_deref()
+                    .ok_or_else(|| NovaError::InvalidInput("commit message required".into()))?;
+                if message.trim().is_empty()
+                    || message.len() > 200
+                    || message.chars().any(|c| c.is_control())
+                {
+                    return Err(NovaError::InvalidInput(
+                        "commit message must be one bounded line".into(),
+                    ));
+                }
+                args.push(message.into());
                 index_mutation = true;
             }
             _ => {}
@@ -209,11 +272,33 @@ impl WorkspaceRegistry {
         } else {
             None
         };
-        run_git(Path::new(&root), &action, args).await
+        if action == "commit" {
+            self.verify_staged_paths(&request).await?;
+        }
+        let mut result = run_git(Path::new(&root), &action, args).await?;
+        if action == "commit" {
+            result.args = vec!["commit".into(), "[redacted-message]".into()];
+            result.stdout = "Commit created".into();
+        }
+        Ok(result)
     }
 }
 
-async fn run_git(root: &Path, action: &str, args: Vec<String>) -> NovaResult<GitResult> {
+fn git_cwd(root: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let value = root.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    root.to_path_buf()
+}
+
+pub(crate) async fn run_git(root: &Path, action: &str, args: Vec<String>) -> NovaResult<GitResult> {
     let mut command = Command::new("git");
     command
         .arg("-c")
@@ -223,7 +308,7 @@ async fn run_git(root: &Path, action: &str, args: Vec<String>) -> NovaResult<Git
             "core.hooksPath=/dev/null"
         })
         .args(&args)
-        .current_dir(root)
+        .current_dir(git_cwd(root))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
@@ -494,5 +579,86 @@ mod tests {
             .await
             .expect("current");
         assert_eq!(active.stdout, "feature/a");
+    }
+
+    #[tokio::test]
+    async fn commit_and_restore_require_explicit_safe_targets() {
+        let temp = tempfile::tempdir().expect("root");
+        git(temp.path(), &["init", "-q"]);
+        git(
+            temp.path(),
+            &["config", "user.email", "fixture@example.test"],
+        );
+        git(temp.path(), &["config", "user.name", "Fixture"]);
+        fs::write(temp.path().join("file.txt"), "initial\n").expect("initial");
+        git(temp.path(), &["add", "file.txt"]);
+        git(temp.path(), &["commit", "-qm", "baseline"]);
+        let state = WorkspaceRegistry::new(temp.path(), &[]).expect("registry");
+
+        fs::write(temp.path().join("file.txt"), "changed\n").expect("update");
+        assert!(
+            state
+                .git_operation(GitRequest {
+                    action: "restore".into(),
+                    files: vec!["file.txt".into()],
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        state
+            .git_operation(GitRequest {
+                action: "restore".into(),
+                files: vec!["file.txt".into()],
+                discard_changes: true,
+                ..Default::default()
+            })
+            .await
+            .expect("explicit restore");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).expect("read"),
+            "initial\n"
+        );
+
+        fs::write(temp.path().join("file.txt"), "committed\n").expect("update");
+        state
+            .git_operation(GitRequest {
+                action: "stage".into(),
+                files: vec!["file.txt".into()],
+                ..Default::default()
+            })
+            .await
+            .expect("stage");
+        let commit = state
+            .git_operation(GitRequest {
+                action: "commit".into(),
+                message: Some("bounded test commit".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("commit");
+        assert_eq!(commit.stdout, "Commit created");
+        assert!(!format!("{commit:?}").contains("bounded test commit"));
+        let log = state
+            .git_operation(GitRequest {
+                action: "log".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("history");
+        assert!(log.stdout.contains("bounded test commit"));
+
+        fs::write(temp.path().join("other.txt"), "safe").expect("other");
+        fs::write(temp.path().join(".env"), "protected").expect("blocked fixture");
+        git(temp.path(), &["add", ".env"]);
+        git(temp.path(), &["add", "other.txt"]);
+        let denied = state
+            .git_operation(GitRequest {
+                action: "commit".into(),
+                message: Some("deny protected staging".into()),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(denied, Err(NovaError::BlockedPath)));
     }
 }

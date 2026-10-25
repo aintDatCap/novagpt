@@ -1,4 +1,6 @@
 //! Official rmcp-based protocol and transport boundary.
+mod audit;
+pub use audit::AuditTrail;
 use axum::{
     Router,
     extract::{Request, State},
@@ -32,6 +34,7 @@ pub struct NovaExtras {
     pub vm: Option<VmManager>,
     pub agents: Option<AgentManager>,
     pub bash_mode: BashMode,
+    pub audit: AuditTrail,
 }
 
 #[derive(Clone)]
@@ -50,11 +53,38 @@ impl NovaMcp {
     pub fn with_extras(workspaces: WorkspaceRegistry, extras: NovaExtras) -> Self {
         Self { workspaces, extras }
     }
+    fn observed(&self, tool: &'static str, result: CallToolResult) -> CallToolResult {
+        self.extras
+            .audit
+            .record(tool, result.is_error.unwrap_or(false));
+        result
+    }
+
+    async fn observed_compute<T, F>(&self, tool: &'static str, job: F) -> CallToolResult
+    where
+        T: Serialize + Send + 'static,
+        F: FnOnce() -> NovaResult<T> + Send + 'static,
+    {
+        self.observed(tool, compute(job).await)
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OpenWorkspaceArgs {
     root: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WorkspaceArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct InspectArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -108,6 +138,21 @@ struct EditArgs {
     expected_sha256: Option<String>,
     #[serde(default)]
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct HandoffCreateArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    id: String,
+    instructions: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct HandoffReadArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -175,6 +220,14 @@ struct GitArgs {
     create: Option<bool>,
     #[serde(default)]
     files: Vec<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    discard_changes: Option<bool>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -203,6 +256,10 @@ impl GitArgs {
             start_point: self.start_point,
             create: self.create.unwrap_or(false),
             files: self.files,
+            message: self.message,
+            discard_changes: self.discard_changes.unwrap_or(false),
+            worktree_id: self.worktree_id,
+            branch: self.branch,
         }
     }
 }
@@ -306,6 +363,25 @@ where
 
 #[tool_router]
 impl NovaMcp {
+    #[tool(description = "Return bounded metadata-only HUMAN/LLM tool activity for this process")]
+    fn runtime_status(&self) -> CallToolResult {
+        tool_reply(Ok(self.extras.audit.snapshot(50)))
+    }
+
+    #[tool(description = "Show safe server capability flags without revealing secrets")]
+    fn server_config(&self) -> CallToolResult {
+        tool_reply(Ok(serde_json::json!({
+            "bash_mode": match self.extras.bash_mode {
+                BashMode::Off => "off", BashMode::Safe => "safe", BashMode::Full => "full",
+            },
+            "vm_enabled": self.extras.vm.is_some(),
+            "subagents_enabled": self.extras.agents.is_some(),
+            "audit_mode": "metadata-only-memory",
+            "write_mode": "workspace-guarded",
+            "transport_session_is_conversation_identity": false,
+        })))
+    }
+
     #[tool(
         description = "Open the default, configured workspace without changing any other conversation's selection"
     )]
@@ -321,7 +397,44 @@ impl NovaMcp {
         Parameters(args): Parameters<OpenWorkspaceArgs>,
     ) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || state.open_workspace(args.root)).await
+        self.observed_compute("open_workspace", move || state.open_workspace(args.root))
+            .await
+    }
+
+    #[tool(
+        description = "List explicitly opened allowed workspace roots (no implicit active conversation root)"
+    )]
+    async fn list_workspaces(&self) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("list_workspaces", move || state.list_workspaces())
+            .await
+    }
+
+    #[tool(
+        description = "Return the stable canonical workspace ID and root without exposing file content"
+    )]
+    async fn workspace_snapshot(
+        &self,
+        Parameters(args): Parameters<WorkspaceArgs>,
+    ) -> CallToolResult {
+        self.observed(
+            "workspace_snapshot",
+            tool_reply(self.workspaces.workspace(args.workspace_id.as_deref())),
+        )
+    }
+
+    #[tool(
+        description = "Inspect a bounded, safe file inventory (extensions/manifests/tests, no file contents)"
+    )]
+    async fn inspect_workspace(&self, Parameters(args): Parameters<InspectArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("inspect_workspace", move || {
+            state.inspect_workspace(
+                args.workspace_id.as_deref(),
+                args.max_entries.unwrap_or(300),
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -329,7 +442,7 @@ impl NovaMcp {
     )]
     async fn tree(&self, Parameters(args): Parameters<TreeArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || {
+        self.observed_compute("tree", move || {
             state.tree(
                 args.workspace_id.as_deref(),
                 args.path.as_deref().unwrap_or("."),
@@ -343,7 +456,7 @@ impl NovaMcp {
     #[tool(description = "Search for literal text in safe workspace files")]
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || {
+        self.observed_compute("search", move || {
             state.search(
                 args.workspace_id.as_deref(),
                 &args.query,
@@ -358,7 +471,10 @@ impl NovaMcp {
     )]
     async fn read(&self, Parameters(args): Parameters<FileArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || state.read_file(args.workspace_id.as_deref(), &args.path)).await
+        self.observed_compute("read", move || {
+            state.read_file(args.workspace_id.as_deref(), &args.path)
+        })
+        .await
     }
 
     #[tool(
@@ -366,7 +482,7 @@ impl NovaMcp {
     )]
     async fn write(&self, Parameters(args): Parameters<WriteArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || {
+        self.observed_compute("write", move || {
             state.write_file(FileWriteRequest {
                 workspace_id: args.workspace_id.as_deref(),
                 path: &args.path,
@@ -383,7 +499,7 @@ impl NovaMcp {
     )]
     async fn edit(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || {
+        self.observed_compute("edit", move || {
             state.edit_file(EditRequest {
                 workspace_id: args.workspace_id.as_deref(),
                 path: &args.path,
@@ -392,6 +508,38 @@ impl NovaMcp {
                 expected_sha256: args.expected_sha256.as_deref(),
                 replace_all: args.replace_all.unwrap_or(false),
             })
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Create a new bounded handoff plan in the selected workspace; never executes the handoff"
+    )]
+    async fn handoff_to_agent(
+        &self,
+        Parameters(args): Parameters<HandoffCreateArgs>,
+    ) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("handoff_to_agent", move || {
+            state.create_handoff(args.workspace_id.as_deref(), &args.id, &args.instructions)
+        })
+        .await
+    }
+
+    #[tool(description = "Read a handoff artifact by validated ID from the selected workspace")]
+    async fn read_handoff(&self, Parameters(args): Parameters<HandoffReadArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("read_handoff", move || {
+            state.read_handoff(args.workspace_id.as_deref(), &args.id)
+        })
+        .await
+    }
+
+    #[tool(description = "Load a guarded workspace SKILL.md file at an explicit path")]
+    async fn load_skill(&self, Parameters(args): Parameters<FileArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("load_skill", move || {
+            state.load_skill(args.workspace_id.as_deref(), &args.path)
         })
         .await
     }
@@ -423,7 +571,10 @@ impl NovaMcp {
     )]
     async fn apply_patch(&self, Parameters(args): Parameters<PatchArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        compute(move || state.apply_unified_patch(args.workspace_id.as_deref(), &args.patch)).await
+        self.observed_compute("apply_patch", move || {
+            state.apply_unified_patch(args.workspace_id.as_deref(), &args.patch)
+        })
+        .await
     }
 
     #[tool(
@@ -451,7 +602,10 @@ impl NovaMcp {
     )]
     async fn git(&self, Parameters(args): Parameters<GitArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        tool_reply(state.git_operation(args.into_request()).await)
+        self.observed(
+            "git",
+            tool_reply(state.git_operation(args.into_request()).await),
+        )
     }
 
     #[tool(description = "Read the workspace Git branch and working tree status")]

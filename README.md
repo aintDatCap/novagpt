@@ -24,11 +24,17 @@ The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP always requires a token; 
 
 ## Git, Bash, patch and attachment import (INITIAL)
 
-NovaGPT now also exposes MCP tools `git`, `git_status`, `git_diff`, `show_changes`, `bash`, `apply_patch` and `import_file`. These are **initial guarded implementations**, not complete CodexPro parity. Git supports status/history, guarded single-file diff, branches, staging and unstaging. Destructive Git restore, commit and worktree actions explicitly reject requests; workspace-wide raw diff is refused unless a safe individual file path is supplied. A workspace-wide summary remains available with `include_diff=false`. Git index mutations are serialized per canonical root; other independent reads are not.
+NovaGPT exposes MCP tools `git`, `git_status`, `git_diff`, `show_changes`, `bash`, `apply_patch` and `import_file`. These are **initial guarded implementations**, not complete CodexPro parity. Git supports status/history, guarded single-file diff, branches, staging/unstaging, bounded local commit, explicit `restore` with `discard_changes=true`, and owned worktree create/list/remove using an OS temporary directory. Commit refuses already-staged protected paths; worktree removal refuses unowned or dirty worktrees. Records are process-local and worktrees may become orphaned after a server restart. Workspace-wide raw diff is refused unless an individual safe file path is supplied; `include_diff=false` returns summary stats. Git index mutations are serialized per canonical root, not per ChatGPT conversation.
 
 Bash defaults to `safe`, a fixed list of Rust quality commands launched **without shell interpretation**. Use `--bash-mode off` to disable it. `--bash-mode full` requires the additional `--allow-full-shell` startup flag; it grants arbitrary host command execution and must only be enabled with deliberate trust. Subprocess output is bounded and timeout-controlled, but neither safe mode nor full mode constitutes a Windows sandbox.
 
 `apply_patch` accepts one ordinary unified update diff targeting an existing guarded file, rejects stale hunks and multiple targets, and checks before applying. It does not promise crash-atomic updates or multi-file transactions. `import_file` accepts ChatGPT Apps SDK attachment objects, requires a guarded destination, approved HTTPS hosts, pinned public IPv4 DNS resolution, no redirects, a 5 MiB byte cap and an optional SHA-256 precondition. Real remote attachment transfer and MIME verification have **not** been demonstrated.
+
+## Additional MCP and CLI slices (INITIAL)
+
+`list_workspaces`, `workspace_snapshot`, and `inspect_workspace` provide explicit-root and bounded metadata-only inventory; they are not semantic dependency or symbol analysis. `handoff_to_agent` creates an exclusive bounded `.ai-bridge/handoffs/<ID>.md` plan **without running an agent**. `read_handoff` and `load_skill` expose only explicit guarded files. `runtime_status` includes capped metadata-only HUMAN and LLM views of selected tool outcomes, shared across HTTP sessions but not persisted. `server_config` exposes nonsecret configuration flags.
+
+CLI commands `novagpt doctor --json`, `novagpt inspect --json`, and `novagpt review --json` are read-only diagnostics. Server diagnostics on stderr can use `--log-format human` (default) or `--log-format llm` (JSONL). Neither mode is an unrestricted transcript logger; sensitive tool inputs and file bodies are not recorded by the metadata-only audit. A real two-client MCP HTTP test validates separate sessions, shared file visibility, stale-hash rejection, GET/SSE and DELETE isolation. Full TS protocol parity and stress/TTL tests remain pending.
 
 ## Experimental ngrok exposure
 
@@ -43,7 +49,7 @@ This feature requires an independently installed and configured ngrok v3 client 
 
 ## Status
 
-This is an **early vertical slice**, not a complete port. In addition to the initial coding tools above, optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, browser projects, complete CodexPro Git/CLI/analysis/logging behavior, and all differential checks remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
+This remains an **early vertical slice**, not a complete port. Optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, generic browser projects, persistent and fully instrumented logging, advanced analysis, broader skills/Pro workflows, complete CLI/release behavior, and TS differential parity remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
 
 CodexPro remains the reference oracle and production implementation until parity and rollback have been validated.
 

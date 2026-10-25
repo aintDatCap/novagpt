@@ -49,6 +49,7 @@ struct SharedState {
     known: Mutex<HashMap<String, PathBuf>>,
     write_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
     git_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    worktrees: Mutex<HashMap<(String, String), crate::worktree_ops::OwnedWorktree>>,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,7 @@ impl WorkspaceRegistry {
                 known: Mutex::new(known),
                 write_locks: Mutex::new(HashMap::new()),
                 git_locks: Mutex::new(HashMap::new()),
+                worktrees: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -224,6 +226,79 @@ impl WorkspaceRegistry {
                 .clone()
         };
         Ok(lock.lock_owned().await)
+    }
+
+    pub(crate) fn inner_known_roots(&self) -> NovaResult<Vec<Workspace>> {
+        let known = self
+            .inner
+            .known
+            .lock()
+            .map_err(|_| NovaError::StatePoisoned)?;
+        Ok(known
+            .values()
+            .filter(|root| root.is_dir() && self.is_allowed(root))
+            .map(|root| self.describe(root))
+            .collect())
+    }
+
+    pub(crate) fn owned_worktree(
+        &self,
+        workspace_id: &str,
+        id: &str,
+    ) -> NovaResult<Option<crate::worktree_ops::OwnedWorktree>> {
+        let table = self
+            .inner
+            .worktrees
+            .lock()
+            .map_err(|_| NovaError::StatePoisoned)?;
+        Ok(table
+            .get(&(workspace_id.to_string(), id.to_string()))
+            .cloned())
+    }
+
+    pub(crate) fn owned_worktrees(
+        &self,
+        workspace_id: &str,
+    ) -> NovaResult<Vec<crate::worktree_ops::OwnedWorktree>> {
+        let table = self
+            .inner
+            .worktrees
+            .lock()
+            .map_err(|_| NovaError::StatePoisoned)?;
+        Ok(table
+            .values()
+            .filter(|record| record.workspace_id == workspace_id)
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn register_worktree(
+        &self,
+        record: crate::worktree_ops::OwnedWorktree,
+    ) -> NovaResult<()> {
+        let mut table = self
+            .inner
+            .worktrees
+            .lock()
+            .map_err(|_| NovaError::StatePoisoned)?;
+        let key = (record.workspace_id.clone(), record.id.clone());
+        if table.contains_key(&key) {
+            return Err(NovaError::InvalidInput(
+                "Worktree is already registered".into(),
+            ));
+        }
+        table.insert(key, record);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_worktree(&self, workspace_id: &str, id: &str) -> NovaResult<()> {
+        let mut table = self
+            .inner
+            .worktrees
+            .lock()
+            .map_err(|_| NovaError::StatePoisoned)?;
+        table.remove(&(workspace_id.to_string(), id.to_string()));
+        Ok(())
     }
 
     pub(crate) fn max_read_bytes(&self) -> usize {
