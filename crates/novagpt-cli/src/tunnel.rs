@@ -93,6 +93,23 @@ impl NgrokTunnel {
         Self::discover_endpoint(self.port, self.configured_domain.as_deref()).await
     }
 
+    /// Learn the actual public host from the loopback ngrok API, restricted to
+    /// the reserved upstream port. Never permit arbitrary inbound Host values.
+    pub async fn public_hostname(&self) -> Option<String> {
+        for _ in 0..25 {
+            if let Some(endpoint) = self.endpoint().await {
+                let url = reqwest::Url::parse(&endpoint).ok()?;
+                let host = url.host_str()?.to_string();
+                if valid_domain(&host) {
+                    return Some(host);
+                }
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        None
+    }
+
     /// Local discovery never prints or persists a token and does not start a tunnel.
     pub async fn discover_endpoint(port: u16, configured_domain: Option<&str>) -> Option<String> {
         Self::discover_endpoint_at(port, configured_domain, "http://127.0.0.1:4040/api/tunnels")

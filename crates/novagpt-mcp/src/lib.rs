@@ -41,6 +41,8 @@ pub struct NovaExtras {
     pub output_store: OutputStore,
     pub bash_mode: BashMode,
     pub audit: AuditTrail,
+    /// Explicitly approved public tunnel hostname. Never accepts a wildcard.
+    pub http_public_hostname: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1307,6 +1309,33 @@ pub async fn run_http_with(
     run_http_on_listener_with(workspaces, listener, token, extras).await
 }
 
+/// Keep the rmcp DNS-rebinding host checks enabled, extending their strict
+/// loopback allowlist only for the tunnel hostname explicitly approved locally.
+fn http_server_config(
+    public_hostname: Option<&str>,
+) -> Result<StreamableHttpServerConfig, &'static str> {
+    let mut config = StreamableHttpServerConfig::default();
+    if let Some(host) = public_hostname {
+        let labels: Vec<&str> = host.split('.').collect();
+        if host.len() > 253
+            || labels.len() < 2
+            || labels.iter().any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+            })
+        {
+            return Err("Unsafe public MCP hostname");
+        }
+        config.allowed_hosts.push(host.to_string());
+    }
+    Ok(config)
+}
+
 /// For managed tunnels, bind *before* starting ngrok: never advertise an
 /// endpoint pointed at another process already occupying the configured port.
 pub async fn run_http_on_listener_with(
@@ -1318,11 +1347,15 @@ pub async fn run_http_on_listener_with(
     if token.len() < 24 || !listener.local_addr()?.ip().is_loopback() {
         return Err("MCP HTTP requires a loopback listener and a strong workspace token".into());
     }
+    let config = http_server_config(extras.http_public_hostname.as_deref())?;
     let audit = extras.audit.clone();
+    if extras.http_public_hostname.is_some() {
+        audit.record("http_public_host_allowed", false);
+    }
     let service = StreamableHttpService::new(
         move || Ok(NovaMcp::with_extras(workspaces.clone(), extras.clone())),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        config,
     );
     let router = Router::new()
         .nest_service("/mcp", service)

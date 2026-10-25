@@ -1135,6 +1135,7 @@ dependencies = [
  "novagpt-browser",
  "novagpt-core",
  "novagpt-vm",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",

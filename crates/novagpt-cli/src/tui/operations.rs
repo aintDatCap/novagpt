@@ -266,6 +266,7 @@ impl Controller {
                         browser_bridge: None,
                         output_store: novagpt_mcp::OutputStore::default(),
                         bash_mode: novagpt_core::BashMode::Safe,
+                        http_public_hostname: None,
                         audit: novagpt_mcp::AuditTrail::persistent(
                             crate::logging::audit_directory(&root)
                                 .map_err(|_| "Percorso audit non valido.".to_string())?,
@@ -277,12 +278,12 @@ impl Controller {
             })
             .await;
             match setup {
-                Ok(Ok((workspaces, extras, token))) => {
+                Ok(Ok((workspaces, mut extras, token))) => {
                     let tx_check = tx.clone();
                     let probe_token = token.clone();
                     let probe = tokio::spawn(async move {
                         // An unrelated listener (e.g. CodexPro) must never mark NovaGPT ready.
-                        for _ in 0..25 {
+                        for _ in 0..120 {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             if connection::probe(address.port(), &probe_token).await.is_ok() {
                                 let _ = tx_check.send(OperationEvent::Server(ServerState::Running));
@@ -301,33 +302,42 @@ impl Controller {
                                 // Do not start a public tunnel unless NovaGPT owns this port.
                                 match tunnel::NgrokTunnel::start(address.port(), ngrok_domain).await {
                                     Ok(mut tunnel) => {
-                                        let server = async {
-                                            novagpt_mcp::run_http_on_listener_with(
-                                                workspaces, listener, token, extras
-                                            ).await.is_ok()
-                                        };
-                                        tokio::pin!(server);
-                                        let mut published = false;
-                                        loop {
-                                            tokio::select! {
-                                                output = &mut server => {
-                                                    let _ = tunnel.child.start_kill();
-                                                    break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
-                                                }
-                                                output = tunnel.child.wait() => {
-                                                    let _ = output;
-                                                    audit.record("http_tunnel_stopped", true);
-                                                    break Err("Il tunnel ngrok si è chiuso".into());
-                                                }
-                                                () = tokio::time::sleep(Duration::from_millis(450)) => {
-                                                    if !published && tunnel.endpoint().await.is_some() {
-                                                        audit.record("http_tunnel_ready", false);
-                                                        published = true;
-                                                        let _ = tx.send(OperationEvent::Log(Level::Success,
-                                                            "Tunnel ngrok pronto. Seleziona 'Mostra / copia URL ChatGPT'.".into()));
+                                        if let Some(hostname) = tunnel.public_hostname().await {
+                                            // Same validated public host used by the tunnel; never disable host validation.
+                                            extras.http_public_hostname = Some(hostname);
+                                            let server = async {
+                                                novagpt_mcp::run_http_on_listener_with(
+                                                    workspaces, listener, token, extras
+                                                ).await.is_ok()
+                                            };
+                                            tokio::pin!(server);
+                                            let mut published = false;
+                                            loop {
+                                                tokio::select! {
+                                                    output = &mut server => {
+                                                        let _ = tunnel.child.start_kill();
+                                                        break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
+                                                    }
+                                                    output = tunnel.child.wait() => {
+                                                        let _ = output;
+                                                        audit.record("http_tunnel_stopped", true);
+                                                        break Err("Il tunnel ngrok si è chiuso".into());
+                                                    }
+                                                    () = tokio::time::sleep(Duration::from_millis(450)) => {
+                                                        if !published && tunnel.endpoint().await.is_some() {
+                                                            audit.record("http_tunnel_ready", false);
+                                                            published = true;
+                                                            let _ = tx.send(OperationEvent::Log(Level::Success,
+                                                                "Tunnel ngrok pronto. Seleziona 'Mostra / copia URL ChatGPT'.".into()));
+                                                        }
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            audit.record("http_tunnel_discovery_failed", true);
+                                            let _ = tunnel.child.start_kill();
+                                            audit.flush().await;
+                                            Err("Il dominio ngrok della porta MCP non e' stato verificato".into())
                                         }
                                     }
                                     Err(_) => {

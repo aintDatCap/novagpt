@@ -362,13 +362,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
-    let extras = NovaExtras {
+    let mut extras = NovaExtras {
         vm,
         agents,
         browser_bridge,
         output_store: novagpt_mcp::OutputStore::default(),
         bash_mode,
         audit: novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?,
+        http_public_hostname: None,
     };
     match cli.command {
         Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
@@ -405,6 +406,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("Impossibile avviare ngrok".into());
                     }
                 };
+                let hostname = match tunnel.public_hostname().await {
+                    Some(host) => host,
+                    None => {
+                        audit.record("http_tunnel_discovery_failed", true);
+                        tunnel.stop().await;
+                        audit.flush().await;
+                        return Err(
+                            "ngrok non ha confermato il dominio pubblico della porta MCP".into(),
+                        );
+                    }
+                };
+                // Trust only the hostname returned by the locally controlled ngrok
+                // agent for the exact loopback port, not a wildcard or forwarded header.
+                extras.http_public_hostname = Some(hostname);
                 let server =
                     novagpt_mcp::run_http_on_listener_with(workspaces, listener, token, extras);
                 tokio::pin!(server);
