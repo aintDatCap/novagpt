@@ -326,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vm,
         agents,
         browser_bridge,
+        output_store: novagpt_mcp::OutputStore::default(),
         bash_mode,
         audit: novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?,
     };

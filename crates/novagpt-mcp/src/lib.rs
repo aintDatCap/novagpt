@@ -1,5 +1,6 @@
 //! Official rmcp-based protocol and transport boundary.
 mod audit;
+mod output_store;
 pub use audit::AuditTrail;
 use axum::{
     Router,
@@ -15,6 +16,7 @@ use novagpt_core::{
     BashMode, BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
 };
 use novagpt_vm::{VmCreate, VmManager};
+pub use output_store::OutputStore;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -36,6 +38,7 @@ pub struct NovaExtras {
     pub vm: Option<VmManager>,
     pub agents: Option<AgentManager>,
     pub browser_bridge: Option<BrowserBridge>,
+    pub output_store: OutputStore,
     pub bash_mode: BashMode,
     pub audit: AuditTrail,
 }
@@ -202,6 +205,19 @@ struct PatchArgs {
     #[serde(default)]
     workspace_id: Option<String>,
     patch: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OutputArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    output_resource_id: String,
+    #[serde(default)]
+    stream: Option<String>,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -673,24 +689,63 @@ impl NovaMcp {
     }
 
     #[tool(
+        description = "Page over recent bounded command output by opaque resource ID, scoped to a workspace (in memory only)"
+    )]
+    async fn read_output(&self, Parameters(args): Parameters<OutputArgs>) -> CallToolResult {
+        let result = self
+            .workspaces
+            .workspace(args.workspace_id.as_deref())
+            .map_err(|_| NovaError::InvalidInput("Unknown workspace".into()))
+            .and_then(|workspace| {
+                self.extras
+                    .output_store
+                    .read(
+                        &workspace.workspace_id,
+                        &args.output_resource_id,
+                        args.stream.as_deref().unwrap_or("stdout"),
+                        args.offset.unwrap_or(0),
+                        args.max_chars.unwrap_or(8000),
+                    )
+                    .map_err(|message| NovaError::InvalidInput(message.into()))
+            });
+        self.observed("read_output", tool_reply(result))
+    }
+
+    #[tool(
         description = "Execute a bounded local command under the startup-configured off/safe/full shell policy"
     )]
     async fn bash(&self, Parameters(args): Parameters<BashArgs>) -> CallToolResult {
-        let response = tool_reply(
-            self.workspaces
-                .run_bash(
-                    self.extras.bash_mode,
-                    BashRequest {
-                        workspace_id: args.workspace_id,
-                        command: args.command,
-                        shell: args.shell,
-                        cwd: args.cwd,
-                        timeout_ms: args.timeout_ms,
-                    },
-                )
-                .await,
-        );
-        self.observed("bash", response)
+        let workspace_id = self
+            .workspaces
+            .workspace(args.workspace_id.as_deref())
+            .map(|workspace| workspace.workspace_id);
+        let result = self
+            .workspaces
+            .run_bash(
+                self.extras.bash_mode,
+                BashRequest {
+                    workspace_id: args.workspace_id,
+                    command: args.command,
+                    shell: args.shell,
+                    cwd: args.cwd,
+                    timeout_ms: args.timeout_ms,
+                },
+            )
+            .await
+            .map(|mut value| {
+                if let Ok(workspace_id) = workspace_id
+                    && let Ok(id) = self.extras.output_store.save(
+                        &workspace_id,
+                        &value.stdout,
+                        &value.stderr,
+                        value.truncated,
+                    )
+                {
+                    value.output_resource_id = Some(id);
+                }
+                value
+            });
+        self.observed("bash", tool_reply(result))
     }
 
     #[tool(

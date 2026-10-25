@@ -36,6 +36,10 @@ Bash defaults to `safe`, a fixed list of Rust quality commands launched **withou
 
 CLI commands `novagpt doctor --json`, `novagpt inspect --json`, and `novagpt review --json` are read-only diagnostics. Server diagnostics on stderr can use `--log-format human` (default) or `--log-format llm` (JSONL). Neither mode is an unrestricted transcript logger; sensitive tool inputs and file bodies are not recorded by the metadata-only audit. A real two-client MCP HTTP test validates separate sessions, shared file visibility, stale-hash rejection, GET/SSE and DELETE isolation. Full TS protocol parity and stress/TTL tests remain pending.
 
+## Recent shell output retrieval (INITIAL)
+
+A successful `bash` call now returns `output_resource_id`. MCP `read_output` accepts `output_resource_id`, optional `workspace_id`, `stream=stdout|stderr`, `offset` and `max_chars` (2–8000) to page through retained output. The last four completed shell captures are stored **in memory**, scoped to canonical workspace IDs and shared across MCP transports; UTF-16 page offsets match the TypeScript client contract. Actual command capture remains limited to 64 KiB per stream; it is marked incomplete if truncated. No output is written to the persistent metadata audit. This is not yet complete CodexPro 2 MB shell/VM output retention.
+
 ## Persistent audit logging (INITIAL)
 
 The MCP tool activity audit is enabled by default for CLI `stdio` / `http` and TUI-started HTTP. It writes **only** bounded metadata (sequence, UTC Unix timestamp, fixed tool identifier, success/error) as JSONL under the user's state directory, never inside the repository. It does **not** save prompts, command text, arguments, file paths, responses, HTTP authorization headers or bearer tokens; it is not a full request/response transcript or a complete transport-event trace.

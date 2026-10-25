@@ -41,6 +41,8 @@ pub struct BashResult {
     pub stderr: String,
     pub truncated: bool,
     pub termination_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_resource_id: Option<String>,
 }
 
 fn safe_argv(command: &str) -> NovaResult<Vec<&'static str>> {
@@ -229,6 +231,7 @@ impl WorkspaceRegistry {
             stderr: String::from_utf8_lossy(&err).into_owned(),
             truncated,
             termination_reason: termination_reason.into(),
+            output_resource_id: None,
         })
     }
 }

@@ -164,6 +164,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "git_diff",
         "show_changes",
         "bash",
+        "read_output",
         "apply_patch",
         "import_file",
         "browser_tabs",
@@ -193,7 +194,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 36);
+    assert_eq!(listed.len(), 37);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],

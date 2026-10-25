@@ -153,6 +153,50 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         .expect("unknown root denied");
     assert_eq!(invalid["result"]["isError"], true);
 
+    // Retained Bash output can be paged by another authorized transport,
+    // but cannot be fetched using a different workspace identity.
+    let (shell, _) = rpc(
+        &client,
+        port,
+        &token,
+        Some(&sid_a),
+        json!({"jsonrpc":"2.0","id":40,"method":"tools/call",
+            "params":{"name":"bash","arguments":{"command":"cargo --version"}}}),
+    )
+    .await
+    .expect("bounded shell command");
+    assert_eq!(shell["result"]["isError"], false);
+    let resource = shell["result"]["structuredContent"]["output_resource_id"]
+        .as_str()
+        .expect("retained output resource");
+    let read_output = |workspace_id: Option<&str>| {
+        json!({"jsonrpc":"2.0","id":41,
+        "method":"tools/call","params":{"name":"read_output","arguments":{
+            "output_resource_id":resource,"stream":"stdout","offset":0,
+            "max_chars":40,"workspace_id":workspace_id
+        }}})
+    };
+    let (paged, _) = rpc(&client, port, &token, Some(&sid_b), read_output(None))
+        .await
+        .expect("other transport reads output");
+    assert_eq!(paged["result"]["isError"], false);
+    assert!(
+        paged["result"]["structuredContent"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cargo")
+    );
+    let (blocked_output, _) = rpc(
+        &client,
+        port,
+        &token,
+        Some(&sid_b),
+        read_output(Some(other_id)),
+    )
+    .await
+    .expect("workspace mismatch");
+    assert_eq!(blocked_output["result"]["isError"], true);
+
     let read = |id| {
         json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
         "params":{"name":"read","arguments":{"path":"shared.txt"}}})
