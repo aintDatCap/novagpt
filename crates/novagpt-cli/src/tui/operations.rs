@@ -196,7 +196,11 @@ impl Controller {
                         vm,
                         agents,
                         bash_mode: novagpt_core::BashMode::Safe,
-                        audit: novagpt_mcp::AuditTrail::default(),
+                        audit: novagpt_mcp::AuditTrail::persistent(
+                            crate::logging::audit_directory(&root)
+                                .map_err(|_| "Percorso audit non valido.".to_string())?,
+                        )
+                        .map_err(|_| "Archivio audit non disponibile o non sicuro.".to_string())?,
                     },
                     resolved.value,
                 ))

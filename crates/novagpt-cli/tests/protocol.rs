@@ -4,11 +4,20 @@ use serde_json::{Value, json};
 fn explicitly_enabled_vm_inventory_is_reachable_over_real_mcp_stdio() {
     let workspace = tempfile::tempdir().expect("fixture");
     let vm_home = tempfile::tempdir().expect("VM home");
+    let private = tempfile::tempdir().expect("isolated state");
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .arg("--root")
         .arg(workspace.path())
         .arg("--vm-home")
         .arg(vm_home.path())
+        .env(
+            if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_STATE_HOME"
+            },
+            private.path(),
+        )
         .arg("stdio")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -60,6 +69,7 @@ use std::{
 #[test]
 fn stdio_initialize_list_and_call_use_the_real_protocol() {
     let workspace = tempfile::tempdir().expect("create isolated fixture root");
+    let private = tempfile::tempdir().expect("isolated state");
     fs::write(workspace.path().join("hello.txt"), "test text").expect("write fixture");
     fs::write(
         workspace.path().join("image.png"),
@@ -76,6 +86,14 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .arg("--root")
         .arg(workspace.path())
+        .env(
+            if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_STATE_HOME"
+            },
+            private.path(),
+        )
         .arg("stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

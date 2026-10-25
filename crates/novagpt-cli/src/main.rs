@@ -1,4 +1,5 @@
 //! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
+mod logging;
 mod settings;
 mod token;
 mod tui;
@@ -97,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         action: TokenCommand,
     },
+    /// Inspect the per-workspace persistent metadata-only audit without opening a server.
+    Logs {
+        #[command(subcommand)]
+        action: LogsCommand,
+    },
     /// Import an approved qcow2/VHDX disk to NovaGPT's owned VM image store.
     VmImport {
         #[arg(long)]
@@ -118,6 +124,19 @@ enum TokenCommand {
     Path,
 }
 
+#[derive(Subcommand)]
+enum LogsCommand {
+    /// Display the private per-workspace log directory (no token is accessed).
+    Path,
+    /// Show the latest retained safe audit events, as HUMAN text or structured JSON.
+    Tail {
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -129,6 +148,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--setup cannot be combined with a server subcommand".into());
     }
     let local = LocalSettings::load(&root)?;
+    if let Some(Command::Logs { action }) = &cli.command {
+        let directory = logging::audit_directory(&root)?;
+        match action {
+            LogsCommand::Path => println!("{}", directory.display()),
+            LogsCommand::Tail { lines, json } => {
+                let count = (*lines).clamp(1, 128);
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    novagpt_mcp::AuditTrail::persisted_snapshot(&directory, count)
+                })
+                .await??;
+                if *json {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                } else {
+                    for line in &snapshot.human {
+                        println!("{line}");
+                    }
+                    if snapshot.returned_events == 0 {
+                        println!("No persisted audit events.");
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     if let Some(Command::Token { action }) = &cli.command {
         match action {
             TokenCommand::Show => println!("{}", token::resolve(&root)?.value),
@@ -265,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vm,
         agents,
         bash_mode,
-        audit: novagpt_mcp::AuditTrail::default(),
+        audit: novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?,
     };
     match cli.command {
         Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
@@ -328,7 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.bytes
             );
         }
-        Some(Command::Token { .. }) => unreachable!("token commands handled above"),
+        Some(Command::Token { .. } | Command::Logs { .. }) => {
+            unreachable!("local commands handled above")
+        }
         Some(Command::Doctor { .. } | Command::Inspect { .. } | Command::Review { .. }) => {
             unreachable!("read-only commands handled above")
         }

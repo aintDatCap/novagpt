@@ -26,9 +26,18 @@ fn setup_requires_interactive_terminal_and_never_writes_unattended() {
 #[test]
 fn omitted_root_uses_cwd_for_explicit_stdio_transport() {
     let workspace = tempfile::tempdir().expect("workspace");
+    let private = tempfile::tempdir().expect("isolated state");
     fs::write(workspace.path().join("cwd.txt"), "from cwd").expect("fixture");
     let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .current_dir(workspace.path())
+        .env(
+            if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_STATE_HOME"
+            },
+            private.path(),
+        )
         .arg("stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

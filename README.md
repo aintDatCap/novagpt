@@ -32,9 +32,23 @@ Bash defaults to `safe`, a fixed list of Rust quality commands launched **withou
 
 ## Additional MCP and CLI slices (INITIAL)
 
-`list_workspaces`, `workspace_snapshot`, `reconnect_workspace` and `inspect_workspace` provide explicit-root validation and bounded metadata-only inventory; they are not semantic dependency or symbol analysis. `codex_context` reads a guarded and bounded AGENTS.md instruction chain with fingerprint deduplication; it does not automatically include unrelated files, Git patches or handoff outputs. `handoff_to_agent` creates an exclusive bounded `.ai-bridge/handoffs/<ID>.md` plan **without running an agent**. `read_handoff` and `load_skill` expose only explicit guarded files. `runtime_status` includes capped metadata-only HUMAN and LLM views of selected tool outcomes, shared across HTTP sessions but not persisted. `server_config` exposes nonsecret configuration flags.
+`list_workspaces`, `workspace_snapshot`, `reconnect_workspace` and `inspect_workspace` provide explicit-root validation and bounded metadata-only inventory; they are not semantic dependency or symbol analysis. `codex_context` reads a guarded and bounded AGENTS.md instruction chain with fingerprint deduplication; it does not automatically include unrelated files, Git patches or handoff outputs. `handoff_to_agent` creates an exclusive bounded `.ai-bridge/handoffs/<ID>.md` plan **without running an agent**. `read_handoff` and `load_skill` expose only explicit guarded files. `runtime_status` includes capped metadata-only HUMAN and LLM views of tool outcomes, shared across MCP HTTP sessions and now retained on disk across server restarts. Its `dropped_events` and `write_errors` explicitly report capacity/I/O problems. `server_config` exposes nonsecret configuration flags.
 
 CLI commands `novagpt doctor --json`, `novagpt inspect --json`, and `novagpt review --json` are read-only diagnostics. Server diagnostics on stderr can use `--log-format human` (default) or `--log-format llm` (JSONL). Neither mode is an unrestricted transcript logger; sensitive tool inputs and file bodies are not recorded by the metadata-only audit. A real two-client MCP HTTP test validates separate sessions, shared file visibility, stale-hash rejection, GET/SSE and DELETE isolation. Full TS protocol parity and stress/TTL tests remain pending.
+
+## Persistent audit logging (INITIAL)
+
+The MCP tool activity audit is enabled by default for CLI `stdio` / `http` and TUI-started HTTP. It writes **only** bounded metadata (sequence, UTC Unix timestamp, fixed tool identifier, success/error) as JSONL under the user's state directory, never inside the repository. It does **not** save prompts, command text, arguments, file paths, responses, HTTP authorization headers or bearer tokens; it is not a full request/response transcript or a complete transport-event trace.
+
+On Windows the directory is `%LOCALAPPDATA%\NovaGPT\logs\<workspace-sha256>`; on Linux/macOS it is `$XDG_STATE_HOME/NovaGPT/logs/<workspace-sha256>/` or `~/.local/state/NovaGPT/logs/<workspace-sha256>/`. The current file is `audit.jsonl`, rotated to `audit.1.jsonl` through `audit.3.jsonl`. Each file is at most 64 KiB (256 KiB maximum per workspace), and the current in-memory snapshot holds the latest 128 events. A bounded background writer keeps disk I/O off async MCP handlers. On clean server shutdown and `runtime_status`, the queue is flushed. If the queue is saturated or disk writes fail, inspect `dropped_events` and `write_errors`; abrupt process termination can lose queued events.
+
+```powershell
+novagpt --root C:\path\to\repo logs path
+novagpt --root C:\path\to\repo logs tail --lines 50
+novagpt --root C:\path\to\repo logs tail --lines 50 --json
+```
+
+`--log-format human|llm` controls separate stderr diagnostics and **not** the persistent metadata-only audit format. Unix-created directories/files use private permissions (0700/0600), and symlinked log targets are rejected; Windows access additionally depends on inherited user-profile ACLs. Concurrent independent NovaGPT **processes** sharing one log directory, OS-level path-swap attacks, cross-platform ACL auditing and exact CodexPro logging parity are not yet verified.
 
 ## Experimental ngrok exposure
 
@@ -49,7 +63,7 @@ This feature requires an independently installed and configured ngrok v3 client 
 
 ## Status
 
-This remains an **early vertical slice**, not a complete port. Optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, generic browser projects, persistent and fully instrumented logging, advanced analysis, broader skills/Pro workflows, complete CLI/release behavior, and TS differential parity remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
+This remains an **early vertical slice**, not a complete port. Optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, generic browser projects, comprehensive persistent diagnostic tracing beyond the metadata-only audit, advanced analysis, broader skills/Pro workflows, complete CLI/release behavior, and TS differential parity remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
 
 CodexPro remains the reference oracle and production implementation until parity and rollback have been validated.
 

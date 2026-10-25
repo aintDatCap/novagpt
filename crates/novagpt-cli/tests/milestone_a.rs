@@ -22,6 +22,7 @@ fn git(root: &std::path::Path, args: &[&str]) {
 #[test]
 fn initial_git_bash_patch_protocol_and_negative_paths() {
     let fixture = tempfile::tempdir().expect("isolated root");
+    let private = tempfile::tempdir().expect("isolated state");
     git(fixture.path(), &["init", "-q"]);
     git(
         fixture.path(),
@@ -36,6 +37,14 @@ fn initial_git_bash_patch_protocol_and_negative_paths() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .arg("--root")
         .arg(fixture.path())
+        .env(
+            if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_STATE_HOME"
+            },
+            private.path(),
+        )
         .arg("--bash-mode")
         .arg("safe")
         .arg("stdio")

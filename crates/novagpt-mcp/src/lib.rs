@@ -382,29 +382,35 @@ where
 #[tool_router]
 impl NovaMcp {
     #[tool(description = "Return bounded metadata-only HUMAN/LLM tool activity for this process")]
-    fn runtime_status(&self) -> CallToolResult {
-        tool_reply(Ok(self.extras.audit.snapshot(50)))
+    async fn runtime_status(&self) -> CallToolResult {
+        tool_reply(Ok(self.extras.audit.snapshot_flushed(50).await))
     }
 
     #[tool(description = "Show safe server capability flags without revealing secrets")]
     fn server_config(&self) -> CallToolResult {
-        tool_reply(Ok(serde_json::json!({
-            "bash_mode": match self.extras.bash_mode {
-                BashMode::Off => "off", BashMode::Safe => "safe", BashMode::Full => "full",
-            },
-            "vm_enabled": self.extras.vm.is_some(),
-            "subagents_enabled": self.extras.agents.is_some(),
-            "audit_mode": "metadata-only-memory",
-            "write_mode": "workspace-guarded",
-            "transport_session_is_conversation_identity": false,
-        })))
+        self.observed(
+            "server_config",
+            tool_reply(Ok(serde_json::json!({
+                "bash_mode": match self.extras.bash_mode {
+                    BashMode::Off => "off", BashMode::Safe => "safe", BashMode::Full => "full",
+                },
+                "vm_enabled": self.extras.vm.is_some(),
+                "subagents_enabled": self.extras.agents.is_some(),
+                "audit_mode": self.extras.audit.snapshot(1).mode,
+                "write_mode": "workspace-guarded",
+                "transport_session_is_conversation_identity": false,
+            }))),
+        )
     }
 
     #[tool(
         description = "Open the default, configured workspace without changing any other conversation's selection"
     )]
     fn open_current_workspace(&self) -> CallToolResult {
-        tool_reply(Ok(self.workspaces.default_workspace()))
+        self.observed(
+            "open_current_workspace",
+            tool_reply(Ok(self.workspaces.default_workspace())),
+        )
     }
 
     #[tool(
@@ -627,7 +633,7 @@ impl NovaMcp {
         description = "Import a ChatGPT Apps SDK HTTPS attachment into a guarded workspace destination; never download arbitrary hosts"
     )]
     async fn import_file(&self, Parameters(args): Parameters<ImportArgs>) -> CallToolResult {
-        tool_reply(
+        let response = tool_reply(
             self.workspaces
                 .import_attachment(novagpt_core::ImportRequest {
                     workspace_id: args.workspace_id,
@@ -642,7 +648,8 @@ impl NovaMcp {
                     expected_sha256: args.expected_sha256,
                 })
                 .await,
-        )
+        );
+        self.observed("import_file", response)
     }
 
     #[tool(
@@ -660,7 +667,7 @@ impl NovaMcp {
         description = "Execute a bounded local command under the startup-configured off/safe/full shell policy"
     )]
     async fn bash(&self, Parameters(args): Parameters<BashArgs>) -> CallToolResult {
-        tool_reply(
+        let response = tool_reply(
             self.workspaces
                 .run_bash(
                     self.extras.bash_mode,
@@ -673,7 +680,8 @@ impl NovaMcp {
                     },
                 )
                 .await,
-        )
+        );
+        self.observed("bash", response)
     }
 
     #[tool(
@@ -690,7 +698,7 @@ impl NovaMcp {
     #[tool(description = "Read the workspace Git branch and working tree status")]
     async fn git_status(&self, Parameters(args): Parameters<GitReviewArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        tool_reply(
+        let response = tool_reply(
             state
                 .git_operation(novagpt_core::GitRequest {
                     workspace_id: args.workspace_id,
@@ -699,7 +707,8 @@ impl NovaMcp {
                     ..Default::default()
                 })
                 .await,
-        )
+        );
+        self.observed("git_status", response)
     }
 
     #[tool(
@@ -707,7 +716,7 @@ impl NovaMcp {
     )]
     async fn git_diff(&self, Parameters(args): Parameters<GitReviewArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        tool_reply(
+        let response = tool_reply(
             state
                 .git_operation(novagpt_core::GitRequest {
                     workspace_id: args.workspace_id,
@@ -718,7 +727,8 @@ impl NovaMcp {
                     ..Default::default()
                 })
                 .await,
-        )
+        );
+        self.observed("git_diff", response)
     }
 
     #[tool(
@@ -726,7 +736,7 @@ impl NovaMcp {
     )]
     async fn show_changes(&self, Parameters(args): Parameters<GitReviewArgs>) -> CallToolResult {
         let state = self.workspaces.clone();
-        tool_reply(
+        let response = tool_reply(
             state
                 .git_operation(novagpt_core::GitRequest {
                     workspace_id: args.workspace_id,
@@ -737,85 +747,97 @@ impl NovaMcp {
                     ..Default::default()
                 })
                 .await,
-        )
+        );
+        self.observed("show_changes", response)
     }
 
     #[tool(
         description = "Manage explicitly imported disposable NovaGPT VM images/instances: images, create, status or destroy. Disabled unless --vm-home is provided."
     )]
     async fn vm(&self, Parameters(args): Parameters<VmArgs>) -> CallToolResult {
-        let Some(vm) = self.extras.vm.clone() else {
-            return external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled));
-        };
-        match args.action {
-            VmAction::Images => external_reply(vm.images()),
-            VmAction::Create => match args.image {
-                Some(image) => external_reply(
-                    vm.create(VmCreate {
-                        image,
-                        cpus: args.cpus,
-                        memory_mb: args.memory_mb,
-                    })
-                    .await,
-                ),
-                None => tool_reply::<()>(Err(NovaError::InvalidInput(
-                    "image is required for create".into(),
-                ))),
-            },
-            VmAction::Status => match args.id {
-                Some(id) => external_reply(vm.status(&id).await),
-                None => tool_reply::<()>(Err(NovaError::InvalidInput(
-                    "id is required for status".into(),
-                ))),
-            },
-            VmAction::Destroy => match args.id {
-                Some(id) => external_reply(vm.destroy(&id).await),
-                None => tool_reply::<()>(Err(NovaError::InvalidInput(
-                    "id is required for destroy".into(),
-                ))),
-            },
+        let response = async {
+            let Some(vm) = self.extras.vm.clone() else {
+                return external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled));
+            };
+            match args.action {
+                VmAction::Images => external_reply(vm.images()),
+                VmAction::Create => match args.image {
+                    Some(image) => external_reply(
+                        vm.create(VmCreate {
+                            image,
+                            cpus: args.cpus,
+                            memory_mb: args.memory_mb,
+                        })
+                        .await,
+                    ),
+                    None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "image is required for create".into(),
+                    ))),
+                },
+                VmAction::Status => match args.id {
+                    Some(id) => external_reply(vm.status(&id).await),
+                    None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "id is required for status".into(),
+                    ))),
+                },
+                VmAction::Destroy => match args.id {
+                    Some(id) => external_reply(vm.destroy(&id).await),
+                    None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "id is required for destroy".into(),
+                    ))),
+                },
+            }
         }
+        .await;
+        self.observed("vm", response)
     }
 
     #[tool(
         description = "Check VM guest control availability without reading operation-scoped credentials"
     )]
     fn vm_guest_status(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
-        match &self.extras.vm {
-            Some(vm) => external_reply(vm.guest_status(&args.id)),
-            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
-        }
+        self.observed(
+            "vm_guest_status",
+            match &self.extras.vm {
+                Some(vm) => external_reply(vm.guest_status(&args.id)),
+                None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            },
+        )
     }
 
     #[tool(
         description = "Spawn a persistent asynchronous untrusted subagent. Valid roles: explorer, reviewer, tester, implementer. The implementer proposes patches but never auto-applies them."
     )]
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
-        let Some(manager) = &self.extras.agents else {
-            return external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled));
-        };
-        let role = match args.role.as_str() {
-            "explorer" => AgentRole::Explorer,
-            "reviewer" => AgentRole::Reviewer,
-            "tester" => AgentRole::Tester,
-            "implementer" => AgentRole::Implementer,
-            _ => {
-                return tool_reply::<()>(Err(NovaError::InvalidInput(
-                    "role must be explorer, reviewer, tester or implementer".into(),
-                )));
-            }
-        };
-        external_reply(
-            manager
-                .spawn(SpawnAgent {
-                    workspace_id: args.workspace_id,
-                    task: args.task,
-                    role,
-                    paths: args.paths,
-                    context: args.context,
-                })
-                .await,
-        )
+        let response = async {
+            let Some(manager) = &self.extras.agents else {
+                return external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled));
+            };
+            let role = match args.role.as_str() {
+                "explorer" => AgentRole::Explorer,
+                "reviewer" => AgentRole::Reviewer,
+                "tester" => AgentRole::Tester,
+                "implementer" => AgentRole::Implementer,
+                _ => {
+                    return tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "role must be explorer, reviewer, tester or implementer".into(),
+                    )));
+                }
+            };
+            external_reply(
+                manager
+                    .spawn(SpawnAgent {
+                        workspace_id: args.workspace_id,
+                        task: args.task,
+                        role,
+                        paths: args.paths,
+                        context: args.context,
+                    })
+                    .await,
+            )
+        }
+        .await;
+        self.observed("subagent_spawn", response)
     }
 
     #[tool(description = "Send follow-up message to a completed or failed persistent subagent")]
@@ -823,10 +845,11 @@ impl NovaMcp {
         &self,
         Parameters(args): Parameters<AgentMessageArgs>,
     ) -> CallToolResult {
-        match &self.extras.agents {
+        let response = match &self.extras.agents {
             Some(manager) => external_reply(manager.message(&args.id, &args.message).await),
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
-        }
+        };
+        self.observed("subagent_message", response)
     }
 
     #[tool(
@@ -836,12 +859,13 @@ impl NovaMcp {
         &self,
         Parameters(args): Parameters<AgentResumeArgs>,
     ) -> CallToolResult {
-        match &self.extras.agents {
+        let response = match &self.extras.agents {
             Some(manager) => {
                 external_reply(manager.resume(&args.id, args.manual_check_completed).await)
             }
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
-        }
+        };
+        self.observed("subagent_resume", response)
     }
 
     #[tool(
@@ -851,20 +875,22 @@ impl NovaMcp {
         &self,
         Parameters(args): Parameters<AgentStatusArgs>,
     ) -> CallToolResult {
-        match &self.extras.agents {
+        let response = match &self.extras.agents {
             Some(manager) => external_reply(manager.status(args.id.as_deref()).await),
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
-        }
+        };
+        self.observed("subagent_status", response)
     }
 
     #[tool(
         description = "Return bounded untrusted subagent output for independent parent verification"
     )]
     async fn subagent_result(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
-        match &self.extras.agents {
+        let response = match &self.extras.agents {
             Some(manager) => external_reply(manager.result(&args.id).await),
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
-        }
+        };
+        self.observed("subagent_result", response)
     }
 
     #[tool(
@@ -874,15 +900,19 @@ impl NovaMcp {
         &self,
         Parameters(args): Parameters<AgentCancelArgs>,
     ) -> CallToolResult {
-        if args.cleanup_worktree == Some(true) {
-            return tool_reply::<()>(Err(NovaError::InvalidInput(
-                "NovaGPT does not auto-create or remove implementer worktrees yet".into(),
-            )));
+        let response = async {
+            if args.cleanup_worktree == Some(true) {
+                return tool_reply::<()>(Err(NovaError::InvalidInput(
+                    "NovaGPT does not auto-create or remove implementer worktrees yet".into(),
+                )));
+            }
+            match &self.extras.agents {
+                Some(manager) => external_reply(manager.cancel(&args.id).await),
+                None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            }
         }
-        match &self.extras.agents {
-            Some(manager) => external_reply(manager.cancel(&args.id).await),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
-        }
+        .await;
+        self.observed("subagent_cancel", response)
     }
 
     #[tool(
@@ -892,10 +922,11 @@ impl NovaMcp {
         &self,
         Parameters(args): Parameters<IdArgs>,
     ) -> CallToolResult {
-        match &self.extras.agents {
+        let response = match &self.extras.agents {
             Some(manager) => external_reply(manager.diagnostics(&args.id).await),
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
-        }
+        };
+        self.observed("subagent_browser_diagnostics", response)
     }
 }
 
@@ -914,10 +945,13 @@ pub async fn run_stdio_with(
     workspaces: WorkspaceRegistry,
     extras: NovaExtras,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let audit = extras.audit.clone();
     let service = NovaMcp::with_extras(workspaces, extras)
         .serve(stdio())
         .await?;
-    service.waiting().await?;
+    let outcome = service.waiting().await;
+    audit.flush().await;
+    outcome?;
     Ok(())
 }
 
@@ -958,6 +992,7 @@ pub async fn run_http_with(
                 .into(),
         );
     }
+    let audit = extras.audit.clone();
     let service = StreamableHttpService::new(
         move || Ok(NovaMcp::with_extras(workspaces.clone(), extras.clone())),
         LocalSessionManager::default().into(),
@@ -968,10 +1003,12 @@ pub async fn run_http_with(
         .layer(middleware::from_fn_with_state(Arc::new(token), authorize));
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "NovaGPT MCP HTTP listening");
-    axum::serve(listener, router)
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
+        .await;
+    audit.flush().await;
+    result?;
     Ok(())
 }

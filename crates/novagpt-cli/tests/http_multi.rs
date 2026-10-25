@@ -199,6 +199,34 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     assert!(serialized.contains("write"));
     assert!(!serialized.contains("original"));
     assert!(!serialized.contains("winner"));
+    assert_eq!(activity["mode"], "metadata-only-persistent");
+    assert_eq!(activity["write_errors"], 0);
+    let recorded_before_restart = activity["total_calls"].as_u64().expect("counter");
+
+    let mut cli_logs = Command::new(env!("CARGO_BIN_EXE_novagpt"));
+    cli_logs
+        .arg("--root")
+        .arg(root.path())
+        .args(["logs", "tail", "--json"]);
+    if cfg!(windows) {
+        cli_logs.env("LOCALAPPDATA", private.path());
+    } else {
+        cli_logs.env("XDG_STATE_HOME", private.path());
+    }
+    let persisted_output = cli_logs.output().expect("logs tail command");
+    assert!(
+        persisted_output.status.success(),
+        "{:?}",
+        persisted_output.status
+    );
+    let persisted: Value =
+        serde_json::from_slice(&persisted_output.stdout).expect("JSONL snapshot");
+    assert_eq!(persisted["mode"], "metadata-only-persistent");
+    assert!(persisted["total_calls"].as_u64().unwrap_or_default() >= recorded_before_restart);
+    let disk_text = String::from_utf8_lossy(&persisted_output.stdout);
+    assert!(!disk_text.contains(&token));
+    assert!(!disk_text.contains("original"));
+    assert!(!disk_text.contains("winner"));
 
     // The independent transport holds an SSE GET stream without consuming
     // another client's session. Explicit session DELETE is then isolated.
@@ -235,5 +263,50 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     assert_eq!(
         std::fs::read_to_string(root.path().join("shared.txt")).expect("disk"),
         "winner"
+    );
+
+    child.0.kill().expect("stop first server");
+    child.0.wait().expect("reap first server");
+    let mut restarted = ProcessGuard(cmd.spawn().expect("restart from same workspace"));
+    let mut restarted_ready = false;
+    for _ in 0..100 {
+        if restarted.0.try_wait().expect("poll restarted").is_some() {
+            panic!("restarted server exited");
+        }
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            restarted_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(restarted_ready, "restarted HTTP server failed to bind");
+    let (_, fresh_session) = rpc(&client, port, &token, None, initialize(30))
+        .await
+        .expect("new transport after restart");
+    let new_id = fresh_session.expect("new transport ID");
+    let (recovered, _) = rpc(
+        &client,
+        port,
+        &token,
+        Some(&new_id),
+        json!({"jsonrpc":"2.0","id":31,"method":"tools/call",
+            "params":{"name":"runtime_status","arguments":{}}}),
+    )
+    .await
+    .expect("persisted history visible after restart");
+    assert_eq!(
+        recovered["result"]["structuredContent"]["mode"],
+        "metadata-only-persistent"
+    );
+    assert!(
+        recovered["result"]["structuredContent"]["total_calls"]
+            .as_u64()
+            .unwrap_or_default()
+            >= recorded_before_restart
+    );
+    assert!(
+        recovered["result"]["structuredContent"]["llm"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["tool"] == "write"))
     );
 }
