@@ -10,7 +10,7 @@ mod tunnel;
 use clap::{Parser, Subcommand};
 use novagpt_agents::{AgentManager, ChatGptBackend};
 use novagpt_browser::{BrowserBridge, ChatGptBrowser};
-use novagpt_core::{BashMode, WorkspaceRegistry};
+use novagpt_core::WorkspaceRegistry;
 use novagpt_mcp::NovaExtras;
 use novagpt_vm::VmManager;
 use settings::LocalSettings;
@@ -57,15 +57,9 @@ struct Cli {
     /// Explicit HTTPS origin authorized for read-only tab access; never permits other origins.
     #[arg(long, requires = "browser_bridge_port")]
     browser_bridge_origin: Option<String>,
-    /// Shell access mode: off, safe (fixed quality commands), or explicitly approved full.
-    #[arg(long, value_parser = ["off", "safe", "full"], default_value = "safe")]
-    bash_mode: String,
     /// Log format for server diagnostics on stderr: human text or LLM JSON lines.
     #[arg(long, value_parser = ["human", "llm"], default_value = "human")]
     log_format: String,
-    /// Explicit acknowledgement required for unrestricted shell execution.
-    #[arg(long)]
-    allow_full_shell: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -176,16 +170,6 @@ enum LogsCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-fn requested_bash_mode(mode: &str, allow_full_shell: bool) -> Result<BashMode, &'static str> {
-    match mode {
-        "off" => Ok(BashMode::Off),
-        "safe" => Ok(BashMode::Safe),
-        "full" if allow_full_shell => Ok(BashMode::Full),
-        "full" => Err("full Bash access requires --allow-full-shell"),
-        _ => Err("invalid Bash mode"),
-    }
 }
 
 #[tokio::main]
@@ -350,9 +334,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
-    // Resolve once for both HTTP/stdio and the interactive TUI. An
-    // unrestricted terminal always requires an explicit startup opt-in.
-    let bash_mode = requested_bash_mode(&cli.bash_mode, cli.allow_full_shell)?;
     if cli.setup || cli.command.is_none() {
         let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
         let mut profiles = settings::discover_codexpro_profiles(&home)?;
@@ -361,10 +342,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             profiles.push(imported);
         }
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            tui::run(root, local, cli.setup, profiles, handle, bash_mode)
-        })
-        .await??;
+        tokio::task::spawn_blocking(move || tui::run(root, local, cli.setup, profiles, handle))
+            .await??;
         return Ok(());
     }
 
@@ -435,7 +414,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser,
         browser_bridge,
         output_store: novagpt_mcp::OutputStore::default(),
-        bash_mode,
         audit: novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?,
         http_public_hostname: None,
     };
@@ -557,18 +535,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => unreachable!("TUI was handled before server startup"),
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod bash_mode_tests {
-    use super::*;
-
-    #[test]
-    fn unrestricted_shell_requires_explicit_approval_in_both_cli_and_tui() {
-        assert_eq!(requested_bash_mode("safe", false), Ok(BashMode::Safe));
-        assert_eq!(requested_bash_mode("off", false), Ok(BashMode::Off));
-        assert_eq!(requested_bash_mode("full", true), Ok(BashMode::Full));
-        assert!(requested_bash_mode("full", false).is_err());
-        assert!(requested_bash_mode("unrecognized", true).is_err());
-    }
 }

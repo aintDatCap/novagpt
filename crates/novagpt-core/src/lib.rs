@@ -14,7 +14,7 @@ mod process_output;
 mod workspace;
 mod worktree_ops;
 
-pub use command_ops::{BashMode, BashRequest, BashResult};
+pub use command_ops::{BashRequest, BashResult};
 pub use context_ops::CodexInstructions;
 pub use fs_ops::{EditRequest, FileDocument, FileReceipt, FileWriteRequest, SearchHit, TreeEntry};
 pub use git_ops::{GitRequest, GitResult};

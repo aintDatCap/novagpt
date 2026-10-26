@@ -45,8 +45,6 @@ fn initial_git_bash_patch_protocol_and_negative_paths() {
             },
             private.path(),
         )
-        .arg("--bash-mode")
-        .arg("safe")
         .arg("stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -61,8 +59,8 @@ fn initial_git_bash_patch_protocol_and_negative_paths() {
             }}),
             json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git_status","arguments":{}}}),
-            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bash","arguments":{"command":"cargo --version"}}}),
-            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bash","arguments":{"command":"cargo --version && echo bad"}}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bash","arguments":{"command":"echo NOVAGPT_SHELL_VERSION_CHECK"}}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bash","arguments":{"command":"echo NOVAGPT_SHELL_ENABLED_FIXTURE"}}}),
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"apply_patch","arguments":{
                 "patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-after\n+final\n"
             }}}),
@@ -93,7 +91,13 @@ fn initial_git_bash_patch_protocol_and_negative_paths() {
     };
     assert_eq!(get(2)["result"]["isError"], false);
     assert_eq!(get(3)["result"]["structuredContent"]["exitCode"], 0);
-    assert_eq!(get(4)["result"]["isError"], true);
+    assert_eq!(get(4)["result"]["isError"], false);
+    assert!(
+        get(4)["result"]["structuredContent"]["stdout"]
+            .as_str()
+            .unwrap_or("")
+            .contains("NOVAGPT_SHELL_ENABLED_FIXTURE")
+    );
     assert_eq!(get(5)["result"]["structuredContent"]["changed"], true);
     assert!(
         get(6)["result"]["structuredContent"]["stdout"]

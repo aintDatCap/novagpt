@@ -76,7 +76,6 @@ pub fn run(
     setup: bool,
     profiles: Vec<ImportProfile>,
     handle: Handle,
-    bash_mode: novagpt_core::BashMode,
 ) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -87,7 +86,7 @@ pub fn run(
     let (_guard, mut terminal) = TerminalGuard::open()?;
     let mut app = model::App::new(root, settings, setup, profiles);
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut controller = operations::Controller::new(handle, tx, bash_mode);
+    let mut controller = operations::Controller::new(handle, tx);
     loop {
         // UI stays responsive while filesystem, VM and server work off-thread.
         while let Ok(message) = rx.try_recv() {

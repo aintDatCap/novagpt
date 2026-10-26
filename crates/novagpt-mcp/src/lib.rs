@@ -13,7 +13,7 @@ use base64::Engine;
 use novagpt_agents::{AgentManager, AgentRole, SpawnAgent};
 use novagpt_browser::{BrowserBridge, ChatGptBrowser};
 use novagpt_core::{
-    BashMode, BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
+    BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
 };
 use novagpt_vm::{VmCreate, VmManager};
 pub use output_store::OutputStore;
@@ -41,7 +41,6 @@ pub struct NovaExtras {
     pub browser: Option<ChatGptBrowser>,
     pub browser_bridge: Option<BrowserBridge>,
     pub output_store: OutputStore,
-    pub bash_mode: BashMode,
     pub audit: AuditTrail,
     /// Explicitly approved public tunnel hostname. Never accepts a wildcard.
     pub http_public_hostname: Option<String>,
@@ -449,9 +448,7 @@ impl NovaMcp {
         self.observed(
             "server_config",
             tool_reply(Ok(serde_json::json!({
-                "bash_mode": match self.extras.bash_mode {
-                    BashMode::Off => "off", BashMode::Safe => "safe", BashMode::Full => "full",
-                },
+                "bash_enabled": true,
                 "vm_enabled": self.extras.vm.is_some(),
                 "subagents_enabled": self.extras.agents.is_some(),
                 "dedicated_browser_enabled": self.extras.browser.is_some(),
@@ -815,7 +812,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Execute a bounded local command under the startup-configured off/safe/full shell policy"
+        description = "Run a host shell command with bounded output and timeout; available without mode flags. Browser tools are independent."
     )]
     async fn bash(&self, Parameters(args): Parameters<BashArgs>) -> CallToolResult {
         let workspace_id = self
@@ -824,16 +821,13 @@ impl NovaMcp {
             .map(|workspace| workspace.workspace_id);
         let result = self
             .workspaces
-            .run_bash(
-                self.extras.bash_mode,
-                BashRequest {
-                    workspace_id: args.workspace_id,
-                    command: args.command,
-                    shell: args.shell,
-                    cwd: args.cwd,
-                    timeout_ms: args.timeout_ms,
-                },
-            )
+            .run_bash(BashRequest {
+                workspace_id: args.workspace_id,
+                command: args.command,
+                shell: args.shell,
+                cwd: args.cwd,
+                timeout_ms: args.timeout_ms,
+            })
             .await
             .map(|mut value| {
                 if let Ok(workspace_id) = workspace_id

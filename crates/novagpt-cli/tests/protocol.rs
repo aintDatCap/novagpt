@@ -265,3 +265,113 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         );
     }
 }
+
+#[test]
+fn browser_config_and_shell_are_both_available_without_mode_flags() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let private = tempfile::tempdir().expect("private state");
+    let directory = workspace.path().join(".novagpt");
+    fs::create_dir(&directory).expect("configuration directory");
+    // A non-Chrome executable ensures this fixture never opens a real
+    // browser or account; browser and shell remain independent.
+    fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "port": 8787,
+            "browser_enabled": true,
+            "chrome_executable": env!("CARGO_BIN_EXE_novagpt")
+        }))
+        .expect("config json"),
+    )
+    .expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_novagpt"))
+        .arg("--root")
+        .arg(workspace.path())
+        .env(
+            if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_STATE_HOME"
+            },
+            private.path(),
+        )
+        .arg("stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("server");
+    {
+        let mut input = child.stdin.take().expect("stdin");
+        for item in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},
+                "clientInfo":{"name":"browser-bash-decoupling","version":"0.1"}
+            }}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"server_config","arguments":{}
+            }}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"bash","arguments":{"command":"echo NOVAGPT_UNCONDITIONAL_SHELL"}
+            }}),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                "name":"browser_open","arguments":{}
+            }}),
+        ] {
+            writeln!(input, "{item}").expect("request");
+        }
+    }
+    let output = child.wait_with_output().expect("server responses");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json rpc"))
+        .collect();
+    let response = |id: i64| {
+        responses
+            .iter()
+            .find(|message| message["id"] == id)
+            .expect("response")
+    };
+    let flags = &response(2)["result"]["structuredContent"];
+    assert_eq!(flags["bash_enabled"], true);
+    assert_eq!(flags["dedicated_browser_enabled"], true);
+    assert_eq!(response(3)["result"]["isError"], false);
+    let shell_output = response(3)["result"]["structuredContent"]["stdout"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        shell_output.contains("NOVAGPT_UNCONDITIONAL_SHELL"),
+        "{shell_output}"
+    );
+    assert_eq!(response(4)["result"]["isError"], true);
+    let browser_error = response(4)["result"]["structuredContent"]["error"]
+        .as_str()
+        .unwrap_or("");
+    assert!(!browser_error.contains("disabled"), "{browser_error}");
+    assert!(browser_error.contains("Chrome"), "{browser_error}");
+    // Profile acquisition, not personal Chrome: dedicated owned marker only.
+    assert!(
+        directory
+            .join("browser")
+            .join("novagpt-browser-owner")
+            .is_file()
+    );
+}
+
+#[test]
+fn legacy_bash_mode_cli_option_is_removed() {
+    let output = Command::new(env!("CARGO_BIN_EXE_novagpt"))
+        .args(["--bash-mode", "full", "doctor"])
+        .output()
+        .expect("invoke CLI");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+}

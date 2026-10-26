@@ -16,19 +16,13 @@ pub(super) struct Controller {
     runtime: Handle,
     tx: UnboundedSender<OperationEvent>,
     server: Option<JoinHandle<()>>,
-    bash_mode: novagpt_core::BashMode,
 }
 impl Controller {
-    pub fn new(
-        runtime: Handle,
-        tx: UnboundedSender<OperationEvent>,
-        bash_mode: novagpt_core::BashMode,
-    ) -> Self {
+    pub fn new(runtime: Handle, tx: UnboundedSender<OperationEvent>) -> Self {
         Self {
             runtime,
             tx,
             server: None,
-            bash_mode,
         }
     }
     fn report(&self, level: Level, message: impl Into<String>) {
@@ -237,7 +231,6 @@ impl Controller {
             return;
         }
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
-        let bash_mode = self.bash_mode;
         let tx = self.tx.clone();
         let task = self.runtime.spawn(async move {
             let tx_info = tx.clone();
@@ -286,7 +279,6 @@ impl Controller {
                         browser,
                         browser_bridge: None,
                         output_store: novagpt_mcp::OutputStore::default(),
-                        bash_mode,
                         http_public_hostname: None,
                         audit: novagpt_mcp::AuditTrail::persistent(
                             crate::logging::audit_directory(&root)

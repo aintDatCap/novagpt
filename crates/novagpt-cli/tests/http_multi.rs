@@ -298,7 +298,7 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         &token,
         Some(&sid_a),
         json!({"jsonrpc":"2.0","id":40,"method":"tools/call",
-            "params":{"name":"bash","arguments":{"command":"cargo --version"}}}),
+            "params":{"name":"bash","arguments":{"command":"echo NOVAGPT_HTTP_SHELL_FIXTURE"}}}),
     )
     .await
     .expect("bounded shell command");
@@ -321,7 +321,7 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         paged["result"]["structuredContent"]["text"]
             .as_str()
             .unwrap_or("")
-            .contains("cargo")
+            .contains("NOVAGPT_HTTP_SHELL_FIXTURE")
     );
     let (blocked_output, _) = rpc(
         &client,
