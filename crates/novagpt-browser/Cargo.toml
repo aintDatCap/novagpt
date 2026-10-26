@@ -13,3 +13,7 @@ thiserror.workspace = true
 reqwest.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

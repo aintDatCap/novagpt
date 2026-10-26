@@ -47,6 +47,24 @@ cargo run -p novagpt-cli -- `
 
 Supply paths that exist on your machine; the Chrome path above is illustrative, not detected. To use Streamable HTTP instead, provide `NOVAGPT_HTTP_TOKEN` and change `stdio` to `http --port 8787` (the HTTP listener remains loopback-only).
 
+### Manual-login mode (dedicated Chrome, no CDP)
+
+Before starting the MCP server, run an ordinary, visible Chrome instance using the **same dedicated NovaGPT profile**:
+
+```powershell
+cargo run -p novagpt-cli -- `
+  --root C:\Projects\your-repo `
+  --chatgpt-chrome 'C:\Program Files\Google\Chrome\Application\chrome.exe' `
+  --chatgpt-profile 'C:\NovaGPT-ChatGPT-Browser' `
+  browser-login
+```
+
+This mode does **not** add `--remote-debugging-port`, WebDriver, headless, or injection switches. The CLI waits for Chrome to exit. Log in personally in the Chrome window, complete any authentication or verification yourself, and **close that dedicated Chrome** before starting NovaGPT with `stdio` or `http`. If you previously configured browser support in the TUI, `--root C:\Projects\your-repo browser-login` uses the TUI's `.novagpt/browser` directory and detected/configured Chrome automatically. Use exactly the same profile path in both modes; never use a personal or CodexPro profile.
+
+A cross-process OS file lock prevents two NovaGPT instances from claiming the same owned profile at the same time. The profile marker and existing Chrome data are preserved. A stale CDP endpoint after Chrome exits is discarded instead of treating it as a healthy browser.
+
+**Important:** A login accepted in ordinary Chrome may still be rejected after Chrome restarts with CDP enabled, depending on the identity provider's policy. This is a compatibility workflow, **not** a bypass of authentication/antifraud controls or a guarantee of a successful login. If the provider does not permit the browser to be automated, use an officially supported authentication or API workflow. Chrome login and session persistence have not been tested against a real account in this change.
+
 To open Chrome directly from ChatGPT after enabling the browser and restarting the server, call `browser_open` (launches the visible, dedicated Chrome profile); then call `browser_navigate` with `{"url":"https://www.rust-lang.org/"}` and `browser_read` to retrieve bounded visible page text/title/URL. `browser_close` closes only the interactive browsing tab, **not** the shared Chrome process or any subagent conversation. These browser tools have no arbitrary JavaScript, login automation, or cookie access. Navigation currently accepts public HTTPS hostnames without credentials, IP addresses or custom ports; redirect destinations are checked before returning page text. Network-level DNS rebinding and real-browser navigation must still be verified independently. Web page content is untrusted data, not instructions to follow. Use an explicit URL and do not expose sensitive private pages through this tool. Chrome is launched only after the first explicit `browser_open` or subagent request, not at server startup.
 
 Call `subagent_spawn`:

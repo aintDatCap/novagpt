@@ -72,6 +72,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open ordinary Chrome for manual ChatGPT login using NovaGPT's own profile.
+    /// No CDP or automation flags are enabled. Close Chrome before starting agents.
+    BrowserLogin,
     /// Inspect safe workspace information and enabled configuration without launching optional services.
     Doctor {
         /// Emit machine-readable JSON instead of human-readable text.
@@ -243,6 +246,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(action) = &cli.command {
         match action {
+            Command::BrowserLogin => {
+                let env_chrome = std::env::var_os("NOVAGPT_CHROME_PATH").map(PathBuf::from);
+                let chosen = cli
+                    .chatgpt_chrome
+                    .as_deref()
+                    .or(env_chrome.as_deref())
+                    .or(local.chrome_executable.as_deref());
+                let executable = chrome::discover(chosen)?;
+                let profile = cli
+                    .chatgpt_profile
+                    .clone()
+                    .unwrap_or_else(|| settings::local_dir(&root).join("browser"));
+                println!("Opening dedicated NovaGPT Chrome for manual authentication.");
+                println!("Complete any login/verification yourself, then close the Chrome window.");
+                ChatGptBrowser::manual_login(executable, profile).await?;
+                println!(
+                    "Manual Chrome closed. Start NovaGPT normally to use the authorized profile."
+                );
+                return Ok(());
+            }
             Command::ConnectorUrl { port } => {
                 let port = port.unwrap_or(local.port);
                 let resolved = token::resolve(&root)?;
@@ -526,7 +549,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Command::Inspect { .. }
             | Command::Review { .. }
             | Command::ConnectionTest { .. }
-            | Command::ConnectorUrl { .. },
+            | Command::ConnectorUrl { .. }
+            | Command::BrowserLogin,
         ) => {
             unreachable!("read-only commands handled above")
         }

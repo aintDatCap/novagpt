@@ -1,8 +1,10 @@
 //! Dedicated visible Chrome CDP transport for ChatGPT subagents.
 //! Never reads Chrome cookies/credentials; manual challenges are for the user.
 mod bridge;
+mod profile;
 pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
 use futures_util::{SinkExt, StreamExt};
+use profile::ProfileLease;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -50,6 +52,8 @@ pub enum BrowserError {
     Protocol,
     #[error("ChatGPT Browser profile is invalid")]
     InvalidProfile,
+    #[error("Dedicated NovaGPT Chrome profile is already in use")]
+    ProfileBusy,
     #[error("Browser navigation requires a public HTTPS URL with no credentials or custom port")]
     UnsafeUrl,
 }
@@ -137,6 +141,7 @@ struct Inner {
     profile: PathBuf,
     process: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
+    profile_lease: Mutex<Option<ProfileLease>>,
     startup: Mutex<()>,
     create_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
@@ -146,6 +151,24 @@ struct Inner {
 #[derive(Clone)]
 pub struct ChatGptBrowser {
     inner: Arc<Inner>,
+}
+
+/// This launch deliberately does not opt into remote debugging, WebDriver,
+/// headless mode or automation. It is *only* for interactive user login.
+fn manual_login_command(executable: &Path, profile: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+        ])
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(HOME)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 impl ChatGptBrowser {
@@ -167,53 +190,82 @@ impl ChatGptBrowser {
                 profile,
                 process: Mutex::new(None),
                 port: Mutex::new(None),
+                profile_lease: Mutex::new(None),
                 startup: Mutex::new(()),
                 create_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
-                http: reqwest::Client::new(),
+                http: reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .map_err(|_| BrowserError::Protocol)?,
                 start_interval: Duration::from_millis(400),
             }),
         })
     }
 
+    /// Starts ordinary Chrome *without* any remote debugging or automation
+    /// switches. The user performs all authentication steps visibly, closes
+    /// this window, then starts NovaGPT's CDP-capable server separately.
+    pub async fn manual_login(
+        executable: impl AsRef<Path>,
+        profile: impl AsRef<Path>,
+    ) -> Result<(), BrowserError> {
+        let browser = Self::new(executable, profile)?;
+        let owned_profile = browser.inner.profile.clone();
+        let _lease = tokio::task::spawn_blocking(move || profile::acquire(&owned_profile))
+            .await
+            .map_err(|_| BrowserError::InvalidProfile)??;
+        let mut child = manual_login_command(&browser.inner.executable, &browser.inner.profile)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| BrowserError::NotRunning)?;
+        let status = child.wait().await.map_err(|_| BrowserError::NotRunning)?;
+        if !status.success() {
+            return Err(BrowserError::NotRunning);
+        }
+        Ok(())
+    }
+
     async fn ensure_started(&self) -> Result<u16, BrowserError> {
         let _start_guard = self.inner.startup.lock().await;
-        if let Some(port) = *self.inner.port.lock().await {
-            return Ok(port);
-        }
-        fs::create_dir_all(&self.inner.profile)
-            .await
-            .map_err(|_| BrowserError::InvalidProfile)?;
-        if fs::symlink_metadata(&self.inner.profile)
-            .await
-            .map_err(|_| BrowserError::InvalidProfile)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(BrowserError::InvalidProfile);
-        }
-        let owner = self.inner.profile.join("novagpt-browser-owner");
-        if let Ok(bytes) = fs::read(&owner).await {
-            if bytes != b"NovaGPT dedicated ChatGPT Browser profile v1\n" {
-                return Err(BrowserError::InvalidProfile);
+        let current_port = *self.inner.port.lock().await;
+        if let Some(port) = current_port {
+            let alive = {
+                let mut process = self.inner.process.lock().await;
+                process
+                    .as_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+            };
+            let reachable = if alive {
+                self.inner
+                    .http
+                    .get(format!("http://127.0.0.1:{port}/json/version"))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+            } else {
+                false
+            };
+            if alive && reachable {
+                return Ok(port);
             }
-        } else {
-            let mut entries = fs::read_dir(&self.inner.profile)
-                .await
-                .map_err(|_| BrowserError::InvalidProfile)?;
-            if entries
-                .next_entry()
-                .await
-                .map_err(|_| BrowserError::InvalidProfile)?
-                .is_some()
-            {
-                // Never attach to an existing personal Chrome or CodexPro profile.
-                return Err(BrowserError::InvalidProfile);
+            // Stale port/targets must never be reused after Chrome exits.
+            self.inner.port.lock().await.take();
+            self.inner.pages.lock().await.clear();
+            if let Some(mut child) = self.inner.process.lock().await.take() {
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(3), child.wait()).await;
             }
-            fs::write(&owner, b"NovaGPT dedicated ChatGPT Browser profile v1\n")
-                .await
-                .map_err(|_| BrowserError::InvalidProfile)?;
+            self.inner.profile_lease.lock().await.take();
         }
+
+        let profile_path = self.inner.profile.clone();
+        let lease = tokio::task::spawn_blocking(move || profile::acquire(&profile_path))
+            .await
+            .map_err(|_| BrowserError::InvalidProfile)??;
+
+        // A prior session can leave this file behind after a crash.
         let _ = fs::remove_file(self.inner.profile.join("DevToolsActivePort")).await;
         let mut process = Command::new(&self.inner.executable)
             .args([
@@ -248,10 +300,27 @@ impl ChatGptBrowser {
                 || Instant::now() >= deadline
             {
                 let _ = process.start_kill();
+                let _ = timeout(Duration::from_secs(3), process.wait()).await;
                 return Err(BrowserError::NotRunning);
             }
             sleep(Duration::from_millis(200)).await;
         };
+        // Confirm that the endpoint actually belongs to a live CDP server,
+        // not merely to a stale DevToolsActivePort file.
+        let healthy = self
+            .inner
+            .http
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if !healthy {
+            let _ = process.start_kill();
+            let _ = timeout(Duration::from_secs(3), process.wait()).await;
+            return Err(BrowserError::NotRunning);
+        }
+        *self.inner.profile_lease.lock().await = Some(lease);
         *self.inner.process.lock().await = Some(process);
         *self.inner.port.lock().await = Some(port);
         Ok(port)
@@ -262,10 +331,10 @@ impl ChatGptBrowser {
             return Err(BrowserError::Protocol);
         }
         let _serial = self.inner.create_lock.lock().await;
+        let port = self.ensure_started().await?;
         if self.inner.pages.lock().await.contains_key(id) {
             return Err(BrowserError::Unavailable);
         }
-        let port = self.ensure_started().await?;
         // Chrome's remote debugging server permits target creation via PUT.
         let url = format!("http://127.0.0.1:{port}/json/new?{HOME}");
         let response: Value = self
@@ -318,6 +387,8 @@ impl ChatGptBrowser {
     /// Open a visible, dedicated browsing tab, separate from all subagent tabs.
     /// This operation reuses the same owned Chrome process/profile.
     pub async fn browse_open(&self) -> Result<BrowserDiagnostics, BrowserError> {
+        // Validate the owned Chrome process before reusing a remembered tab.
+        self.ensure_started().await?;
         if self.page(BROWSE_TAB).await.is_err() {
             match self.open(BROWSE_TAB).await {
                 Ok(()) | Err(BrowserError::Unavailable) => {}
@@ -421,12 +492,23 @@ impl ChatGptBrowser {
             None
         };
         BrowserDiagnostics {
-            browser_state: if self.inner.port.lock().await.is_some() {
-                "attached"
-            } else {
-                "stopped"
-            }
-            .into(),
+            browser_state: {
+                let running = self
+                    .inner
+                    .process
+                    .lock()
+                    .await
+                    .as_mut()
+                    .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+                if running && self.inner.port.lock().await.is_some() {
+                    "attached"
+                } else if self.inner.port.lock().await.is_some() {
+                    "disconnected"
+                } else {
+                    "stopped"
+                }
+                .into()
+            },
             page_count: pages.len(),
             queued_page_creations: 0,
             manual_check: manual,
@@ -645,6 +727,31 @@ fn manual_reason(state: &Value) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_login_launch_has_no_automation_or_debugging_arguments() {
+        let command =
+            manual_login_command(Path::new("chrome.exe"), Path::new("C:/NovaGPT/browser"));
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=")));
+        assert!(args.iter().any(|arg| arg == HOME));
+        for disallowed in [
+            "--remote-debugging-port",
+            "--remote-debugging-pipe",
+            "--enable-automation",
+            "--headless",
+            "--disable-web-security",
+            "--ignore-certificate-errors",
+        ] {
+            assert!(
+                !args.iter().any(|arg| arg.starts_with(disallowed)),
+                "{disallowed}"
+            );
+        }
+    }
     #[test]
     fn manual_checks_are_never_bypassed() {
         assert_eq!(
