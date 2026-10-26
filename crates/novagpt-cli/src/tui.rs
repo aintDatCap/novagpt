@@ -429,11 +429,11 @@ mod tests {
     #[test]
     fn home_actions_and_tunnel_status_follow_real_server_events() {
         let mut a = app();
-        assert_eq!(a.visible_commands(), vec![0, 7, 2]);
+        assert_eq!(a.visible_commands(), vec![0, 7, 9, 2]);
         assert_eq!(a.command, 0);
         a.key(key(KeyCode::Char('a')));
         assert!(a.show_advanced);
-        assert_eq!(a.visible_commands(), vec![0, 7, 2, 3, 4, 5, 6]);
+        assert_eq!(a.visible_commands(), vec![0, 7, 9, 2, 3, 4, 5, 6]);
         a.key(key(KeyCode::Char('a')));
         assert!(!a.show_advanced);
         a.on_event(OperationEvent::Server(ServerState::Running));
@@ -445,6 +445,93 @@ mod tests {
         a.on_event(OperationEvent::Server(ServerState::Stopped));
         assert!(!a.tunnel_ready);
         assert_eq!(a.command, 0);
+    }
+
+    #[test]
+    fn agent_browser_requires_saved_opt_in_and_mcp_stopped() {
+        let mut app = app();
+        app.command = 9;
+        assert!(app.visible_commands().contains(&9));
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert!(!app.browser_login_running);
+        assert!(!app.busy);
+
+        // Enabling an unsaved draft does not opt in to starting Chrome.
+        app.draft.browser_enabled = true;
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert!(!app.browser_login_running);
+
+        app.persisted = app.draft.clone();
+        app.draft.port = 9191;
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert!(!app.browser_login_running);
+
+        app.draft = app.persisted.clone();
+        app.on_event(OperationEvent::Server(ServerState::Running));
+        assert!(!app.visible_commands().contains(&9));
+        app.command = 9;
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert!(!app.browser_login_running);
+    }
+
+    #[test]
+    fn agent_browser_open_is_async_single_flight_and_blocks_server_start() {
+        let settings = LocalSettings {
+            browser_enabled: true,
+            ..LocalSettings::default()
+        };
+        let mut app = App::new(PathBuf::from("."), settings, false, vec![]);
+        app.command = 9;
+        let effect = app.key(key(KeyCode::Enter));
+        assert!(matches!(effect, Some(Effect::OpenAgentBrowser(config)) if config.browser_enabled));
+        assert!(app.browser_login_running);
+        assert!(app.busy);
+        assert!(app.key(key(KeyCode::Enter)).is_none()); // no second launch
+        app.command = 0;
+        assert!(app.key(key(KeyCode::Enter)).is_none()); // cannot start MCP
+        assert_eq!(app.server, ServerState::Stopped);
+        app.command = 7;
+        assert!(app.key(key(KeyCode::Enter)).is_none()); // cannot start ngrok
+        assert_eq!(app.server, ServerState::Stopped);
+
+        app.on_event(OperationEvent::BrowserLoginFinished(Err(
+            model::BrowserOpenFailure::ProfileBusy,
+        )));
+        assert!(!app.browser_login_running);
+        assert!(!app.busy);
+        assert!(app.status.contains("profile") || app.status.contains("profilo"));
+        app.command = 9;
+        assert!(matches!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::OpenAgentBrowser(_))
+        ));
+        app.on_event(OperationEvent::BrowserLoginFinished(Ok(())));
+        assert!(!app.browser_login_running);
+        assert!(!app.busy);
+        assert!(matches!(
+            app.key(key(KeyCode::Char('q'))),
+            Some(Effect::Quit)
+        ));
+    }
+
+    #[test]
+    fn agent_browser_action_is_visible_and_localized() {
+        let mut app = app();
+        let mut terminal = Terminal::new(TestBackend::new(132, 37)).unwrap();
+        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+        let shown = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(shown(&terminal).contains("Open agent browser"));
+        app.draft.language = crate::i18n::LanguageChoice::Italian;
+        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+        assert!(shown(&terminal).contains("Apri browser agenti"));
     }
 
     #[test]

@@ -319,6 +319,8 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 8 => Messages::tunnel_required(lang),
                 3 | 4 if !app.persisted.vm_enabled => Messages::vm_disabled(lang),
                 5 if !app.persisted.browser_enabled => Messages::browser_disabled(lang),
+                9 if app.browser_login_running => Messages::agent_browser_window_open(lang),
+                9 if !app.persisted.browser_enabled => Messages::browser_disabled(lang),
                 _ => "",
             };
             ListItem::new(Line::from(vec![

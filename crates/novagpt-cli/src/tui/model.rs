@@ -19,6 +19,7 @@ pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
         6 => i18n::Messages::clients_and_cli(lang),
         7 => i18n::Messages::start_mcp_ngrok(lang),
         8 => i18n::Messages::show_chatgpt_url(lang),
+        9 => i18n::Messages::open_agent_browser(lang),
         _ => "",
     }
 }
@@ -116,7 +117,15 @@ pub(super) enum Effect {
     Save(LocalSettings, bool),
     EnsureToken,
     LoadNovaSource(PathBuf),
+    OpenAgentBrowser(LocalSettings),
     Quit,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BrowserOpenFailure {
+    ChromeMissing,
+    ProfileBusy,
+    ProfileInvalid,
+    LaunchFailed,
 }
 #[derive(Debug)]
 pub(super) enum OperationEvent {
@@ -131,6 +140,7 @@ pub(super) enum OperationEvent {
     ConnectorUrlReady(Result<String, String>),
     CopyFinished(Result<(), String>),
     NovaSourceLoaded(Result<ImportProfile, String>),
+    BrowserLoginFinished(Result<(), BrowserOpenFailure>),
     Saved {
         settings: LocalSettings,
         outcome: Result<String, String>,
@@ -161,6 +171,7 @@ pub(super) struct App {
     pub auth_state: AuthState,
     pub yes: bool,
     pub busy: bool,
+    pub browser_login_running: bool,
     pub logs: VecDeque<LogEntry>,
     pub log_offset: usize,
     pub status: String,
@@ -199,6 +210,7 @@ impl App {
             auth_state: AuthState::NotVerified,
             yes: false,
             busy: false,
+            browser_login_running: false,
             logs: VecDeque::new(),
             log_offset: 0,
             status: "Pronto".into(),
@@ -353,6 +365,24 @@ impl App {
                     Err(message) => self.log(Level::Error, message),
                 }
             }
+            OperationEvent::BrowserLoginFinished(result) => {
+                self.browser_login_running = false;
+                self.busy = false;
+                match result {
+                    Ok(()) => {
+                        self.log_localized(Level::Success, i18n::Messages::agent_browser_closed)
+                    }
+                    Err(BrowserOpenFailure::ChromeMissing) => self
+                        .log_localized(Level::Error, i18n::Messages::agent_browser_chrome_missing),
+                    Err(BrowserOpenFailure::ProfileBusy) => {
+                        self.log_localized(Level::Warn, i18n::Messages::agent_browser_profile_busy)
+                    }
+                    Err(BrowserOpenFailure::ProfileInvalid) => self
+                        .log_localized(Level::Error, i18n::Messages::agent_browser_profile_invalid),
+                    Err(BrowserOpenFailure::LaunchFailed) => self
+                        .log_localized(Level::Error, i18n::Messages::agent_browser_launch_failed),
+                }
+            }
             OperationEvent::TokenPresent(message) => {
                 self.auth_state = AuthState::Ready;
                 self.log(Level::Info, message);
@@ -432,7 +462,7 @@ impl App {
         let mut commands = if matches!(self.server, ServerState::Running | ServerState::Starting) {
             vec![8, 1, 2]
         } else {
-            vec![0, 7, 2]
+            vec![0, 7, 9, 2]
         };
         if self.show_advanced {
             commands.extend([3, 4, 5, 6]);
@@ -458,7 +488,12 @@ impl App {
         self.command = index;
         match index {
             0 => {
-                if self.server == ServerState::Starting || self.server == ServerState::Running {
+                if self.browser_login_running {
+                    self.log_localized(Level::Warn, i18n::Messages::agent_browser_close_first);
+                    None
+                } else if self.server == ServerState::Starting
+                    || self.server == ServerState::Running
+                {
                     self.log_localized(
                         Level::Warn,
                         i18n::Messages::server_is_already_running_or_starting,
@@ -531,7 +566,10 @@ impl App {
                 None
             }
             7 => {
-                if matches!(self.server, ServerState::Starting | ServerState::Running) {
+                if self.browser_login_running {
+                    self.log_localized(Level::Warn, i18n::Messages::agent_browser_close_first);
+                    None
+                } else if matches!(self.server, ServerState::Starting | ServerState::Running) {
                     self.log_localized(Level::Warn, i18n::Messages::stop_http_before_ngrok);
                     None
                 } else if self.dirty() {
@@ -557,6 +595,23 @@ impl App {
                     self.busy = true;
                     Some(Effect::ShowConnectorUrl(self.persisted.port))
                 }
+            }
+            9 => {
+                if matches!(self.server, ServerState::Running | ServerState::Starting) {
+                    self.log_localized(Level::Warn, i18n::Messages::agent_browser_stop_mcp);
+                } else if self.browser_login_running || self.busy {
+                    self.log_localized(Level::Warn, i18n::Messages::operation_in_progress);
+                } else if !self.persisted.browser_enabled {
+                    self.log_localized(Level::Warn, i18n::Messages::agent_browser_enable_first);
+                } else if self.dirty() {
+                    self.log_localized(Level::Warn, i18n::Messages::agent_browser_save_first);
+                } else {
+                    self.busy = true;
+                    self.browser_login_running = true;
+                    self.log_localized(Level::Info, i18n::Messages::agent_browser_login_requested);
+                    return Some(Effect::OpenAgentBrowser(self.persisted.clone()));
+                }
+                None
             }
             _ => None,
         }

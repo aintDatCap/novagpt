@@ -1,6 +1,6 @@
 //! Owns async runtime tasks and isolates blocking filesystem/VM actions from input.
 use super::launcher::install_launcher;
-use super::model::{Effect, Level, OperationEvent, ServerState};
+use super::model::{BrowserOpenFailure, Effect, Level, OperationEvent, ServerState};
 use crate::settings::{self, LocalSettings};
 use crate::token;
 use crate::{connection, tunnel};
@@ -16,6 +16,7 @@ pub(super) struct Controller {
     runtime: Handle,
     tx: UnboundedSender<OperationEvent>,
     server: Option<JoinHandle<()>>,
+    browser_login: Option<JoinHandle<()>>,
 }
 impl Controller {
     pub fn new(runtime: Handle, tx: UnboundedSender<OperationEvent>) -> Self {
@@ -23,6 +24,7 @@ impl Controller {
             runtime,
             tx,
             server: None,
+            browser_login: None,
         }
     }
     fn report(&self, level: Level, message: impl Into<String>) {
@@ -32,6 +34,9 @@ impl Controller {
         match effect {
             Effect::Quit => {
                 self.stop();
+                if let Some(task) = self.browser_login.take() {
+                    task.abort();
+                }
                 return false;
             }
             Effect::Start(settings) => self.start(root, settings, false),
@@ -108,6 +113,44 @@ impl Controller {
                         .map_err(|_| "Impossibile importare la cartella: verifica percorso e .novagpt/config.json.".to_string());
                     let _ = tx.send(OperationEvent::NovaSourceLoaded(result));
                 });
+            }
+            Effect::OpenAgentBrowser(config) => {
+                if self
+                    .browser_login
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+                {
+                    self.report(Level::Warn, "Dedicated browser login is already running.");
+                } else {
+                    let tx = self.tx.clone();
+                    self.browser_login = Some(self.runtime.spawn(async move {
+                        // Chrome discovery checks the filesystem; keep it off Tokio workers.
+                        let executable = tokio::task::spawn_blocking(move || {
+                            crate::chrome::discover(config.chrome_executable.as_deref())
+                        })
+                        .await
+                        .map_err(|_| BrowserOpenFailure::ChromeMissing)
+                        .and_then(|result| result.map_err(|_| BrowserOpenFailure::ChromeMissing));
+                        let result = match executable {
+                            Ok(executable) => {
+                                let profile = settings::local_dir(&root).join("browser");
+                                novagpt_browser::ChatGptBrowser::manual_login(executable, profile)
+                                    .await
+                                    .map_err(|error| match error {
+                                        novagpt_browser::BrowserError::ProfileBusy => {
+                                            BrowserOpenFailure::ProfileBusy
+                                        }
+                                        novagpt_browser::BrowserError::InvalidProfile => {
+                                            BrowserOpenFailure::ProfileInvalid
+                                        }
+                                        _ => BrowserOpenFailure::LaunchFailed,
+                                    })
+                            }
+                            Err(error) => Err(error),
+                        };
+                        let _ = tx.send(OperationEvent::BrowserLoginFinished(result));
+                    }));
+                }
             }
             Effect::Stop => self.stop(),
             Effect::Inventory => {
@@ -412,6 +455,9 @@ impl Controller {
 impl Drop for Controller {
     fn drop(&mut self) {
         if let Some(task) = self.server.take() {
+            task.abort();
+        }
+        if let Some(task) = self.browser_login.take() {
             task.abort();
         }
     }
