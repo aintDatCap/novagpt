@@ -129,7 +129,7 @@ mod tests {
     fn navigation_and_selection_and_number_shortcuts() {
         let mut a = app();
         a.key(key(KeyCode::Down));
-        assert_eq!(a.command, 1);
+        assert_eq!(a.command, 7);
         a.key(key(KeyCode::Up));
         assert_eq!(a.command, 0);
         assert!(matches!(a.key(key(KeyCode::Enter)), Some(Effect::Start(_))));
@@ -390,7 +390,15 @@ mod tests {
     fn resize_and_tiny_rendering_with_testbackend() {
         let mut a = app();
         a.tab = 0;
-        for (w, h) in [(120, 32), (65, 18), (35, 11), (12, 7), (8, 4)] {
+        for (w, h) in [
+            (148, 42),
+            (120, 32),
+            (80, 24),
+            (65, 18),
+            (35, 11),
+            (12, 7),
+            (8, 4),
+        ] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             t.draw(|f| render::draw(f, &a)).unwrap();
             assert_eq!(t.size().unwrap().width, w);
@@ -405,7 +413,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(screen.contains("MCP HTTP"));
+        assert!(screen.contains("STATO MCP E COMPONENTI"));
         assert!(screen.contains("INFO"));
         a.tab = 2;
         t.draw(|f| render::draw(f, &a)).unwrap();
@@ -418,6 +426,65 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("Porta HTTP"));
     }
+    #[test]
+    fn home_actions_and_tunnel_status_follow_real_server_events() {
+        let mut a = app();
+        assert_eq!(a.visible_commands(), vec![0, 7, 2]);
+        assert_eq!(a.command, 0);
+        a.key(key(KeyCode::Char('a')));
+        assert!(a.show_advanced);
+        assert_eq!(a.visible_commands(), vec![0, 7, 2, 3, 4, 5, 6]);
+        a.key(key(KeyCode::Char('a')));
+        assert!(!a.show_advanced);
+        a.on_event(OperationEvent::Server(ServerState::Running));
+        assert_eq!(a.visible_commands(), vec![8, 1, 2]);
+        assert_eq!(a.command, 8);
+        assert!(!a.tunnel_ready);
+        a.on_event(OperationEvent::TunnelReady);
+        assert!(a.tunnel_ready);
+        a.on_event(OperationEvent::Server(ServerState::Stopped));
+        assert!(!a.tunnel_ready);
+        assert_eq!(a.command, 0);
+    }
+
+    #[test]
+    fn grouped_settings_navigation_and_home_rendering() {
+        let mut a = app();
+        a.tab = 2;
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.config, 11);
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.config, 12);
+        a.key(key(KeyCode::Up));
+        assert_eq!(a.config, 11);
+
+        let mut t = Terminal::new(TestBackend::new(124, 36)).unwrap();
+        t.draw(|f| render::draw(f, &a)).unwrap();
+        let screen = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let shown = screen(&t);
+        assert!(shown.contains("CONNESSIONE"));
+        assert!(shown.contains("BROWSER"));
+        assert!(shown.contains("APPLICA MODIFICHE"));
+
+        a.tab = 0;
+        t.draw(|f| render::draw(f, &a)).unwrap();
+        let shown = screen(&t);
+        assert!(shown.contains("Panoramica dei servizi"));
+        assert!(shown.contains("token MCP concede accesso"));
+        assert!(!shown.contains("Operazioni VM"));
+        a.key(key(KeyCode::Char('a')));
+        t.draw(|f| render::draw(f, &a)).unwrap();
+        assert!(screen(&t).contains("Operazioni VM"));
+    }
+
     struct FakeTerminal(Arc<Mutex<Vec<&'static str>>>);
     impl TerminalOps for FakeTerminal {
         fn leave_alternate(&mut self) {
@@ -571,7 +638,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(displayed.contains("3 immagini approvate"));
-        assert!(displayed.contains("NECESSARIO"));
+        assert!(displayed.contains("riavvio MCP necessario"));
         let ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(a.key(ctrl), Some(Effect::Quit)));
     }

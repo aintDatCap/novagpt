@@ -340,6 +340,7 @@ impl Controller {
                                                         if !published && tunnel.endpoint().await.is_some() {
                                                             audit.record("http_tunnel_ready", false);
                                                             published = true;
+                                                            let _ = tx.send(OperationEvent::TunnelReady);
                                                             let _ = tx.send(OperationEvent::Log(Level::Success,
                                                                 "Tunnel ngrok pronto. Seleziona 'Mostra / copia URL ChatGPT'.".into()));
                                                         }

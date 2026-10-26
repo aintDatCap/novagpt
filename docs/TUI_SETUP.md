@@ -1,6 +1,6 @@
 # NovaGPT TUI e setup guidato (Ratatui 0.29)
 
-NovaGPT usa **tre schede**: **Comandi**, **Stato**, **Config**. Il workspace predefinito e' la directory di lavoro corrente; `--root` ne seleziona una diversa. Le configurazioni NovaGPT sono locali in `<workspace>/.novagpt/`. CodexPro originale e i relativi dati non vengono modificati.
+NovaGPT usa **tre schede**: **Panoramica**, **Attività**, **Impostazioni**. La Panoramica presenta soltanto le azioni pertinenti allo stato corrente, con operazioni avanzate accessibili premendo `a`; Attività è dedicata ai log; le impostazioni sono suddivise in sezioni. Il workspace predefinito e' la directory di lavoro corrente; `--root` ne seleziona una diversa. Le configurazioni NovaGPT sono locali in `<workspace>/.novagpt/`. CodexPro originale e i relativi dati non vengono modificati.
 
 ## PowerShell / Windows Terminal
 
@@ -21,22 +21,23 @@ Richiede un terminale interattivo con raw mode e alternate screen; il setup non 
 | --- | --- |
 | `Tab` / `Shift+Tab` | Cambia scheda |
 | `←` / `→` | Cambia scheda quando non e' attivo un campo o una modale |
-| `↑` / `↓` | Seleziona menu/config oppure scorre i log in Stato |
+| `↑` / `↓` | Seleziona le azioni o le impostazioni, oppure scorre i log in Attività |
 | `Enter` | Esegue, modifica o conferma la selezione |
 | `Esc` | Chiude modale, annulla edit o torna indietro |
 | `q` | Esce; richiede conferma se ci sono modifiche non salvate |
 | `?` | Aiuto |
 | `Ctrl+C` | Esce e ripristina il terminale |
 | `PgUp` / `PgDn`, `Home` / `End` | Scroll log |
-| `1`-`4` | Scorciatoie opzionali nei Comandi: avvio HTTP, stop HTTP, inventario VM, diagnostica |
-| `s` | Seleziona il salvataggio in Config (richiede conferma) |
+| `1`-`4` | Scorciatoie rapide nella Panoramica: avvio MCP, arresto MCP, inventario VM, diagnostica |
+| `s` | Salva da Impostazioni (richiede conferma) |
+| `a` | Mostra/nascondi le operazioni avanzate nella Panoramica |
 | `n` / `b` | Avanti / indietro nel setup guidato |
 
 Durante l'editing, `Tab`, `q` e le frecce non spostano il focus. Invio applica dopo la validazione, Esc annulla. La voce selezionata e' evidenziata; una descrizione appare a fianco o sotto, se il terminale ha spazio sufficiente.
 
-## Comandi
+## Panoramica
 
-Usa le frecce e Invio, non necessariamente i tasti numerici.
+La home mostra lo stato MCP **solo dopo handshake autenticato**, la porta locale, la configurazione di Chrome **senza fingere una verifica di login**, e lo stato ngrok confermato da un evento del tunnel. Le azioni principali cambiano fra server spento e acceso; premi **a** per gli strumenti avanzati (VM, sottoagenti, CLI). Lo schermo usa meno riquadri, e su terminali più piccoli si adatta a una sola colonna. Il prefisso tecnico Win32 dei percorsi canonici viene nascosto nella visualizzazione. Usa le frecce e Invio, non necessariamente i tasti numerici.
 
 - **Avvia MCP HTTP:** avvia il server protetto su `127.0.0.1` usando la configurazione salvata; se **Ngrok automatico** e' ON avvia anche il tunnel, usando l'eventuale dominio salvato. Per un avvio soltanto locale tramite CLI: `novagpt http --no-ngrok`. Il token viene generato al primo avvio e non compare nei log.
 - **Arresta MCP HTTP:** apre una conferma; interrompe solo il server creato dalla sessione TUI, non eventuali processi esterni.
@@ -76,13 +77,13 @@ Il token e' richiesto dal server come credenziale di autenticazione MCP. Non con
 
 Le operazioni CLI di ispezione e diagnostica sono disponibili senza TUI: `novagpt doctor --json`, `novagpt inspect --json`, `novagpt review --json`. `--log-format human|llm` seleziona il formato diagnostico **stderr** del server. L'audit MCP metadata-only ora viene salvato fuori dal repository (`%LOCALAPPDATA%\NovaGPT\logs\<hash-workspace>\` su Windows) anche per l'HTTP avviato dalla TUI. `runtime_status` espone gli ultimi eventi recuperati anche dopo un riavvio; con `novagpt logs path` e `novagpt logs tail --lines 50 [--json]` puoi consultare localmente file JSONL ruotati (4 x 64 KiB). Si registrano solo nome statico del tool, timestamp, sequenza ed esito; mai argomenti, token, path dei file o output. Non e' un registro completo delle chiamate/protocollo, e la TUI conserva separatamente il proprio buffer di eventi di lifecycle (massimo 250).
 
-## Stato e log
+## Attività e log
 
-La dashboard include workspace, stato del server e endpoint, VM/browser (configurati, **non** dichiarati avviati), ultimo errore noto e indicazione di riavvio. I log INFO, WARN, ERROR e OK con timestamp UTC sono conservati in un buffer di massimo **250 eventi**. Si possono scorrere anche mentre arrivano nuovi eventi. Sono eventi di lifecycle/operazione della TUI, **non** la traccia completa delle invocazioni MCP; nessun token viene registrato.
+La schermata Attività dedica la maggior parte dello spazio agli eventi: workspace, MCP/endpoint, tunnel, VM/browser (configurati, **non** dichiarati avviati), indicazione di riavvio e cronologia. I log INFO, WARN, ERROR e OK con timestamp UTC sono conservati in un buffer di massimo **250 eventi**. Si possono scorrere anche mentre arrivano nuovi eventi. Sono eventi di lifecycle/operazione della TUI, **non** la traccia completa delle invocazioni MCP; nessun token viene registrato.
 
-## Config
+## Impostazioni
 
-Menu navigabile con porta HTTP, attivazione VM, attivazione ChatGPT Browser, percorso assoluto dell'eseguibile Chrome, aggiunta/rimozione di directory autorizzate, scelta profilo CodexPro, anteprima importazione, **Ngrok automatico (ON/OFF)**, **Dominio ngrok** modificabile, Salva, Annulla e **Genera / verifica token HTTP**. L'asterisco (`*`) indica i valori modificati. Errori di input, percorso Chrome non valido e salvataggio fallito sono visibili. Le directory devono esistere, sono canonicalizzate e limitate a 16 radici aggiuntive.
+I campi sono ora ordinati per **Connessione, Browser, Macchine virtuali, Directory autorizzate, Importazione e Applica modifiche**; la scheda presenta l'aiuto contestuale del campo selezionato nelle finestre ampie. `s` salva la bozza con conferma, indipendentemente dalla riga selezionata. Menu navigabile con porta HTTP, attivazione VM, attivazione ChatGPT Browser, percorso assoluto dell'eseguibile Chrome, aggiunta/rimozione di directory autorizzate, scelta profilo CodexPro, anteprima importazione, **Ngrok automatico (ON/OFF)**, **Dominio ngrok** modificabile, Salva, Annulla e **Genera / verifica token HTTP**. L'asterisco (`*`) indica i valori modificati. Errori di input, percorso Chrome non valido e salvataggio fallito sono visibili. Le directory devono esistere, sono canonicalizzate e limitate a 16 radici aggiuntive.
 
 La voce **Eseguibile Chrome** puo' rimanere vuota: NovaGPT cerca automaticamente Chrome con lo stesso ordine di CodexPro (Windows: `ProgramFiles`, `ProgramFiles(x86)`, `LOCALAPPDATA`; macOS: cartelle Applications; Linux: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser` nel `PATH`). Un percorso esplicito resta prioritario e, se errato, non viene sostituito silenziosamente con quello automatico. La CLI accetta anche `NOVAGPT_CHROME_PATH` quando il browser e' abilitato. La scoperta riguarda soltanto l'eseguibile: NovaGPT usa sempre un **profilo Chrome dedicato**, distinto dai profili personali e da quelli CodexPro.
 
@@ -90,7 +91,7 @@ La configurazione viene mantenuta in **bozza** fino alla conferma del salvataggi
 
 ## Setup `novagpt --setup`
 
-Apre la **stessa TUI** inizialmente su Config. Segui il banner:
+Apre la **stessa TUI** inizialmente su Impostazioni. Segui il banner:
 
 1. **Workspace:** verifica il percorso nell'header.
 2. **Parametri:** configura i campi necessari.

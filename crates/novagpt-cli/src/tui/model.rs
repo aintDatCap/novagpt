@@ -10,7 +10,7 @@ use std::{
 pub(super) const COMMANDS: [(&str, &str); 9] = [
     (
         "Avvia MCP HTTP",
-        "Avvia il server autenticato su 127.0.0.1 (token da ambiente).",
+        "Avvia il server MCP locale con il token HTTP configurato.",
     ),
     (
         "Arresta MCP HTTP",
@@ -45,6 +45,7 @@ pub(super) const COMMANDS: [(&str, &str); 9] = [
         "Mostra l'URL riservato solo su richiesta; premi C per copiarlo.",
     ),
 ];
+pub(super) const CONFIG_ORDER: [usize; 15] = [0, 11, 12, 10, 2, 3, 1, 4, 5, 6, 7, 13, 8, 9, 14];
 pub(super) const CONFIG_ITEMS: [&str; 15] = [
     "Porta HTTP",
     "Abilita VM",
@@ -132,6 +133,7 @@ pub(super) enum Effect {
 pub(super) enum OperationEvent {
     Log(Level, String),
     Server(ServerState),
+    TunnelReady,
     RootAdded(Result<PathBuf, String>),
     ChromeChecked(bool),
     VmInventory(Result<usize, String>),
@@ -154,6 +156,8 @@ pub(super) struct App {
     pub step: usize,
     pub tab: usize,
     pub command: usize,
+    pub show_advanced: bool,
+    pub tunnel_ready: bool,
     pub config: usize,
     pub profile: usize,
     pub root_selection: usize,
@@ -187,6 +191,8 @@ impl App {
             step: if setup { 0 } else { 4 },
             tab: if setup { 2 } else { 0 },
             command: 0,
+            show_advanced: false,
+            tunnel_ready: false,
             config: 0,
             profile: 0,
             root_selection: 0,
@@ -222,6 +228,24 @@ impl App {
     pub fn config_len(&self) -> usize {
         if self.setup { 15 } else { 14 }
     }
+
+    pub fn config_order(&self) -> &'static [usize] {
+        &CONFIG_ORDER[..self.config_len()]
+    }
+
+    fn select_config(&mut self, direction: i32) {
+        let order = self.config_order();
+        let position = order
+            .iter()
+            .position(|&index| index == self.config)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            position.saturating_sub(1)
+        } else {
+            (position + 1).min(order.len().saturating_sub(1))
+        };
+        self.config = order[next];
+    }
     pub fn log(&mut self, level: Level, message: impl Into<String>) {
         let message = message.into();
         let secs = SystemTime::now()
@@ -255,8 +279,15 @@ impl App {
                 self.server = s;
                 if matches!(s, ServerState::Stopped | ServerState::Failed) {
                     self.running_config = None;
+                    self.tunnel_ready = false;
+                    if !self.show_advanced {
+                        self.command = 0;
+                    }
+                } else if s == ServerState::Running && !self.show_advanced {
+                    self.command = 8;
                 }
             }
+            OperationEvent::TunnelReady => self.tunnel_ready = true,
             OperationEvent::VmInventory(result) => {
                 self.busy = false;
                 match result {
@@ -371,6 +402,32 @@ impl App {
             }
         }
     }
+    pub fn visible_commands(&self) -> Vec<usize> {
+        let mut commands = if matches!(self.server, ServerState::Running | ServerState::Starting) {
+            vec![8, 1, 2]
+        } else {
+            vec![0, 7, 2]
+        };
+        if self.show_advanced {
+            commands.extend([3, 4, 5, 6]);
+        }
+        commands
+    }
+
+    fn select_command(&mut self, direction: i32) {
+        let commands = self.visible_commands();
+        let position = commands
+            .iter()
+            .position(|&index| index == self.command)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            position.saturating_sub(1)
+        } else {
+            (position + 1).min(commands.len().saturating_sub(1))
+        };
+        self.command = commands[next];
+    }
+
     fn activate_command(&mut self, index: usize) -> Option<Effect> {
         self.command = index;
         match index {
@@ -383,6 +440,9 @@ impl App {
                     None
                 } else {
                     self.server = ServerState::Starting;
+                    if !self.show_advanced {
+                        self.command = 8;
+                    }
                     self.running_config = Some(self.persisted.clone());
                     self.log(
                         Level::Info,
@@ -447,6 +507,9 @@ impl App {
                     None
                 } else {
                     self.server = ServerState::Starting;
+                    if !self.show_advanced {
+                        self.command = 8;
+                    }
                     self.running_config = Some(self.persisted.clone());
                     self.log(Level::Info, "Avvio del tunnel ngrok richiesto...");
                     Some(Effect::StartNgrok(self.persisted.clone()))
@@ -640,6 +703,10 @@ impl App {
         match action {
             Confirm::Stop => {
                 self.server = ServerState::Stopped;
+                self.tunnel_ready = false;
+                if !self.show_advanced {
+                    self.command = 0;
+                }
                 self.running_config = None;
                 Some(Effect::Stop)
             }
@@ -764,6 +831,12 @@ impl App {
         }
         match key.code {
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
+            KeyCode::Char('a') if self.tab == 0 => {
+                self.show_advanced = !self.show_advanced;
+                if !self.visible_commands().contains(&self.command) {
+                    self.command = self.visible_commands()[0];
+                }
+            }
             KeyCode::Tab => self.tab = (self.tab + 1) % 3,
             KeyCode::BackTab => self.tab = (self.tab + 2) % 3,
             KeyCode::Left => self.tab = (self.tab + 2) % 3,
@@ -789,14 +862,14 @@ impl App {
                 self.step = self.step.saturating_sub(1)
             }
             KeyCode::Up => match self.tab {
-                0 => self.command = self.command.saturating_sub(1),
+                0 => self.select_command(-1),
                 1 => self.log_offset = (self.log_offset + 1).min(self.logs.len().saturating_sub(1)),
-                _ => self.config = self.config.saturating_sub(1),
+                _ => self.select_config(-1),
             },
             KeyCode::Down => match self.tab {
-                0 => self.command = (self.command + 1).min(COMMANDS.len() - 1),
+                0 => self.select_command(1),
                 1 => self.log_offset = self.log_offset.saturating_sub(1),
-                _ => self.config = (self.config + 1).min(self.config_len() - 1),
+                _ => self.select_config(1),
             },
             KeyCode::PageUp if self.tab == 1 => {
                 self.log_offset = (self.log_offset + 10).min(self.logs.len().saturating_sub(1))
