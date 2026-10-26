@@ -510,6 +510,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_full_mode_runs_shell_commands_outside_safe_allowlist() {
+        let home = tempfile::tempdir().expect("workspace");
+        let registry = WorkspaceRegistry::new(home.path(), &[]).expect("registry");
+        let (shell, command) = if cfg!(windows) {
+            ("powershell", "Write-Output NOVAGPT_FULL_SHELL_FIXTURE")
+        } else {
+            ("bash", "printf NOVAGPT_FULL_SHELL_FIXTURE")
+        };
+        let result = registry
+            .run_bash(
+                BashMode::Full,
+                BashRequest {
+                    workspace_id: None,
+                    command: command.into(),
+                    shell: Some(shell.into()),
+                    cwd: None,
+                    timeout_ms: Some(30_000),
+                },
+            )
+            .await
+            .expect("explicitly approved full shell");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.stdout.contains("NOVAGPT_FULL_SHELL_FIXTURE"));
+        assert_eq!(result.command, "[redacted full-mode command]");
+    }
+
+    #[tokio::test]
     async fn safe_mode_can_run_bounded_tool() {
         let home = tempfile::tempdir().expect("workspace");
         let registry = WorkspaceRegistry::new(home.path(), &[]).expect("registry");

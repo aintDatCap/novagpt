@@ -175,6 +175,16 @@ enum LogsCommand {
     },
 }
 
+fn requested_bash_mode(mode: &str, allow_full_shell: bool) -> Result<BashMode, &'static str> {
+    match mode {
+        "off" => Ok(BashMode::Off),
+        "safe" => Ok(BashMode::Safe),
+        "full" if allow_full_shell => Ok(BashMode::Full),
+        "full" => Err("full Bash access requires --allow-full-shell"),
+        _ => Err("invalid Bash mode"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -317,6 +327,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+    // Resolve once for both HTTP/stdio and the interactive TUI. An
+    // unrestricted terminal always requires an explicit startup opt-in.
+    let bash_mode = requested_bash_mode(&cli.bash_mode, cli.allow_full_shell)?;
     if cli.setup || cli.command.is_none() {
         let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
         let mut profiles = settings::discover_codexpro_profiles(&home)?;
@@ -325,8 +338,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             profiles.push(imported);
         }
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || tui::run(root, local, cli.setup, profiles, handle))
-            .await??;
+        tokio::task::spawn_blocking(move || {
+            tui::run(root, local, cli.setup, profiles, handle, bash_mode)
+        })
+        .await??;
         return Ok(());
     }
 
@@ -368,24 +383,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = cli
         .chatgpt_profile
         .or_else(|| browser_enabled.then(|| settings::local_dir(&root).join("browser")));
-    let agents = match (chrome, profile) {
-        (Some(executable), Some(profile)) => {
-            let browser = ChatGptBrowser::new(executable, profile)?;
-            Some(AgentManager::new(
-                workspaces.clone(),
-                Arc::new(ChatGptBackend::new(browser)),
-            ))
-        }
+    let browser = match (chrome, profile) {
+        (Some(executable), Some(profile)) => Some(ChatGptBrowser::new(executable, profile)?),
         (None, None) => None,
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
     };
-    let bash_mode = match cli.bash_mode.as_str() {
-        "off" => BashMode::Off,
-        "safe" => BashMode::Safe,
-        "full" if cli.allow_full_shell => BashMode::Full,
-        "full" => return Err("full Bash access requires --allow-full-shell".into()),
-        _ => return Err("invalid Bash mode".into()),
-    };
+    let agents = browser.as_ref().map(|browser| {
+        AgentManager::new(
+            workspaces.clone(),
+            Arc::new(ChatGptBackend::new(browser.clone())),
+        )
+    });
     let browser_bridge = match (
         cli.browser_bridge_port,
         cli.browser_bridge_origin.as_deref(),
@@ -401,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut extras = NovaExtras {
         vm,
         agents,
+        browser,
         browser_bridge,
         output_store: novagpt_mcp::OutputStore::default(),
         bash_mode,
@@ -524,4 +533,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => unreachable!("TUI was handled before server startup"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bash_mode_tests {
+    use super::*;
+
+    #[test]
+    fn unrestricted_shell_requires_explicit_approval_in_both_cli_and_tui() {
+        assert_eq!(requested_bash_mode("safe", false), Ok(BashMode::Safe));
+        assert_eq!(requested_bash_mode("off", false), Ok(BashMode::Off));
+        assert_eq!(requested_bash_mode("full", true), Ok(BashMode::Full));
+        assert!(requested_bash_mode("full", false).is_err());
+        assert!(requested_bash_mode("unrecognized", true).is_err());
+    }
 }

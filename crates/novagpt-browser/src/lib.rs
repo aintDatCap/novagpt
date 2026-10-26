@@ -25,6 +25,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const HOME: &str = "https://chatgpt.com/";
+const BROWSE_TAB: &str = "browse-main";
+const MAX_BROWSE_TEXT: usize = 20_000;
 const COMPOSER: &str = "#prompt-textarea, [data-testid='prompt-textarea'], [contenteditable='true'][data-lexical-editor='true'], textarea";
 const ASSISTANTS: &str = "[data-message-author-role='assistant']";
 const MAX_PROMPT: usize = 80_000;
@@ -48,6 +50,8 @@ pub enum BrowserError {
     Protocol,
     #[error("ChatGPT Browser profile is invalid")]
     InvalidProfile,
+    #[error("Browser navigation requires a public HTTPS URL with no credentials or custom port")]
+    UnsafeUrl,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,6 +62,13 @@ pub struct BrowserDiagnostics {
     pub manual_check: Option<String>,
     pub page_ready: bool,
     pub automation_driver: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowsedPage {
+    pub url: String,
+    pub title: String,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -304,6 +315,93 @@ impl ChatGptBrowser {
         Ok(())
     }
 
+    /// Open a visible, dedicated browsing tab, separate from all subagent tabs.
+    /// This operation reuses the same owned Chrome process/profile.
+    pub async fn browse_open(&self) -> Result<BrowserDiagnostics, BrowserError> {
+        if self.page(BROWSE_TAB).await.is_err() {
+            match self.open(BROWSE_TAB).await {
+                Ok(()) | Err(BrowserError::Unavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(self.diagnostics(Some(BROWSE_TAB)).await)
+    }
+
+    /// Navigate the dedicated browsing tab. No arbitrary JavaScript is accepted
+    /// through MCP. Subagent pages and their conversations are unaffected.
+    pub async fn browse_navigate(&self, url: &str) -> Result<BrowsedPage, BrowserError> {
+        let target = public_https_url(url)?;
+        let page = self.page(BROWSE_TAB).await?;
+        let previous = page
+            .eval("location.href")
+            .await?
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        page.command("Page.enable", json!({})).await?;
+        let navigation = page
+            .command("Page.navigate", json!({"url":target.as_str()}))
+            .await?;
+        if navigation.get("errorText").is_some() {
+            return Err(BrowserError::Unavailable);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let state = page
+                .eval("({url:location.href,ready:document.readyState})")
+                .await;
+            match state {
+                Ok(state) => {
+                    if let Some(current) = state["url"].as_str()
+                        && (current != previous || current == target.as_str())
+                        && state["ready"] != "loading"
+                    {
+                        public_https_url(current)?;
+                        return self.browse_read().await;
+                    }
+                }
+                Err(BrowserError::Protocol) => {} // transient navigation context change
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(BrowserError::Timeout);
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Read only visible DOM text, title and URL from the dedicated tab.
+    /// The current URL is rechecked after navigation/redirects.
+    pub async fn browse_read(&self) -> Result<BrowsedPage, BrowserError> {
+        let page = self.page(BROWSE_TAB).await?;
+        let value = page
+            .eval("(() => ({url:location.href,title:document.title,text:(document.body?.innerText || '').slice(0,20000)}))()")
+            .await?;
+        let url = value["url"].as_str().ok_or(BrowserError::Protocol)?;
+        public_https_url(url)?;
+        let title = value["title"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(300)
+            .collect();
+        let text = value["text"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(MAX_BROWSE_TEXT)
+            .collect();
+        Ok(BrowsedPage {
+            url: url.to_owned(),
+            title,
+            text,
+        })
+    }
+
+    pub async fn browse_close(&self) -> Result<(), BrowserError> {
+        self.close(BROWSE_TAB).await
+    }
+
     async fn page(&self, id: &str) -> Result<Arc<Page>, BrowserError> {
         self.inner
             .pages
@@ -494,6 +592,37 @@ impl ChatGptBrowser {
         Ok(())
     }
 }
+/// Restrict automated browsing to ordinary public HTTPS hostnames. Avoid
+/// local services, raw IP addresses, embedded credentials and custom ports.
+/// DNS names still require network-layer restrictions against rebinding.
+fn public_https_url(input: &str) -> Result<reqwest::Url, BrowserError> {
+    if input.len() > 2048 || input.bytes().any(|b| b.is_ascii_control()) {
+        return Err(BrowserError::UnsafeUrl);
+    }
+    let url = reqwest::Url::parse(input).map_err(|_| BrowserError::UnsafeUrl)?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return Err(BrowserError::UnsafeUrl);
+    }
+    let host = url.host_str().ok_or(BrowserError::UnsafeUrl)?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(BrowserError::UnsafeUrl);
+    }
+    let host = host.to_ascii_lowercase();
+    if !host.contains('.')
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return Err(BrowserError::UnsafeUrl);
+    }
+    Ok(url)
+}
+
 fn safe_id(id: &str) -> bool {
     (5..=48).contains(&id.len())
         && id
@@ -530,6 +659,33 @@ mod tests {
             manual_reason(&json!({"composer":true,"challenge":false,"login":false})),
             None
         );
+    }
+    #[test]
+    fn browser_only_accepts_public_https_urls_without_credentials() {
+        for allowed in [
+            "https://example.org/",
+            "https://www.rust-lang.org/learn",
+            "https://chatgpt.com/",
+        ] {
+            assert!(public_https_url(allowed).is_ok(), "{allowed}");
+        }
+        for denied in [
+            "http://example.org",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://127.0.0.1/",
+            "https://192.168.1.2/",
+            "https://[::1]/",
+            "https://localhost/",
+            "https://host.local/",
+            "https://services.internal/",
+            "https://intranet/",
+            "https://user:secret@example.org/",
+            "https://example.org:444/",
+            "https://example.org/\nheader",
+        ] {
+            assert!(public_https_url(denied).is_err(), "{denied}");
+        }
     }
     #[test]
     fn id_validation_is_safe() {

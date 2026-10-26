@@ -142,6 +142,12 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
                     "title":"Selected fixture","selected_paths":["hello.txt"]
                 }
             }}),
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{
+                "name":"browser_open","arguments":{}
+            }}),
+            json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{
+                "name":"browser_navigate","arguments":{"url":"https://example.org/"}
+            }}),
         ];
         for message in messages {
             writeln!(input, "{message}").expect("send MCP request");
@@ -197,6 +203,10 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "load_skill",
         "vm",
         "vm_guest_status",
+        "browser_open",
+        "browser_navigate",
+        "browser_read",
+        "browser_close",
         "subagent_spawn",
         "subagent_message",
         "subagent_resume",
@@ -210,13 +220,15 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 39);
+    assert_eq!(listed.len(), 43);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],
         "image/png"
     );
     assert_eq!(by_id(7)["result"]["content"][0]["type"], "image");
+    assert_eq!(by_id(11)["result"]["isError"], true);
+    assert_eq!(by_id(12)["result"]["isError"], true);
     assert_eq!(by_id(10)["result"]["isError"], false);
     assert_eq!(
         by_id(10)["result"]["structuredContent"]["files_included"][0],

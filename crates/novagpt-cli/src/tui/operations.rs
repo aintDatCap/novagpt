@@ -16,13 +16,19 @@ pub(super) struct Controller {
     runtime: Handle,
     tx: UnboundedSender<OperationEvent>,
     server: Option<JoinHandle<()>>,
+    bash_mode: novagpt_core::BashMode,
 }
 impl Controller {
-    pub fn new(runtime: Handle, tx: UnboundedSender<OperationEvent>) -> Self {
+    pub fn new(
+        runtime: Handle,
+        tx: UnboundedSender<OperationEvent>,
+        bash_mode: novagpt_core::BashMode,
+    ) -> Self {
         Self {
             runtime,
             tx,
             server: None,
+            bash_mode,
         }
     }
     fn report(&self, level: Level, message: impl Into<String>) {
@@ -231,6 +237,7 @@ impl Controller {
             return;
         }
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
+        let bash_mode = self.bash_mode;
         let tx = self.tx.clone();
         let task = self.runtime.spawn(async move {
             let tx_info = tx.clone();
@@ -249,20 +256,25 @@ impl Controller {
                 } else {
                     None
                 };
-                let agents = if config.browser_enabled {
-                    let chrome = crate::chrome::discover(config.chrome_executable.as_deref()).map_err(|_| "Chrome non disponibile.")?;
-                    let browser = novagpt_browser::ChatGptBrowser::new(
-                        chrome,
-                        settings::local_dir(&root).join("browser"),
+                let browser = if config.browser_enabled {
+                    let chrome = crate::chrome::discover(config.chrome_executable.as_deref())
+                        .map_err(|_| "Chrome non disponibile.")?;
+                    Some(
+                        novagpt_browser::ChatGptBrowser::new(
+                            chrome,
+                            settings::local_dir(&root).join("browser"),
+                        )
+                        .map_err(|_| "Browser non inizializzabile.".to_string())?,
                     )
-                    .map_err(|_| "Browser non inizializzabile.".to_string())?;
-                    Some(novagpt_agents::AgentManager::new(
-                        workspaces.clone(),
-                        Arc::new(novagpt_agents::ChatGptBackend::new(browser)),
-                    ))
                 } else {
                     None
                 };
+                let agents = browser.as_ref().map(|browser| {
+                    novagpt_agents::AgentManager::new(
+                        workspaces.clone(),
+                        Arc::new(novagpt_agents::ChatGptBackend::new(browser.clone())),
+                    )
+                });
                 let resolved = token::resolve(&root)
                     .map_err(|err| format!("Token HTTP non disponibile: {err}"))?;
                 let _ = tx_info.send(OperationEvent::TokenPresent(resolved.description()));
@@ -271,9 +283,10 @@ impl Controller {
                     novagpt_mcp::NovaExtras {
                         vm,
                         agents,
+                        browser,
                         browser_bridge: None,
                         output_store: novagpt_mcp::OutputStore::default(),
-                        bash_mode: novagpt_core::BashMode::Safe,
+                        bash_mode,
                         http_public_hostname: None,
                         audit: novagpt_mcp::AuditTrail::persistent(
                             crate::logging::audit_directory(&root)

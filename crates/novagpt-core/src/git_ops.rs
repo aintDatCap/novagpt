@@ -298,31 +298,25 @@ fn git_cwd(root: &Path) -> std::path::PathBuf {
     root.to_path_buf()
 }
 
-pub(crate) async fn run_git(root: &Path, action: &str, args: Vec<String>) -> NovaResult<GitResult> {
+// Preserve standard user Git configuration (identity, signing, hooks).
+// Tool-level path validation takes place before this helper.
+fn git_command(root: &Path, args: &[String]) -> Command {
     let mut command = Command::new("git");
     command
-        .arg("-c")
-        .arg(if cfg!(windows) {
-            "core.hooksPath=NUL"
-        } else {
-            "core.hooksPath=/dev/null"
-        })
-        .args(&args)
+        .args(args)
         .current_dir(git_cwd(root))
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
         .env("GIT_PAGER", "cat")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    command
+}
 
-    let mut child = command
+pub(crate) async fn run_git(root: &Path, action: &str, args: Vec<String>) -> NovaResult<GitResult> {
+    let mut child = git_command(root, &args)
         .spawn()
         .map_err(|_| NovaError::InvalidInput("Git executable unavailable".into()))?;
     let stdout = child
@@ -582,9 +576,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_inherits_custom_global_identity_instead_of_disabling_it() {
+        let temp = tempfile::tempdir().expect("fixture root");
+        let repo = temp.path().join("repository");
+        fs::create_dir(&repo).expect("repo directory");
+        git(&repo, &["init", "-q"]);
+        let global = temp.path().join("global.gitconfig");
+        fs::write(
+            &global,
+            "[user]\n    name = Nova Global Fixture\n    email = global@example.invalid\n",
+        )
+        .expect("isolated global config");
+        fs::write(repo.join("file.txt"), "fixture\n").expect("fixture file");
+        git(&repo, &["add", "file.txt"]);
+        // Verify inherited global identity with a real commit, without
+        // changing or depending on the machine's real ~/.gitconfig.
+        let mut command = git_command(
+            &repo,
+            &["commit".into(), "-m".into(), "from global config".into()],
+        );
+        command
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
+        let result = command.output().await.expect("run real git commit");
+        assert!(
+            result.status.success(),
+            "Git should use the supplied global identity, exit {:?}",
+            result.status.code()
+        );
+        let mut verify = git_command(
+            &repo,
+            &["log".into(), "-1".into(), "--format=%an <%ae>".into()],
+        );
+        verify
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        let identity = verify.output().await.expect("read resulting identity");
+        assert!(identity.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&identity.stdout).trim(),
+            "Nova Global Fixture <global@example.invalid>"
+        );
+    }
+
+    #[tokio::test]
     async fn commit_and_restore_require_explicit_safe_targets() {
         let temp = tempfile::tempdir().expect("root");
         git(temp.path(), &["init", "-q"]);
+        // Keep line-ending fixtures deterministic even when the user's global
+        // Git config enables core.autocrlf on Windows.
+        git(temp.path(), &["config", "core.autocrlf", "false"]);
         git(
             temp.path(),
             &["config", "user.email", "fixture@example.test"],

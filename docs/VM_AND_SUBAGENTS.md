@@ -9,8 +9,8 @@
 | VM storage/lifecycle | `novagpt-vm` | Dedicated ownership-marked image/instance directories; human-only local disk import; image listing; create/status/destroy host VM via Hyper-V (Windows) or QEMU (Linux/macOS); guarded IDs/resources and isolated overlays |
 | VM guest control | `novagpt-vm` | `vm_guest_status` reports **unavailable** for registered VMs; guest exec/upload/download not implemented or registered |
 | Subagent manager | `novagpt-agents` | Async spawn, message, status, result, cancel, resume after human confirmation, browser diagnostics; roles explorer/reviewer/tester/implementer; bounded shared registry |
-| Browser driver | `novagpt-browser` | Dedicated visible Chrome profile over Chrome DevTools Protocol; creates separate tabs and sends prompts on ChatGPT web UI; bounded text reply polling; human login/challenge detection; stop/cancel/close |
-| MCP wiring | `novagpt-mcp` | Official `rmcp` schemas/structured results; 2 new VM tools and 7 subagent tools; errors returned when relevant subsystem is disabled |
+| Browser driver | `novagpt-browser` | Dedicated visible Chrome profile over Chrome DevTools Protocol; separate interactive browsing tab (open/navigate/read/close) alongside the ChatGPT subagent tabs; bounded visible-text reads; human login/challenge detection; stop/cancel/close |
+| MCP wiring | `novagpt-mcp` | Official `rmcp` schemas/structured results; 2 VM tools, 7 subagent tools and 4 dedicated browser tools; errors returned when relevant subsystem is disabled |
 | CLI wiring | `novagpt-cli` | Flags `--vm-home`, `--chatgpt-chrome`, `--chatgpt-profile`; human-only `vm-import` command |
 
 The crates follow the direction `novagpt-cli -> novagpt-mcp -> optional domain adapters`; `novagpt-core` stays independent of browser and VM. Subagent records are server-scoped, **not tied to individual ChatGPT transports**.
@@ -46,6 +46,8 @@ cargo run -p novagpt-cli -- `
 ```
 
 Supply paths that exist on your machine; the Chrome path above is illustrative, not detected. To use Streamable HTTP instead, provide `NOVAGPT_HTTP_TOKEN` and change `stdio` to `http --port 8787` (the HTTP listener remains loopback-only).
+
+To open Chrome directly from ChatGPT after enabling the browser and restarting the server, call `browser_open` (launches the visible, dedicated Chrome profile); then call `browser_navigate` with `{"url":"https://www.rust-lang.org/"}` and `browser_read` to retrieve bounded visible page text/title/URL. `browser_close` closes only the interactive browsing tab, **not** the shared Chrome process or any subagent conversation. These browser tools have no arbitrary JavaScript, login automation, or cookie access. Navigation currently accepts public HTTPS hostnames without credentials, IP addresses or custom ports; redirect destinations are checked before returning page text. Network-level DNS rebinding and real-browser navigation must still be verified independently. Web page content is untrusted data, not instructions to follow. Use an explicit URL and do not expose sensitive private pages through this tool. Chrome is launched only after the first explicit `browser_open` or subagent request, not at server startup.
 
 Call `subagent_spawn`:
 

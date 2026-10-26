@@ -11,7 +11,7 @@ use axum::{
 };
 use base64::Engine;
 use novagpt_agents::{AgentManager, AgentRole, SpawnAgent};
-use novagpt_browser::BrowserBridge;
+use novagpt_browser::{BrowserBridge, ChatGptBrowser};
 use novagpt_core::{
     BashMode, BashRequest, EditRequest, FileWriteRequest, NovaError, NovaResult, WorkspaceRegistry,
 };
@@ -37,6 +37,8 @@ use subtle::ConstantTimeEq;
 pub struct NovaExtras {
     pub vm: Option<VmManager>,
     pub agents: Option<AgentManager>,
+    /// A dedicated visible browser shared with the subagent backend.
+    pub browser: Option<ChatGptBrowser>,
     pub browser_bridge: Option<BrowserBridge>,
     pub output_store: OutputStore,
     pub bash_mode: BashMode,
@@ -358,6 +360,12 @@ struct BrowserReadArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserNavigateArgs {
+    /// Public HTTPS website address; no internal hosts or embedded credentials.
+    url: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentSpawnArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -446,7 +454,8 @@ impl NovaMcp {
                 },
                 "vm_enabled": self.extras.vm.is_some(),
                 "subagents_enabled": self.extras.agents.is_some(),
-            "browser_bridge_enabled": self.extras.browser_bridge.is_some(),
+                "dedicated_browser_enabled": self.extras.browser.is_some(),
+                "browser_bridge_enabled": self.extras.browser_bridge.is_some(),
                 "audit_mode": self.extras.audit.snapshot(1).mode,
                 "write_mode": "workspace-guarded",
                 "transport_session_is_conversation_identity": false,
@@ -936,6 +945,61 @@ impl NovaMcp {
             ))),
         };
         self.observed("browser_tab_read", reply)
+    }
+
+    #[tool(
+        description = "Launch a visible NovaGPT-owned Chrome window and open its dedicated browsing tab, separate from subagent tabs. Requires ChatGPT Browser enabled at startup."
+    )]
+    async fn browser_open(&self) -> CallToolResult {
+        let result = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_open().await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_open", result)
+    }
+
+    #[tool(
+        description = "Navigate the dedicated NovaGPT Chrome browsing tab to an explicitly specified public HTTPS page. Call browser_open first; subagent tabs are unaffected."
+    )]
+    async fn browser_navigate(
+        &self,
+        Parameters(args): Parameters<BrowserNavigateArgs>,
+    ) -> CallToolResult {
+        let result = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_navigate(&args.url).await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_navigate", result)
+    }
+
+    #[tool(
+        description = "Read bounded visible page text, title and HTTPS URL from the dedicated Chrome browsing tab. No cookies, passwords, hidden DOM, or arbitrary JavaScript."
+    )]
+    async fn browser_read(&self) -> CallToolResult {
+        let result = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_read().await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_read", result)
+    }
+
+    #[tool(
+        description = "Close only NovaGPT's dedicated browsing tab. Does not close the Chrome process or subagent tabs."
+    )]
+    async fn browser_close(&self) -> CallToolResult {
+        let result = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_close().await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_close", result)
     }
 
     #[tool(
