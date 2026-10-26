@@ -1,6 +1,7 @@
 //! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
 mod chrome;
 mod connection;
+mod i18n;
 mod logging;
 mod settings;
 mod token;
@@ -57,7 +58,7 @@ struct Cli {
     /// Explicit HTTPS origin authorized for read-only tab access; never permits other origins.
     #[arg(long, requires = "browser_bridge_port")]
     browser_bridge_origin: Option<String>,
-    /// Log format for server diagnostics on stderr: human text or LLM JSON lines.
+    /// Diagnostic text style on stderr: human or compact LLM-readable text. Never JSON.
     #[arg(long, value_parser = ["human", "llm"], default_value = "human")]
     log_format: String,
     #[command(subcommand)]
@@ -163,12 +164,10 @@ enum TokenCommand {
 enum LogsCommand {
     /// Display the private per-workspace log directory (no token is accessed).
     Path,
-    /// Show the latest retained safe audit events, as HUMAN text or structured JSON.
+    /// Show the latest retained private audit events as English text.
     Tail {
         #[arg(long, default_value_t = 50)]
         lines: usize,
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -187,21 +186,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let directory = logging::audit_directory(&root)?;
         match action {
             LogsCommand::Path => println!("{}", directory.display()),
-            LogsCommand::Tail { lines, json } => {
+            LogsCommand::Tail { lines } => {
                 let count = (*lines).clamp(1, 128);
                 let snapshot = tokio::task::spawn_blocking(move || {
                     novagpt_mcp::AuditTrail::persisted_snapshot(&directory, count)
                 })
                 .await??;
-                if *json {
-                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
-                } else {
-                    for line in &snapshot.human {
-                        println!("{line}");
-                    }
-                    if snapshot.returned_events == 0 {
-                        println!("No persisted audit events.");
-                    }
+                for line in &snapshot.human {
+                    println!("{line}");
+                }
+                if snapshot.returned_events == 0 {
+                    println!("No persisted audit events.");
+                }
+                if snapshot.dropped_events > 0 || snapshot.write_errors > 0 {
+                    println!(
+                        "Audit diagnostics: {} dropped events, {} write errors.",
+                        snapshot.dropped_events, snapshot.write_errors
+                    );
                 }
             }
         }
@@ -222,7 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Token salvato per il workspace (valore nascosto). Riavvia HTTP per applicarlo."
                 );
                 if std::env::var_os("NOVAGPT_HTTP_TOKEN").is_some() {
-                    eprintln!("Attenzione: NOVAGPT_HTTP_TOKEN ha precedenza sul token salvato.");
+                    eprintln!("Warning: NOVAGPT_HTTP_TOKEN overrides the stored token.");
                 }
             }
         }
@@ -353,11 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .with_env_filter(filter);
     if cli.log_format == "llm" {
-        diagnostics
-            .json()
-            .with_current_span(false)
-            .with_span_list(false)
-            .init();
+        diagnostics.compact().init();
     } else {
         diagnostics.init();
     }
@@ -439,7 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         audit.record("http_bind_failed", true);
                         audit.flush().await;
                         return Err(
-                            "Porta MCP occupata: impossibile avviare ngrok verso un altro processo"
+                            "MCP port is occupied: refusing to start ngrok for another process"
                                 .into(),
                         );
                     }
@@ -449,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => {
                         audit.record("http_tunnel_start_failed", true);
                         audit.flush().await;
-                        return Err("Impossibile avviare ngrok".into());
+                        return Err("Unable to start ngrok".into());
                     }
                 };
                 let hostname = match tunnel.public_hostname().await {
@@ -459,7 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tunnel.stop().await;
                         audit.flush().await;
                         return Err(
-                            "ngrok non ha confermato il dominio pubblico della porta MCP".into(),
+                            "ngrok did not verify the public hostname for the MCP port".into()
                         );
                     }
                 };
@@ -490,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // URL is from the local ngrok API and matched to the configured port.
                         // This does not establish that a real ChatGPT remote MCP client works.
                         eprintln!(
-                            "ngrok MCP endpoint pronto: {endpoint} (usa connector-url --port {port} per mostrare l'URL riservato; ChatGPT non ancora verificato)"
+                            "ngrok MCP endpoint ready: {endpoint} (use connector-url --port {port} to reveal the private URL; ChatGPT connection not yet verified)"
                         );
                         published = true;
                     }

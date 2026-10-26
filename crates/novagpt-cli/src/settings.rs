@@ -36,6 +36,7 @@ fn read_limited(path: &Path) -> io::Result<Vec<u8>> {
 #[serde(default, deny_unknown_fields)]
 pub struct LocalSettings {
     pub version: u8,
+    pub language: crate::i18n::LanguageChoice,
     pub port: u16,
     pub allowed_roots: Vec<PathBuf>,
     pub vm_enabled: bool,
@@ -48,6 +49,7 @@ impl Default for LocalSettings {
     fn default() -> Self {
         Self {
             version: 1,
+            language: crate::i18n::LanguageChoice::default(),
             port: 8787,
             allowed_roots: Vec::new(),
             vm_enabled: false,

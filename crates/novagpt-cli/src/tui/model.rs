@@ -1,4 +1,5 @@
 //! UI state and pure keyboard transitions. Effects are executed by operations.rs.
+use crate::i18n::{self, Language};
 use crate::settings::{ImportProfile, LocalSettings};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -7,62 +8,43 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub(super) const COMMANDS: [(&str, &str); 9] = [
-    (
-        "Avvia MCP HTTP",
-        "Avvia il server MCP locale con il token HTTP configurato.",
-    ),
-    (
-        "Arresta MCP HTTP",
-        "Interrompe il server avviato da questa sessione TUI.",
-    ),
-    (
-        "Diagnostica workspace",
-        "Controlla configurazione, directory e servizi locali.",
-    ),
-    (
-        "Inventario VM",
-        "Elenca le immagini approvate nello store NovaGPT locale.",
-    ),
-    (
-        "Operazioni VM",
-        "Create/status/destroy via tool MCP vm; importazione via CLI esplicita.",
-    ),
-    (
-        "Sottoagenti",
-        "Spawn/status/message/result/cancel/resume via MCP, se browser attivo.",
-    ),
-    (
-        "Client e CLI",
-        "Accesso stdio, HTTP esterno e comando vm-import.",
-    ),
-    (
-        "Avvia MCP + ngrok",
-        "Avvia il server e il tunnel pubblico. Non copia l'URL negli appunti.",
-    ),
-    (
-        "Mostra / copia URL ChatGPT",
-        "Mostra l'URL riservato solo su richiesta; premi C per copiarlo.",
-    ),
-];
-pub(super) const CONFIG_ORDER: [usize; 15] = [0, 11, 12, 10, 2, 3, 1, 4, 5, 6, 7, 13, 8, 9, 14];
-pub(super) const CONFIG_ITEMS: [&str; 15] = [
-    "Porta HTTP",
-    "Abilita VM",
-    "Abilita ChatGPT Browser",
-    "Eseguibile Chrome",
-    "Aggiungi directory autorizzata",
-    "Rimuovi directory autorizzata",
-    "Scegli profilo CodexPro / NovaGPT",
-    "Importa da profilo (anteprima)",
-    "Salva configurazione",
-    "Annulla modifiche",
-    "Genera / verifica token HTTP",
-    "Ngrok automatico (ON/OFF)",
-    "Dominio ngrok",
-    "Importa da cartella NovaGPT",
-    "Prossimo passo setup",
-];
+pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
+    match index {
+        0 => i18n::Messages::start_mcp_http(lang),
+        1 => i18n::Messages::stop_mcp_http(lang),
+        2 => i18n::Messages::workspace_diagnostics(lang),
+        3 => i18n::Messages::vm_inventory(lang),
+        4 => i18n::Messages::vm_operations(lang),
+        5 => i18n::Messages::subagents(lang),
+        6 => i18n::Messages::clients_and_cli(lang),
+        7 => i18n::Messages::start_mcp_ngrok(lang),
+        8 => i18n::Messages::show_chatgpt_url(lang),
+        _ => "",
+    }
+}
+
+pub(super) const CONFIG_ORDER: [usize; 16] = [15, 0, 11, 12, 10, 2, 3, 1, 4, 5, 6, 7, 13, 8, 9, 14];
+pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
+    match index {
+        0 => i18n::Messages::http_port(lang),
+        1 => i18n::Messages::enable_vm(lang),
+        2 => i18n::Messages::enable_chatgpt_browser(lang),
+        3 => i18n::Messages::chrome_executable(lang),
+        4 => i18n::Messages::add_authorized_directory(lang),
+        5 => i18n::Messages::remove_authorized_directory(lang),
+        6 => i18n::Messages::choose_codexpro_novagpt_profile(lang),
+        7 => i18n::Messages::import_profile_preview(lang),
+        8 => i18n::Messages::save_settings(lang),
+        9 => i18n::Messages::discard_changes(lang),
+        10 => i18n::Messages::generate_verify_http_token(lang),
+        11 => i18n::Messages::automatic_ngrok_on_off(lang),
+        12 => i18n::Messages::ngrok_hostname(lang),
+        13 => i18n::Messages::import_novagpt_folder(lang),
+        14 => i18n::Messages::next_setup_step(lang),
+        15 => i18n::Messages::settings_language(lang),
+        _ => "",
+    }
+}
 const LOG_CAP: usize = 250;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +59,13 @@ pub(super) struct LogEntry {
     pub time: String,
     pub level: Level,
     pub message: String,
+    pub english: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AuthState {
+    NotVerified,
+    Ready,
+    Error,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ServerState {
@@ -159,6 +148,7 @@ pub(super) struct App {
     pub show_advanced: bool,
     pub tunnel_ready: bool,
     pub config: usize,
+    pub system_language: Language,
     pub profile: usize,
     pub root_selection: usize,
     pub server: ServerState,
@@ -168,7 +158,7 @@ pub(super) struct App {
     pub input: String,
     pub input_error: Option<String>,
     pub chrome_valid: Option<bool>,
-    pub auth_state: String,
+    pub auth_state: AuthState,
     pub yes: bool,
     pub busy: bool,
     pub logs: VecDeque<LogEntry>,
@@ -194,6 +184,7 @@ impl App {
             show_advanced: false,
             tunnel_ready: false,
             config: 0,
+            system_language: i18n::detect_system(),
             profile: 0,
             root_selection: 0,
             server: ServerState::Stopped,
@@ -205,7 +196,7 @@ impl App {
             chrome_valid: Some(
                 crate::chrome::discover(settings.chrome_executable.as_deref()).is_ok(),
             ),
-            auth_state: "Non verificato".to_string(),
+            auth_state: AuthState::NotVerified,
             yes: false,
             busy: false,
             logs: VecDeque::new(),
@@ -215,18 +206,23 @@ impl App {
         app.log(Level::Info, "NovaGPT avviato. ? apre l'aiuto.");
         app
     }
+    pub fn language(&self) -> Language {
+        self.draft.language.resolved(self.system_language)
+    }
     pub fn dirty(&self) -> bool {
         self.draft != self.persisted
     }
     pub fn restart_needed(&self) -> bool {
+        // Language is a TUI-only preference. It never changes MCP startup state.
         self.server == ServerState::Running
-            && self
-                .running_config
-                .as_ref()
-                .is_some_and(|c| *c != self.persisted)
+            && self.running_config.as_ref().is_some_and(|running| {
+                let mut current = self.persisted.clone();
+                current.language = running.language;
+                *running != current
+            })
     }
     pub fn config_len(&self) -> usize {
-        if self.setup { 15 } else { 14 }
+        if self.setup { 16 } else { 15 }
     }
 
     pub fn config_order(&self) -> &'static [usize] {
@@ -264,6 +260,7 @@ impl App {
         self.logs.push_back(LogEntry {
             time,
             level,
+            english: message.clone(),
             message: message.clone(),
         });
         if self.logs.len() > LOG_CAP {
@@ -272,6 +269,28 @@ impl App {
         self.log_offset = self.log_offset.min(self.logs.len().saturating_sub(1));
         self.status = message;
     }
+    fn log_localized(&mut self, level: Level, message: fn(Language) -> &'static str) {
+        self.log(level, message(Language::Italian));
+        if let Some(entry) = self.logs.back_mut() {
+            entry.english = message(Language::English).to_string();
+        }
+        self.status = message(self.language()).to_string();
+    }
+
+    fn log_localized_dynamic(&mut self, level: Level, english: String, italian: String) {
+        self.log(level, italian);
+        if let Some(entry) = self.logs.back_mut() {
+            entry.english = english.clone();
+        }
+        self.status = if self.language() == Language::English {
+            english
+        } else {
+            self.logs
+                .back()
+                .map_or(String::new(), |entry| entry.message.clone())
+        };
+    }
+
     pub fn on_event(&mut self, event: OperationEvent) {
         match event {
             OperationEvent::Log(level, text) => self.log(level, text),
@@ -293,9 +312,10 @@ impl App {
                 match result {
                     Ok(count) => {
                         self.vm_images = Some(count);
-                        self.log(
+                        self.log_localized_dynamic(
                             Level::Success,
-                            format!("Inventario VM: {count} immagini approvate."),
+                            i18n::Messages::vm_image_count(Language::English, count),
+                            i18n::Messages::vm_image_count(Language::Italian, count),
                         );
                     }
                     Err(message) => self.log(Level::Error, message),
@@ -306,16 +326,19 @@ impl App {
                 match result {
                     Ok(url) => {
                         self.modal = Some(Modal::ConnectorUrl(url));
-                        self.log(
+                        self.log_localized(
                             Level::Info,
-                            "URL ChatGPT visualizzato solo in finestra riservata.",
+                            i18n::Messages::chatgpt_url_shown_only_in_the_private,
                         );
                     }
                     Err(message) => self.log(Level::Warn, message),
                 }
             }
             OperationEvent::CopyFinished(result) => match result {
-                Ok(()) => self.log(Level::Success, "URL copiato negli appunti su richiesta."),
+                Ok(()) => self.log_localized(
+                    Level::Success,
+                    i18n::Messages::url_copied_to_clipboard_on_request,
+                ),
                 Err(message) => self.log(Level::Error, message),
             },
             OperationEvent::NovaSourceLoaded(result) => {
@@ -325,27 +348,24 @@ impl App {
                         self.profiles.push(profile);
                         self.profile = self.profiles.len().saturating_sub(1);
                         self.modal = Some(Modal::ImportPreview);
-                        self.log(
-                            Level::Info,
-                            "Cartella NovaGPT verificata: controlla l'anteprima.",
-                        );
+                        self.log_localized(Level::Info, i18n::Messages::nova_folder_verified);
                     }
                     Err(message) => self.log(Level::Error, message),
                 }
             }
             OperationEvent::TokenPresent(message) => {
-                self.auth_state = "Pronto".to_string();
+                self.auth_state = AuthState::Ready;
                 self.log(Level::Info, message);
             }
             OperationEvent::TokenReady(result) => {
                 self.busy = false;
                 match result {
                     Ok(message) => {
-                        self.auth_state = "Pronto".to_string();
+                        self.auth_state = AuthState::Ready;
                         self.log(Level::Success, message);
                     }
                     Err(message) => {
-                        self.auth_state = "ERRORE".to_string();
+                        self.auth_state = AuthState::Error;
                         self.log(Level::Error, message);
                     }
                 }
@@ -353,10 +373,7 @@ impl App {
             OperationEvent::ChromeChecked(valid) => {
                 self.chrome_valid = Some(valid);
                 if !valid {
-                    self.log(
-                        Level::Error,
-                        "Eseguibile Chrome non valido o non accessibile.",
-                    );
+                    self.log_localized(Level::Error, i18n::Messages::invalid_chrome_binary);
                 }
             }
             OperationEvent::RootAdded(result) => {
@@ -364,14 +381,20 @@ impl App {
                 match result {
                     Ok(root) => {
                         if root == self.root || self.draft.allowed_roots.contains(&root) {
-                            self.log(Level::Warn, "Directory gia autorizzata.");
+                            self.log_localized(
+                                Level::Warn,
+                                i18n::Messages::directory_already_authorized,
+                            );
                         } else if self.draft.allowed_roots.len() >= 16 {
-                            self.log(Level::Error, "Massimo 16 directory aggiuntive.");
+                            self.log_localized(
+                                Level::Error,
+                                i18n::Messages::maximum_16_additional_directories,
+                            );
                         } else {
                             self.draft.allowed_roots.push(root);
-                            self.log(
+                            self.log_localized(
                                 Level::Success,
-                                "Directory autorizzata aggiunta (non salvata).",
+                                i18n::Messages::authorized_directory_added_not_saved,
                             );
                         }
                     }
@@ -394,7 +417,10 @@ impl App {
                             self.modal = Some(Modal::SetupResult(text));
                         }
                         if self.restart_needed() {
-                            self.log(Level::Warn, "Riavvia HTTP per applicare la configurazione.");
+                            self.log_localized(
+                                Level::Warn,
+                                i18n::Messages::restart_http_to_apply_the_settings,
+                            );
                         }
                     }
                     Err(msg) => self.log(Level::Error, msg),
@@ -433,10 +459,13 @@ impl App {
         match index {
             0 => {
                 if self.server == ServerState::Starting || self.server == ServerState::Running {
-                    self.log(Level::Warn, "Server gia in esecuzione o in avvio.");
+                    self.log_localized(
+                        Level::Warn,
+                        i18n::Messages::server_is_already_running_or_starting,
+                    );
                     None
                 } else if self.dirty() {
-                    self.log(Level::Warn, "Salva le modifiche prima di avviare HTTP.");
+                    self.log_localized(Level::Warn, i18n::Messages::save_before_http);
                     None
                 } else {
                     self.server = ServerState::Starting;
@@ -462,48 +491,51 @@ impl App {
                 if matches!(self.server, ServerState::Starting | ServerState::Running) {
                     self.confirm(Confirm::Stop);
                 } else {
-                    self.log(Level::Info, "Nessun server TUI da arrestare.");
+                    self.log_localized(Level::Info, i18n::Messages::no_tui_server_to_stop);
                 }
                 None
             }
             2 => Some(Effect::Diagnose(self.persisted.clone())),
             3 => {
                 if !self.persisted.vm_enabled {
-                    self.log(
+                    self.log_localized(
                         Level::Warn,
-                        "VM non abilitata nella configurazione salvata.",
+                        i18n::Messages::vm_is_disabled_in_the_saved_configuration,
                     );
                     None
                 } else {
                     self.busy = true;
-                    self.log(Level::Info, "Lettura inventario VM...");
+                    self.log_localized(Level::Info, i18n::Messages::reading_vm_inventory);
                     Some(Effect::Inventory)
                 }
             }
             4 => {
-                self.notice("Operazioni VM", "Tool MCP 'vm': images, create (image), status (id), destroy (id, distruttivo). Importazione di dischi approvati: novagpt vm-import --name N --source FILE [--cpus 2 --memory-mb 4096]. Le operazioni host richiedono un client MCP con parametri espliciti.");
+                self.notice(
+                    i18n::Messages::vm_operations(self.language()),
+                    i18n::Messages::notice_vm_body(self.language()),
+                );
                 None
             }
             5 => {
-                self.notice("Sottoagenti MCP", "Tool disponibili: subagent_spawn, subagent_status, subagent_message, subagent_result, subagent_cancel, subagent_resume, subagent_browser_diagnostics. Servono browser ChatGPT abilitato, Chrome dedicato e autenticazione manuale; nessuna automazione e' avviata da questo menu.");
+                self.notice(
+                    i18n::Messages::mcp_subagents(self.language()),
+                    i18n::Messages::notice_agents_body(self.language()),
+                );
                 None
             }
             6 => {
-                self.notice("Accesso CLI", "MCP stdio: novagpt stdio\nHTTP da CLI: novagpt http --ngrok\nMostra URL: novagpt connector-url\nVM import: novagpt vm-import --name N --source FILE");
+                self.notice(
+                    i18n::Messages::cli_access(self.language()),
+                    i18n::Messages::notice_cli_body(self.language()),
+                );
                 None
             }
             7 => {
                 if matches!(self.server, ServerState::Starting | ServerState::Running) {
-                    self.log(
-                        Level::Warn,
-                        "Arresta il server HTTP prima di avviare ngrok.",
-                    );
+                    self.log_localized(Level::Warn, i18n::Messages::stop_http_before_ngrok);
                     None
                 } else if self.dirty() {
-                    self.log(
-                        Level::Warn,
-                        "Salva la configurazione prima di avviare ngrok.",
-                    );
+                    self.log_localized(Level::Warn, i18n::Messages::save_before_ngrok);
                     None
                 } else {
                     self.server = ServerState::Starting;
@@ -511,13 +543,13 @@ impl App {
                         self.command = 8;
                     }
                     self.running_config = Some(self.persisted.clone());
-                    self.log(Level::Info, "Avvio del tunnel ngrok richiesto...");
+                    self.log_localized(Level::Info, i18n::Messages::ngrok_tunnel_startup_requested);
                     Some(Effect::StartNgrok(self.persisted.clone()))
                 }
             }
             8 => {
                 if self.server != ServerState::Running {
-                    self.log(Level::Warn, "Avvia prima MCP + ngrok.");
+                    self.log_localized(Level::Warn, i18n::Messages::start_mcp_ngrok_first);
                     None
                 } else if self.busy {
                     None
@@ -615,24 +647,31 @@ impl App {
         }
         self.modal = None;
         self.input.clear();
-        self.log(
+        self.log_localized(
             Level::Info,
-            "Valore modificato; salva per renderlo persistente.",
+            i18n::Messages::value_changed_save_to_persist_it,
         );
         None
     }
     fn config_action(&mut self) -> Option<Effect> {
         match self.config {
+            15 => {
+                self.draft.language = self.draft.language.next();
+                self.log_localized(
+                    Level::Info,
+                    i18n::Messages::language_changed_save_to_keep_it_after,
+                );
+            }
             0 => self.start_edit(Field::Port),
             1 => {
                 self.draft.vm_enabled = !self.draft.vm_enabled;
-                self.log(Level::Info, "Opzione VM modificata.");
+                self.log_localized(Level::Info, i18n::Messages::vm_setting_changed);
             }
             2 => {
                 self.draft.browser_enabled = !self.draft.browser_enabled;
                 self.chrome_valid =
                     Some(crate::chrome::discover(self.draft.chrome_executable.as_deref()).is_ok());
-                self.log(Level::Info, "Opzione browser modificata.");
+                self.log_localized(Level::Info, i18n::Messages::browser_setting_changed);
             }
             3 => self.start_edit(Field::Chrome),
             4 => self.start_edit(Field::Root),
@@ -641,14 +680,14 @@ impl App {
                     self.root_selection = 0;
                     self.modal = Some(Modal::Roots);
                 } else {
-                    self.log(Level::Warn, "Nessuna directory aggiuntiva.");
+                    self.log_localized(Level::Warn, i18n::Messages::no_additional_directories);
                 }
             }
             6 => {
                 if !self.profiles.is_empty() {
                     self.profile = (self.profile + 1) % self.profiles.len();
                 } else {
-                    self.log(Level::Warn, "Nessun profilo di importazione disponibile.");
+                    self.log_localized(Level::Warn, i18n::Messages::no_import_profiles);
                 }
             }
             7 => {
@@ -657,13 +696,13 @@ impl App {
                 }) {
                     self.modal = Some(Modal::ImportPreview);
                 } else {
-                    self.log(Level::Warn, "Nessuna porta importabile nel profilo.");
+                    self.log_localized(Level::Warn, i18n::Messages::no_import_port);
                 }
             }
             8 => {
                 if self.setup && self.step < 3 {
                     self.step = 3;
-                    self.log(Level::Info, "Passo di revisione: conferma il salvataggio.");
+                    self.log_localized(Level::Info, i18n::Messages::setup_review_step);
                 } else {
                     self.confirm(Confirm::Save);
                 }
@@ -681,9 +720,9 @@ impl App {
             }
             11 => {
                 self.draft.ngrok_enabled = !self.draft.ngrok_enabled;
-                self.log(
+                self.log_localized(
                     Level::Info,
-                    "Preferenza ngrok modificata; salva per confermare.",
+                    i18n::Messages::ngrok_preference_changed_save_to_confirm,
                 );
             }
             12 => self.start_edit(Field::NgrokDomain),
@@ -712,20 +751,20 @@ impl App {
             }
             Confirm::Save => {
                 if self.busy {
-                    self.log(Level::Warn, "Operazione in corso.");
+                    self.log_localized(Level::Warn, i18n::Messages::operation_in_progress);
                     None
                 } else {
                     self.busy = true;
-                    self.log(Level::Info, "Validazione e salvataggio in corso...");
+                    self.log_localized(Level::Info, i18n::Messages::validation_saving);
                     Some(Effect::Save(self.draft.clone(), self.setup))
                 }
             }
             Confirm::Import => {
                 if let Some(profile) = self.profiles.get(self.profile) {
                     crate::settings::import_supported(&mut self.draft, profile);
-                    self.log(
+                    self.log_localized(
                         Level::Success,
-                        "Porta e impostazioni ngrok consentite importate nella bozza; salva per applicarle.",
+                        i18n::Messages::port_and_approved_ngrok_settings_imported_into,
                     );
                 }
                 None
@@ -733,7 +772,10 @@ impl App {
             Confirm::RemoveRoot => {
                 if self.root_selection < self.draft.allowed_roots.len() {
                     self.draft.allowed_roots.remove(self.root_selection);
-                    self.log(Level::Success, "Directory rimossa dalla bozza.");
+                    self.log_localized(
+                        Level::Success,
+                        i18n::Messages::directory_removed_from_draft,
+                    );
                 }
                 None
             }
@@ -741,7 +783,7 @@ impl App {
                 self.draft = self.persisted.clone();
                 self.chrome_valid =
                     Some(crate::chrome::discover(self.draft.chrome_executable.as_deref()).is_ok());
-                self.log(Level::Info, "Modifiche annullate.");
+                self.log_localized(Level::Info, i18n::Messages::changes_discarded);
                 None
             }
             Confirm::Quit => Some(Effect::Quit),

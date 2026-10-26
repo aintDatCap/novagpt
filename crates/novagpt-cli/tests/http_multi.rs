@@ -388,7 +388,7 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     cli_logs
         .arg("--root")
         .arg(root.path())
-        .args(["logs", "tail", "--json"]);
+        .args(["logs", "tail"]);
     if cfg!(windows) {
         cli_logs.env("LOCALAPPDATA", private.path());
     } else {
@@ -400,14 +400,26 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         "{:?}",
         persisted_output.status
     );
-    let persisted: Value =
-        serde_json::from_slice(&persisted_output.stdout).expect("JSONL snapshot");
-    assert_eq!(persisted["mode"], "metadata-only-persistent");
-    assert!(persisted["total_calls"].as_u64().unwrap_or_default() >= recorded_before_restart);
     let disk_text = String::from_utf8_lossy(&persisted_output.stdout);
+    assert!(disk_text.contains("Event #"), "{disk_text}");
+    assert!(disk_text.contains("tool "));
+    assert!(
+        !disk_text.trim_start().starts_with('{'),
+        "logs must be plain text"
+    );
     assert!(!disk_text.contains(&token));
     assert!(!disk_text.contains("original"));
     assert!(!disk_text.contains("winner"));
+    assert!(recorded_before_restart >= 5);
+    // A JSON option must not remain on this logging-only CLI command.
+    let rejected = Command::new(env!("CARGO_BIN_EXE_novagpt"))
+        .arg("--root")
+        .arg(root.path())
+        .args(["logs", "tail", "--json"])
+        .output()
+        .expect("removed JSON mode");
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unexpected argument"));
 
     // The independent transport holds an SSE GET stream without consuming
     // another client's session. Explicit session DELETE is then isolated.
@@ -488,6 +500,8 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     assert!(
         recovered["result"]["structuredContent"]["llm"]
             .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["tool"] == "write"))
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|line| line.contains("tool=write"))))
     );
 }

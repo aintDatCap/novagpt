@@ -1,5 +1,4 @@
 //! A tunnel must not be spawned if another process already owns the MCP port.
-use serde_json::Value;
 use std::{net::TcpListener, process::Command};
 
 #[test]
@@ -13,6 +12,7 @@ fn ngrok_start_refuses_an_occupied_loopback_port_and_records_diagnostic() {
 
     let mut server = Command::new(binary);
     server
+        .args(["--log-format", "llm"])
         .arg("--root")
         .arg(root.path())
         .args(["http", "--ngrok", "--port"])
@@ -30,15 +30,17 @@ fn ngrok_start_refuses_an_occupied_loopback_port_and_records_diagnostic() {
     );
     let stderr = String::from_utf8_lossy(&outcome.stderr);
     assert!(
-        stderr.contains("Porta MCP occupata"),
+        stderr.contains("MCP port is occupied"),
         "specific safe error expected"
     );
     assert!(!stderr.contains(&credential), "never show credentials");
+    assert!(
+        !stderr.contains("\"timestamp\":"),
+        "LLM logging must not emit JSON"
+    );
 
     let mut logs = Command::new(binary);
-    logs.arg("--root")
-        .arg(root.path())
-        .args(["logs", "tail", "--json"]);
+    logs.arg("--root").arg(root.path()).args(["logs", "tail"]);
     if cfg!(windows) {
         logs.env("LOCALAPPDATA", private.path());
     } else {
@@ -49,7 +51,9 @@ fn ngrok_start_refuses_an_occupied_loopback_port_and_records_diagnostic() {
         output.status.success(),
         "audit must be readable after early failure"
     );
-    let snapshot: Value = serde_json::from_slice(&output.stdout).expect("safe JSON");
-    assert!(snapshot.to_string().contains("http_bind_failed"));
-    assert!(!snapshot.to_string().contains(&credential));
+    let audit = String::from_utf8_lossy(&output.stdout);
+    assert!(audit.contains("http_bind_failed"));
+    assert!(audit.contains("Event #"));
+    assert!(!audit.trim_start().starts_with('{'));
+    assert!(!audit.contains(&credential));
 }

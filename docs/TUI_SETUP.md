@@ -1,6 +1,6 @@
 # NovaGPT TUI e setup guidato (Ratatui 0.29)
 
-NovaGPT usa **tre schede**: **Panoramica**, **Attività**, **Impostazioni**. La Panoramica presenta soltanto le azioni pertinenti allo stato corrente, con operazioni avanzate accessibili premendo `a`; Attività è dedicata ai log; le impostazioni sono suddivise in sezioni. Il workspace predefinito e' la directory di lavoro corrente; `--root` ne seleziona una diversa. Le configurazioni NovaGPT sono locali in `<workspace>/.novagpt/`. CodexPro originale e i relativi dati non vengono modificati.
+NovaGPT usa **tre schede**: **Overview / Panoramica**, **Activity / Attività**, **Settings / Impostazioni**. **La lingua predefinita della TUI è inglese**; l'italiano e la rilevazione automatica della lingua di sistema sono disponibili nelle impostazioni. La Panoramica presenta soltanto le azioni pertinenti allo stato corrente, con operazioni avanzate accessibili premendo `a`; Attività è dedicata ai log; le impostazioni sono suddivise in sezioni. Il workspace predefinito e' la directory di lavoro corrente; `--root` ne seleziona una diversa. Le configurazioni NovaGPT sono locali in `<workspace>/.novagpt/`. CodexPro originale e i relativi dati non vengono modificati.
 
 ## PowerShell / Windows Terminal
 
@@ -14,6 +14,16 @@ C:\Projects\novagpt\target\release\novagpt.exe --root C:\Projects\my-workspace -
 ```
 
 Richiede un terminale interattivo con raw mode e alternate screen; il setup non interattivo non crea file. Gli eventi Crossterm di tipo `Press` e `Repeat` sono gestiti, `Release` ignorati; su resize avviene un nuovo layout.
+
+## Localizzazione / Language
+
+Il modulo interno `novagpt-cli/src/i18n.rs` fornisce il catalogo bilingue dell'interfaccia; non serve un crate NovaGPT aggiuntivo. La dipendenza [sys-locale](https://crates.io/crates/sys-locale) rileva la lingua del sistema tramite le API della piattaforma (anche Windows). Le opzioni nel menu **Settings → General → Interface language** (o **Impostazioni → Generali → Lingua dell'interfaccia**) sono:
+
+- **English**: valore predefinito, indipendente dalla lingua del sistema.
+- **Italiano**: traduzione italiana esplicita.
+- **Automatic / Automatico**: usa la lingua rilevata dal sistema; `it` e varianti (`it-IT`, `it_IT`) selezionano italiano, le altre lingue o un valore non disponibile ripiegano su inglese.
+
+Seleziona il campo e premi **Enter** per cambiare lingua immediatamente; premi **s** per salvare la preferenza in `.novagpt/config.json` (`"language": "english" | "italian" | "auto"`). I vecchi file senza il campo sono compatibili e aprono la TUI in inglese. Cambiare soltanto la lingua non richiede riavviare MCP. La localizzazione riguarda la console Ratatui: i nomi dei tool MCP, i payload JSON e gli argomenti CLI restano invariati, mentre messaggi grezzi provenienti da sottosistemi esterni possono usare la lingua originaria.
 
 ## Navigazione
 
@@ -75,7 +85,7 @@ novagpt --root C:\Projects\my-workspace token path
 
 Il token e' richiesto dal server come credenziale di autenticazione MCP. Non condividere mai l'output di `token show`, non inserirlo in commit, messaggi o screenshot. Se cambi il token mentre HTTP e' in esecuzione, il server deve essere riavviato per applicare la modifica. La generazione non abilita di per se' l'accesso dalla rete: il server resta in ascolto solo su loopback.
 
-Le operazioni CLI di ispezione e diagnostica sono disponibili senza TUI: `novagpt doctor --json`, `novagpt inspect --json`, `novagpt review --json`. `--log-format human|llm` seleziona il formato diagnostico **stderr** del server. L'audit MCP metadata-only ora viene salvato fuori dal repository (`%LOCALAPPDATA%\NovaGPT\logs\<hash-workspace>\` su Windows) anche per l'HTTP avviato dalla TUI. `runtime_status` espone gli ultimi eventi recuperati anche dopo un riavvio; con `novagpt logs path` e `novagpt logs tail --lines 50 [--json]` puoi consultare localmente file JSONL ruotati (4 x 64 KiB). Si registrano solo nome statico del tool, timestamp, sequenza ed esito; mai argomenti, token, path dei file o output. Non e' un registro completo delle chiamate/protocollo, e la TUI conserva separatamente il proprio buffer di eventi di lifecycle (massimo 250).
+Le operazioni CLI di ispezione e diagnostica sono disponibili senza TUI: `novagpt doctor --json`, `novagpt inspect --json`, `novagpt review --json`. `--log-format human|llm` seleziona rispettivamente testo standard o compatto, sempre in inglese e **mai JSON**, per la diagnostica **stderr** del server. L'audit MCP metadata-only ora viene salvato fuori dal repository (`%LOCALAPPDATA%\NovaGPT\logs\<hash-workspace>\` su Windows) anche per l'HTTP avviato dalla TUI. `runtime_status` espone gli ultimi eventi recuperati anche dopo un riavvio; con `novagpt logs path` e `novagpt logs tail --lines 50` puoi consultare localmente file di testo `audit.log` ruotati (4 x 64 KiB). Si registrano solo nome statico del tool, timestamp, sequenza ed esito; mai argomenti, token, path dei file o output. Non e' un registro completo delle chiamate/protocollo, e la TUI conserva separatamente il proprio buffer di eventi di lifecycle (massimo 250).
 
 ## Attività e log
 
@@ -127,3 +137,6 @@ Riferimenti ufficiali consultati:
 - [Crossterm keyboard/eventi 0.28](https://docs.rs/crossterm/0.28.1/crossterm/event/index.html) e [terminal lifecycle](https://docs.rs/crossterm/0.28.1/crossterm/terminal/index.html)
 
 Consulta inoltre [VM e sottoagenti](VM_AND_SUBAGENTS.md), [parity](PARITY.md), [quality gates](QUALITY_GATES.md).
+
+
+L'audit persistente registra esclusivamente testo inglese leggibile anche da LLM (`event=... timestamp_unix=... tool=... status=...`); i precedenti file `audit*.jsonl` restano archiviati e non vengono letti o modificati dalla nuova versione. La TUI è l'unica eccezione: gli stati e gli eventi presentati a schermo possono essere localizzati in inglese o italiano. Il JSON dei comandi diagnostici `--json` e del protocollo MCP non è un formato di logging.

@@ -35,7 +35,7 @@ pub struct AuditSnapshot {
     pub dropped_events: u64,
     pub write_errors: u64,
     pub human: Vec<String>,
-    pub llm: Vec<AuditEvent>,
+    pub llm: Vec<String>,
 }
 
 #[derive(Default)]
@@ -112,10 +112,10 @@ fn checked_file(path: &Path) -> io::Result<Option<u64>> {
 
 fn file_name(index: usize) -> &'static str {
     match index {
-        0 => "audit.jsonl",
-        1 => "audit.1.jsonl",
-        2 => "audit.2.jsonl",
-        _ => "audit.3.jsonl",
+        0 => "audit.log",
+        1 => "audit.1.log",
+        2 => "audit.2.log",
+        _ => "audit.3.log",
     }
 }
 
@@ -128,6 +128,39 @@ fn valid_record(event: &AuditEvent) -> bool {
             .tool
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Plain English-readable audit format, with fixed labels and bounded fields.
+fn format_event(event: &AuditEvent) -> String {
+    format!(
+        "event={} timestamp_unix={} tool={} status={}\n",
+        event.sequence, event.unix_seconds, event.tool, event.status
+    )
+}
+
+fn parse_event(line: &[u8]) -> Option<AuditEvent> {
+    // Reject noncanonical lines, extra fields and untrusted content rather than
+    // interpreting arbitrary text as a valid tool event.
+    let text = std::str::from_utf8(line).ok()?;
+    let mut fields = text.split_ascii_whitespace();
+    let sequence = fields.next()?.strip_prefix("event=")?.parse().ok()?;
+    let unix_seconds = fields
+        .next()?
+        .strip_prefix("timestamp_unix=")?
+        .parse()
+        .ok()?;
+    let tool = fields.next()?.strip_prefix("tool=")?.to_string();
+    let status = fields.next()?.strip_prefix("status=")?.to_string();
+    if fields.next().is_some() {
+        return None;
+    }
+    let event = AuditEvent {
+        sequence,
+        unix_seconds,
+        tool,
+        status,
+    };
+    valid_record(&event).then_some(event)
 }
 
 /// Loads at most 4 x 64 KiB, without following symlinks or trusting disk records
@@ -150,9 +183,7 @@ fn history(dir: &Path) -> io::Result<AuditState> {
             if line.is_empty() {
                 continue;
             }
-            if let Ok(event) = serde_json::from_slice::<AuditEvent>(line)
-                && valid_record(&event)
-            {
+            if let Some(event) = parse_event(line) {
                 state.count = state.count.max(event.sequence);
                 if state.events.len() == MAX_EVENTS {
                     state.events.pop_front();
@@ -182,8 +213,7 @@ fn rotate(dir: &Path) -> io::Result<()> {
 }
 
 fn append(dir: &Path, event: &AuditEvent) -> io::Result<()> {
-    let mut line = serde_json::to_vec(event)?;
-    line.push(b'\n');
+    let line = format_event(event).into_bytes();
     let current = dir.join(file_name(0));
     if checked_file(&current)?
         .unwrap_or(0)
@@ -340,9 +370,22 @@ impl AuditTrail {
             write_errors: self.write_errors.load(Ordering::Relaxed),
             human: entries
                 .iter()
-                .map(|item| format!("#{} {} {}", item.sequence, item.tool, item.status))
+                .map(|item| {
+                    format!(
+                        "Event #{} at UNIX timestamp {}: tool {} completed with status {}.",
+                        item.sequence, item.unix_seconds, item.tool, item.status
+                    )
+                })
                 .collect(),
-            llm: entries,
+            llm: entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "event={} timestamp_unix={} tool={} status={}",
+                        entry.sequence, entry.unix_seconds, entry.tool, entry.status
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -383,10 +426,18 @@ mod tests {
         let snapshot = audit.snapshot(999);
         assert_eq!(snapshot.total_calls, 181);
         assert_eq!(snapshot.llm.len(), 128);
-        assert_eq!(snapshot.llm.last().expect("latest").status, "error");
-        let json = serde_json::to_string(&snapshot).expect("serialize");
-        assert!(!json.contains("token"));
-        assert!(!json.contains("root"));
+        assert!(
+            snapshot
+                .llm
+                .last()
+                .expect("latest")
+                .contains("status=error")
+        );
+        let text = snapshot.human.join("\n");
+        assert!(text.contains("Event #"));
+        assert!(text.contains("tool read"));
+        assert!(!text.contains("token"));
+        assert!(!text.contains("root"));
     }
 
     #[tokio::test]
@@ -408,7 +459,7 @@ mod tests {
         let persisted = reopened.snapshot(128);
         assert_eq!(persisted.mode, "metadata-only-persistent");
         assert!(persisted.total_calls > 0);
-        assert!(fs::metadata(dir.join("audit.jsonl")).expect("log").len() <= MAX_FILE_BYTES);
+        assert!(fs::metadata(dir.join("audit.log")).expect("log").len() <= MAX_FILE_BYTES);
         let limit_files = fs::read_dir(&dir).expect("dir").count();
         assert!(limit_files <= MAX_FILES);
     }
@@ -420,20 +471,27 @@ mod tests {
         let audit = AuditTrail::persistent(dir.clone()).expect("audit");
         audit.record("write", true);
         audit.snapshot_flushed(10).await;
-        let data = fs::read_to_string(dir.join("audit.jsonl")).expect("JSONL");
-        assert!(data.contains(r#""tool":"write""#));
+        let data = fs::read_to_string(dir.join("audit.log")).expect("plain text audit");
+        assert!(data.contains("tool=write status=error"));
+        assert!(!data.trim_start().starts_with('{'));
+        assert!(parse_event(b"event=1 timestamp_unix=0 tool=read status=ok").is_some());
+        assert!(
+            parse_event(b"event=1 timestamp_unix=0 tool=read status=ok token=secret").is_none()
+        );
         assert!(!data.contains("authorization"));
         assert!(!data.contains("secret-value"));
         let old = AuditTrail::persisted_snapshot(&dir, 10).expect("disk");
         assert_eq!(old.llm.len(), 1);
         drop(audit);
         fs::write(
-            dir.join("audit.jsonl"),
-            b"{\"tool\":\"read\",\"status\":\"ok\",\"sequence\":2,\"unix_seconds\":0}\nnot-json\n",
+            dir.join("audit.log"),
+            b"event=2 timestamp_unix=0 tool=read status=ok\n{\"secret\":\"hidden\"}\nnot-an-event\n",
         )
         .expect("malformed test fixture");
         let summary = AuditTrail::persisted_snapshot(&dir, 10).expect("ignore corrupt lines");
         assert_eq!(summary.llm.len(), 1);
+        assert_eq!(summary.total_calls, 2);
+        assert!(!summary.human.join("\n").contains("secret"));
     }
 
     #[test]
@@ -441,19 +499,19 @@ mod tests {
         let tmp = tempfile::tempdir().expect("fixture");
         let dir = tmp.path().join("NovaGPT").join("logs").join("corrupt");
         let _ = AuditTrail::persistent(dir.clone()).expect("create dirs");
-        fs::write(dir.join("audit.jsonl"), b"").expect("fixture");
+        fs::write(dir.join("audit.log"), b"").expect("fixture");
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
-            fs::remove_file(dir.join("audit.jsonl")).expect("remove");
-            symlink(tmp.path().join("outside"), dir.join("audit.jsonl")).expect("link");
+            fs::remove_file(dir.join("audit.log")).expect("remove");
+            symlink(tmp.path().join("outside"), dir.join("audit.log")).expect("link");
             assert!(AuditTrail::persistent(dir).is_err());
         }
         #[cfg(windows)]
         {
             use std::os::windows::fs::symlink_file;
-            fs::remove_file(dir.join("audit.jsonl")).expect("remove");
-            if symlink_file(tmp.path().join("outside"), dir.join("audit.jsonl")).is_ok() {
+            fs::remove_file(dir.join("audit.log")).expect("remove");
+            if symlink_file(tmp.path().join("outside"), dir.join("audit.log")).is_ok() {
                 assert!(AuditTrail::persistent(dir).is_err());
             }
         }

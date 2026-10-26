@@ -413,7 +413,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(screen.contains("STATO MCP E COMPONENTI"));
+        assert!(screen.contains("MCP AND COMPONENT STATUS"));
         assert!(screen.contains("INFO"));
         a.tab = 2;
         t.draw(|f| render::draw(f, &a)).unwrap();
@@ -424,7 +424,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(screen.contains("Porta HTTP"));
+        assert!(screen.contains("HTTP port"));
     }
     #[test]
     fn home_actions_and_tunnel_status_follow_real_server_events() {
@@ -451,11 +451,11 @@ mod tests {
     fn grouped_settings_navigation_and_home_rendering() {
         let mut a = app();
         a.tab = 2;
-        a.key(key(KeyCode::Down));
-        assert_eq!(a.config, 11);
-        a.key(key(KeyCode::Down));
-        assert_eq!(a.config, 12);
         a.key(key(KeyCode::Up));
+        assert_eq!(a.config, 15);
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.config, 0);
+        a.key(key(KeyCode::Down));
         assert_eq!(a.config, 11);
 
         let mut t = Terminal::new(TestBackend::new(124, 36)).unwrap();
@@ -470,19 +470,104 @@ mod tests {
                 .collect::<String>()
         };
         let shown = screen(&t);
-        assert!(shown.contains("CONNESSIONE"));
-        assert!(shown.contains("BROWSER"));
-        assert!(shown.contains("APPLICA MODIFICHE"));
+        assert!(shown.contains("CONNECTION"));
+        a.config = 2;
+        t.draw(|f| render::draw(f, &a)).unwrap();
+        assert!(screen(&t).contains("BROWSER"));
+        assert!(shown.contains("APPLY CHANGES"));
 
         a.tab = 0;
         t.draw(|f| render::draw(f, &a)).unwrap();
         let shown = screen(&t);
-        assert!(shown.contains("Panoramica dei servizi"));
-        assert!(shown.contains("token MCP concede accesso"));
+        assert!(shown.contains("Service overview"));
+        assert!(shown.contains("MCP token also grants access"));
         assert!(!shown.contains("Operazioni VM"));
         a.key(key(KeyCode::Char('a')));
         t.draw(|f| render::draw(f, &a)).unwrap();
-        assert!(screen(&t).contains("Operazioni VM"));
+        assert!(screen(&t).contains("VM operations"));
+    }
+
+    #[test]
+    fn interface_language_changes_live_and_auto_uses_system_locale() {
+        use crate::i18n::{Language, LanguageChoice};
+        let mut a = app();
+        assert_eq!(a.language(), Language::English);
+        let mut terminal = Terminal::new(TestBackend::new(130, 35)).expect("terminal");
+        terminal
+            .draw(|f| render::draw(f, &a))
+            .expect("render English");
+        let shown = |t: &Terminal<TestBackend>| {
+            t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(shown(&terminal).contains("Service overview"));
+        assert!(!shown(&terminal).contains("Panoramica dei servizi"));
+
+        a.tab = 2;
+        a.config = 15;
+        a.key(key(KeyCode::Enter));
+        assert_eq!(a.draft.language, LanguageChoice::Italian);
+        assert_eq!(a.language(), Language::Italian);
+        assert!(a.dirty());
+        a.tab = 0;
+        terminal
+            .draw(|f| render::draw(f, &a))
+            .expect("render Italian");
+        assert!(shown(&terminal).contains("Panoramica dei servizi"));
+
+        a.tab = 2;
+        a.config = 15;
+        a.system_language = Language::Italian;
+        a.key(key(KeyCode::Enter));
+        assert_eq!(a.draft.language, LanguageChoice::Auto);
+        assert_eq!(a.language(), Language::Italian);
+        a.system_language = Language::English;
+        assert_eq!(a.language(), Language::English);
+        a.key(key(KeyCode::Enter));
+        assert_eq!(a.draft.language, LanguageChoice::English);
+    }
+
+    #[test]
+    fn changing_only_language_does_not_require_mcp_restart() {
+        use crate::i18n::LanguageChoice;
+        let mut a = app();
+        a.on_event(OperationEvent::Server(ServerState::Running));
+        a.running_config = Some(a.persisted.clone());
+        assert!(!a.restart_needed());
+        a.draft.language = LanguageChoice::Italian;
+        let saved = a.draft.clone();
+        a.on_event(OperationEvent::Saved {
+            settings: saved,
+            outcome: Ok("saved".into()),
+        });
+        assert!(!a.restart_needed());
+    }
+
+    #[test]
+    fn connector_credential_remains_byte_identical_when_localized() {
+        let mut a = app();
+        let url = "https://example.test/mcp?secret=CODE_123456789";
+        a.modal = Some(Modal::ConnectorUrl(url.to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(136, 38)).expect("terminal");
+        for language in [
+            crate::i18n::LanguageChoice::English,
+            crate::i18n::LanguageChoice::Italian,
+        ] {
+            a.draft.language = language;
+            terminal.draw(|f| render::draw(f, &a)).expect("render URL");
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(screen.contains(url), "connector URL must remain unchanged");
+        }
     }
 
     struct FakeTerminal(Arc<Mutex<Vec<&'static str>>>);
@@ -598,7 +683,7 @@ mod tests {
             "Token pronto (valore nascosto).".into(),
         )));
         assert!(!app.busy);
-        assert_eq!(app.auth_state, "Pronto");
+        assert_eq!(app.auth_state, model::AuthState::Ready);
         let mut terminal = Terminal::new(TestBackend::new(105, 32)).unwrap();
         terminal.draw(|frame| render::draw(frame, &app)).unwrap();
         let rendered = terminal
@@ -608,8 +693,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Genera / verifica token HTTP"));
-        assert!(rendered.contains("Pronto"));
+        assert!(rendered.contains("Generate / verify HTTP token"));
+        assert!(rendered.contains("Ready"));
     }
     #[test]
     fn status_inventory_restart_and_ctrl_c() {
@@ -637,8 +722,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(displayed.contains("3 immagini approvate"));
-        assert!(displayed.contains("riavvio MCP necessario"));
+        assert!(displayed.contains("3 approved images"));
+        assert!(displayed.contains("MCP restart required"));
         let ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(a.key(ctrl), Some(Effect::Quit)));
     }

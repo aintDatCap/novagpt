@@ -1,5 +1,8 @@
 //! Stateless Ratatui widgets and responsive layout (Ratatui 0.29).
-use super::model::{App, COMMANDS, CONFIG_ITEMS, Confirm, Field, Level, Modal, ServerState};
+use super::model::{
+    App, AuthState, Confirm, Field, Level, Modal, ServerState, command_label, config_label,
+};
+use crate::i18n::{Language, LanguageChoice, Messages};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -24,12 +27,12 @@ fn panel(title: &str) -> Block<'_> {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
 }
-fn state(s: ServerState) -> &'static str {
+fn state(s: ServerState, lang: Language) -> &'static str {
     match s {
-        ServerState::Stopped => "Non avviato",
-        ServerState::Starting => "Avvio in corso",
-        ServerState::Running => "MCP pronto",
-        ServerState::Failed => "Errore di avvio",
+        ServerState::Stopped => Messages::server_stopped(lang),
+        ServerState::Starting => Messages::server_starting(lang),
+        ServerState::Running => Messages::server_ready(lang),
+        ServerState::Failed => Messages::server_failed(lang),
     }
 }
 fn state_color(s: ServerState) -> Color {
@@ -40,8 +43,12 @@ fn state_color(s: ServerState) -> Color {
         ServerState::Stopped => MUTED,
     }
 }
-fn on(b: bool) -> &'static str {
-    if b { "Attivo" } else { "Disattivo" }
+fn on(b: bool, lang: Language) -> &'static str {
+    if b {
+        Messages::enabled(lang)
+    } else {
+        Messages::disabled_3(lang)
+    }
 }
 fn dirty_mark(b: bool) -> &'static str {
     if b { " *" } else { "" }
@@ -98,6 +105,7 @@ fn title_line(app: &App, width: u16) -> Line<'static> {
     ])
 }
 fn config_value(app: &App, index: usize) -> String {
+    let lang = app.language();
     match index {
         0 => format!(
             "{}{}",
@@ -106,12 +114,12 @@ fn config_value(app: &App, index: usize) -> String {
         ),
         1 => format!(
             "{}{}",
-            on(app.draft.vm_enabled),
+            on(app.draft.vm_enabled, lang),
             dirty_mark(app.draft.vm_enabled != app.persisted.vm_enabled)
         ),
         2 => format!(
             "{}{}",
-            on(app.draft.browser_enabled),
+            on(app.draft.browser_enabled, lang),
             dirty_mark(app.draft.browser_enabled != app.persisted.browser_enabled)
         ),
         3 => format!(
@@ -119,39 +127,54 @@ fn config_value(app: &App, index: usize) -> String {
             app.draft
                 .chrome_executable
                 .as_ref()
-                .map_or("(ricerca automatica)".into(), |p| p.display().to_string()),
+                .map_or(Messages::automatic_detection(lang).into(), |p| p
+                    .display()
+                    .to_string()),
             dirty_mark(app.draft.chrome_executable != app.persisted.chrome_executable)
         ),
         4 | 5 => format!(
-            "{} directory{}",
+            "{} {}{}",
             app.draft.allowed_roots.len(),
+            if app.language() == crate::i18n::Language::English {
+                if app.draft.allowed_roots.len() == 1 {
+                    "directory"
+                } else {
+                    "directories"
+                }
+            } else {
+                "directory"
+            },
             dirty_mark(app.draft.allowed_roots != app.persisted.allowed_roots)
         ),
         6 => app
             .profiles
             .get(app.profile)
-            .map_or("(nessuno)".into(), |p| p.root_label.clone()),
+            .map_or(Messages::none(lang).into(), |p| p.root_label.clone()),
         7 => app
             .profiles
             .get(app.profile)
             .and_then(|p| p.port)
-            .map_or("(non disponibile)".into(), |p| {
-                format!("porta {p}, solo con consenso")
+            .map_or(Messages::unavailable(lang).into(), |p| {
+                Messages::http_port_approval(lang, p)
             }),
         8 => {
             if app.busy {
-                "IN CORSO".into()
+                Messages::in_progress(lang).into()
             } else if app.dirty() {
-                "modifiche in sospeso".into()
+                Messages::pending_changes(lang).into()
             } else {
-                "valori attuali".into()
+                Messages::current_values(lang).into()
             }
         }
-        9 => "ripristina ultimo salvataggio".into(),
-        10 => app.auth_state.clone(),
+        9 => Messages::restore_last_save(lang).into(),
+        10 => match app.auth_state {
+            AuthState::NotVerified => Messages::not_verified(lang).into(),
+            AuthState::Ready => Messages::ready(lang).into(),
+            AuthState::Error => Messages::error(lang).into(),
+        },
         11 => format!(
             "{}{}",
-            on(app.draft.ngrok_enabled),
+            on(app.draft.ngrok_enabled, lang),
             dirty_mark(app.draft.ngrok_enabled != app.persisted.ngrok_enabled)
         ),
         12 => format!(
@@ -159,11 +182,23 @@ fn config_value(app: &App, index: usize) -> String {
             app.draft
                 .ngrok_domain
                 .as_deref()
-                .unwrap_or("(non impostato)"),
+                .unwrap_or(Messages::not_set(lang)),
             dirty_mark(app.draft.ngrok_domain != app.persisted.ngrok_domain)
         ),
-        13 => "scegli cartella sorgente".into(),
-        _ => format!("passo {}/4", app.step.min(3) + 1),
+        13 => Messages::choose_source_folder(lang).into(),
+        15 => match app.draft.language {
+            LanguageChoice::English => "English".into(),
+            crate::i18n::LanguageChoice::Italian => Messages::language_italian(lang).into(),
+            LanguageChoice::Auto => Messages::auto_language(
+                lang,
+                if app.system_language == crate::i18n::Language::Italian {
+                    "Italiano"
+                } else {
+                    "English"
+                },
+            ),
+        },
+        _ => Messages::setup_step(lang, app.step.min(3) + 1),
     }
 }
 fn selected_list(
@@ -188,51 +223,52 @@ fn selected_list(
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 fn service_lines(app: &App) -> Vec<Line<'static>> {
+    let lang = app.language();
     let browser = if !app.persisted.browser_enabled {
-        "Disattivato"
+        Messages::disabled_3(lang)
     } else if app.chrome_valid == Some(false) {
-        "Eseguibile non valido"
+        Messages::invalid_executable(lang)
     } else {
-        "Configurato · sessione non verificata"
+        Messages::configured_session_unverified(lang)
     };
     let tunnel = if app.tunnel_ready {
-        "Pronto"
+        Messages::ready(lang)
     } else if app.persisted.ngrok_enabled {
-        "Configurato · non connesso"
+        Messages::configured_not_connected(lang)
     } else {
-        "Non configurato"
+        Messages::not_configured(lang)
     };
     let next = match app.server {
-        ServerState::Running if app.tunnel_ready => "Seleziona «Mostra / copia URL ChatGPT»",
-        ServerState::Running => "MCP locale pronto · verifica il tunnel per ChatGPT",
-        ServerState::Starting => "Attendi la verifica del server MCP…",
-        _ => "Seleziona «Avvia MCP HTTP» per iniziare",
+        ServerState::Running if app.tunnel_ready => Messages::next_show_url(lang),
+        ServerState::Running => Messages::next_check_tunnel(lang),
+        ServerState::Starting => Messages::waiting_for_mcp_server_verification(lang),
+        _ => Messages::next_start_mcp(lang),
     };
     vec![
         Line::from(Span::styled(
-            format!("  ●  {}", state(app.server)),
+            format!("  ●  {}", state(app.server, lang)),
             Style::default()
                 .fg(state_color(app.server))
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Endpoint     ", Style::default().fg(MUTED)),
+            Span::styled(Messages::endpoint_label(lang), Style::default().fg(MUTED)),
             Span::raw(format!("127.0.0.1:{}/mcp", app.persisted.port)),
         ]),
         Line::from(vec![
-            Span::styled("  Browser      ", Style::default().fg(MUTED)),
+            Span::styled(Messages::browser_label(lang), Style::default().fg(MUTED)),
             Span::raw(browser),
         ]),
         Line::from(vec![
-            Span::styled("  Tunnel       ", Style::default().fg(MUTED)),
+            Span::styled(Messages::tunnel_label(lang), Style::default().fg(MUTED)),
             Span::styled(
                 tunnel,
                 Style::default().fg(if app.tunnel_ready { OK } else { MUTED }),
             ),
         ]),
         Line::from(Span::styled(
-            "  Il token MCP concede accesso anche ai comandi host.",
+            Messages::the_mcp_token_also_grants_access_to(lang),
             Style::default().fg(WARN),
         )),
         Line::from(Span::styled(
@@ -242,6 +278,7 @@ fn service_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lang = app.language();
     let wide = area.width >= 104 && area.height >= 14;
     let split = if wide {
         Layout::default()
@@ -264,7 +301,7 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(service_lines(app))
                 .wrap(Wrap { trim: true })
-                .block(panel("Panoramica dei servizi")),
+                .block(panel(Messages::main_page_header(lang))),
             sections[0],
         );
     }
@@ -277,30 +314,30 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .iter()
         .map(|&index| {
             let suffix = match index {
-                0 | 1 | 7 => state(app.server),
-                8 if app.tunnel_ready => "Tunnel disponibile",
-                8 => "Richiede tunnel",
-                3 | 4 if !app.persisted.vm_enabled => "VM disattivata",
-                5 if !app.persisted.browser_enabled => "Browser disattivato",
+                0 | 1 | 7 => state(app.server, lang),
+                8 if app.tunnel_ready => Messages::tunnel_available(lang),
+                8 => Messages::tunnel_required(lang),
+                3 | 4 if !app.persisted.vm_enabled => Messages::vm_disabled(lang),
+                5 if !app.persisted.browser_enabled => Messages::browser_disabled(lang),
                 _ => "",
             };
             ListItem::new(Line::from(vec![
-                Span::raw(format!("  {}  ", COMMANDS[index].0)),
-                Span::styled(suffix.to_string(), Style::default().fg(MUTED)),
+                Span::raw(format!("  {}  ", command_label(index, lang))),
+                Span::styled(suffix, Style::default().fg(MUTED)),
             ]))
         })
         .collect();
     let title = if app.show_advanced {
-        "Azioni · a: nascondi avanzate"
+        Messages::actions_hide_advanced(lang)
     } else {
-        "Azioni · a: mostra avanzate"
+        Messages::actions_a_show_advanced(lang)
     };
     selected_list(frame, sections[1], title, items, current);
     if wide && split[1].width >= 14 {
         let recent = app.logs.iter().rev().take(5).collect::<Vec<_>>();
         let mut lines = vec![
             Line::from(Span::styled(
-                " ULTIMA ATTIVITÀ",
+                Messages::recent_activity(lang),
                 Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -316,20 +353,25 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!(
                     "  {}  {}",
                     event.time.split_whitespace().next().unwrap_or(""),
-                    event.message
+                    if app.language() == crate::i18n::Language::English {
+                        &event.english
+                    } else {
+                        &event.message
+                    }
                 ),
                 Style::default().fg(color),
             )));
             lines.push(Line::from(""));
         }
         lines.push(Line::from(Span::styled(
-            "Per tutti gli eventi, apri Attività.",
+            Messages::for_all_events_open_activity(lang),
             Style::default().fg(MUTED),
         )));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), split[1]);
     }
 }
 fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lang = app.language();
     let height = if area.height > 12 { 6 } else { 4 };
     let sections = Layout::default()
         .direction(Direction::Vertical)
@@ -337,23 +379,23 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
     let summary = [
         Line::from(Span::styled(
-            " STATO MCP E COMPONENTI",
+            Messages::mcp_and_component_status(lang),
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!(
-            " MCP: {}    Porta: {}    ngrok: {}",
-            state(app.server),
+        Line::from(Messages::status_summary(
+            lang,
+            state(app.server, lang),
             app.persisted.port,
             if app.tunnel_ready {
-                "pronto"
+                Messages::ready(lang)
             } else {
-                "non verificato"
-            }
+                Messages::not_verified(lang)
+            },
         )),
-        Line::from(format!(
-            " Chrome: {}    VM: {}",
+        Line::from(Messages::component_summary(
+            lang,
             if app.persisted.browser_enabled {
-                "configurato (non verificato)"
+                Messages::configured_unverified(lang)
             } else {
                 "off"
             },
@@ -361,13 +403,13 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 "on"
             } else {
                 "off"
-            }
+            },
         )),
         Line::from(format!(" Workspace: {}", friendly_root(&app.root))),
         Line::from(if app.restart_needed() {
-            " Configurazione salvata: riavvio MCP necessario"
+            Messages::settings_saved_mcp_restart_required(lang)
         } else {
-            " Configurazione: nessun riavvio richiesto"
+            Messages::settings_no_restart_required(lang)
         }),
     ];
     frame.render_widget(
@@ -395,35 +437,37 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     format!("{label}  "),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(entry.message.clone()),
+                Span::raw(if app.language() == crate::i18n::Language::English {
+                    &entry.english
+                } else {
+                    &entry.message
+                }),
             ]))
         })
         .collect::<Vec<_>>();
-    let caption = format!(
-        "Eventi · {} di {} · ↑↓ PgUp/PgDn per scorrere",
-        end,
-        app.logs.len()
-    );
+    let caption = Messages::event_count(lang, end, app.logs.len());
     frame.render_widget(List::new(items).block(panel(&caption)), sections[1]);
 }
-fn config_help(index: usize) -> &'static str {
+fn config_help(index: usize, lang: Language) -> &'static str {
     match index {
-        0 => "Porta sulla quale NovaGPT espone MCP localmente.",
-        1 => "Abilita le funzioni VM opzionali. Richiede un riavvio del server.",
-        2 => "Prepara il browser dedicato NovaGPT. Non verifica l'accesso a ChatGPT.",
-        3 => "Lascia vuoto per rilevare Chrome automaticamente.",
-        4 | 5 => "Aggiungi o revoca altre directory di lavoro autorizzate.",
-        6 | 7 => "Importa solo impostazioni di connessione, dopo anteprima e consenso.",
-        8 => "Salva le modifiche locali. Alcune impostazioni richiedono riavvio MCP.",
-        9 => "Scarta tutte le modifiche non ancora salvate.",
-        10 => "Verifica o genera il token HTTP senza mostrarlo sullo schermo.",
-        11 => "Avvia ngrok assieme al server MCP quando la preferenza è attiva.",
-        12 => "Hostname ngrok opzionale. Non inserire URL completi o credenziali.",
-        13 => "Importa la configurazione pubblica di un altro workspace NovaGPT.",
-        _ => "Procedi al passo successivo del setup guidato.",
+        0 => Messages::port_on_which_novagpt_exposes_mcp_locally(lang),
+        1 => Messages::enable_optional_vm_features_requires_a_server(lang),
+        2 => Messages::prepare_novagpt_s_dedicated_browser_chatgpt_login(lang),
+        3 => Messages::leave_blank_to_detect_chrome_automatically(lang),
+        4 | 5 => Messages::authorized_directories_help(lang),
+        6 | 7 => Messages::import_connection_help(lang),
+        8 => Messages::save_local_changes_some_settings_require_restarting(lang),
+        9 => Messages::discard_all_unsaved_changes(lang),
+        10 => Messages::verify_or_generate_the_http_token_without(lang),
+        11 => Messages::start_ngrok_with_mcp_when_this_setting(lang),
+        12 => Messages::optional_ngrok_hostname_do_not_enter_complete(lang),
+        13 => Messages::import_novagpt_help(lang),
+        15 => Messages::choose_english_italian_or_automatic_system_language(lang),
+        _ => Messages::next_setup_help(lang),
     }
 }
 fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lang = app.language();
     let top_h = if app.setup {
         if area.height >= 16 { 4 } else { 2 }
     } else {
@@ -435,11 +479,11 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
     if app.setup && top_h > 0 {
         let prompt = match app.step {
-            0 => "SETUP 1/4 · Workspace · n: avanti",
-            1 => "SETUP 2/4 · Parametri · Enter: modifica",
-            2 => "SETUP 3/4 · Importazione facoltativa · n: avanti",
-            3 => "SETUP 4/4 · Conferma e salva",
-            _ => "SETUP COMPLETATO",
+            0 => Messages::setup_workspace(lang),
+            1 => Messages::setup_2_4_settings_enter_edit(lang),
+            2 => Messages::setup_optional_import(lang),
+            3 => Messages::setup_4_4_confirm_and_save(lang),
+            _ => Messages::setup_complete(lang),
         };
         frame.render_widget(
             Paragraph::new(prompt).style(Style::default().fg(ACCENT)),
@@ -463,13 +507,14 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut section = "";
     for &i in app.config_order() {
         let group = match i {
-            0 | 11 | 12 | 10 => "CONNESSIONE",
-            2 | 3 => "BROWSER",
-            1 => "MACCHINE VIRTUALI",
-            4 | 5 => "DIRECTORY AUTORIZZATE",
-            6 | 7 | 13 => "IMPORTAZIONE",
-            8 | 9 => "APPLICA MODIFICHE",
-            _ => "SETUP GUIDATO",
+            15 => Messages::settings_general(lang),
+            0 | 11 | 12 | 10 => Messages::settings_connection(lang),
+            2 | 3 => Messages::settings_browser_heading(lang),
+            1 => Messages::virtual_machines(lang),
+            4 | 5 => Messages::authorized_directories(lang),
+            6 | 7 | 13 => Messages::import(lang),
+            8 | 9 => Messages::apply_changes(lang),
+            _ => Messages::guided_setup(lang),
         };
         if section != group {
             if !rows.is_empty() {
@@ -494,7 +539,7 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
             (available / 2).clamp(12, 30)
         };
         let value_width = available.saturating_sub(label_width + 2);
-        let label = clip_label(CONFIG_ITEMS[i], label_width);
+        let label = clip_label(config_label(i, lang), label_width);
         let label = format!("  {label:<label_width$}  ");
         rows.push(ListItem::new(Line::from(vec![
             Span::styled(
@@ -510,15 +555,15 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
     selected_list(
         frame,
         split[0],
-        "Impostazioni · ↑↓ seleziona  Enter modifica",
+        Messages::settings_select_enter_edit(lang),
         rows,
         selected_row,
     );
     if wide && split[1].width > 12 {
         let status = if app.dirty() {
-            "● Modifiche da salvare"
+            Messages::unsaved_changes_2(lang)
         } else {
-            "✓ Configurazione salvata"
+            Messages::settings_saved_2(lang)
         };
         let status_color = if app.dirty() { WARN } else { OK };
         let lines = vec![
@@ -530,24 +575,27 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "CAMPO SELEZIONATO",
+                Messages::selected_field(lang),
                 Style::default().fg(MUTED),
             )),
             Line::from(Span::styled(
-                CONFIG_ITEMS[app.config],
+                config_label(app.config, lang),
                 Style::default().fg(ACCENT),
             )),
             Line::from(""),
-            Line::from(config_help(app.config)),
+            Line::from(config_help(app.config, lang)),
             Line::from(""),
-            Line::from(Span::styled("SCORCIATOIE", Style::default().fg(MUTED))),
-            Line::from("Enter  Modifica o esegui"),
-            Line::from("s      Salva modifiche"),
+            Line::from(Span::styled(
+                Messages::shortcuts(lang),
+                Style::default().fg(MUTED),
+            )),
+            Line::from(Messages::enter_edit_or_run(lang)),
+            Line::from(Messages::s_save_changes(lang)),
             Line::from(""),
             Line::from(if app.restart_needed() {
-                "Riavvio MCP necessario per applicare la configurazione."
+                Messages::mcp_restart_required_to_apply_settings(lang)
             } else {
-                "Le modifiche salvate saranno usate al prossimo avvio."
+                Messages::saved_changes_will_apply_at_the_next(lang)
             }),
         ];
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), split[1]);
@@ -569,62 +617,145 @@ fn centered(area: Rect, percent_w: u16, h: u16) -> Rect {
     }
 }
 fn modal(frame: &mut Frame<'_>, app: &App) {
-    let Some(modal) = &app.modal else {
-        return;
-    };
+    let lang = app.language();
+    let Some(modal) = &app.modal else { return };
     let area = frame.area();
     if area.width < 3 || area.height < 3 {
         return;
     }
     let (title, body, footer): (String, String, String) = match modal {
-        Modal::Help => ("Aiuto rapido".into(),
-            "Tab / Shift+Tab: Panoramica, Attività, Impostazioni\n↑ ↓: seleziona o scorri i log\nEnter: esegui, modifica o conferma\na: mostra/nascondi azioni avanzate in Panoramica\ns: salva da Impostazioni\nEsc: chiudi/indietro   q: esci\n?: aiuto   Ctrl+C: uscita controllata\nAttività: PgUp/PgDn, Home/End scorrono gli eventi\nImpostazioni: * indica un valore modificato\nSetup: n avanti, b indietro\nScorciatoie 1–4: operazioni rapide.".into(),
-            "Esc / Enter per chiudere".into()),
-        Modal::Notice {title, body} => (title.clone(), body.clone(), "Esc / Enter per chiudere".into()),
-        Modal::ConnectorUrl(url) => (
-            "URL ChatGPT (riservato)".into(),
-            format!("In ChatGPT scegli No authentication e incolla questo URL:\n\n{url}\n\nAttenzione: l'URL contiene una credenziale che permette anche di eseguire comandi host tramite MCP. Non condividerlo."),
-            "C = copia adesso negli appunti • Enter / Esc = chiudi (nessuna copia automatica)".into(),
+        Modal::Help => (
+            Messages::quick_help(lang).into(),
+            Messages::help_body(lang).into(),
+            Messages::esc_enter_to_close(lang).into(),
         ),
-        Modal::SetupResult(message) => ("Setup terminato".into(), message.clone(), "Invio / Esc per chiudere".into()),
+        Modal::Notice { title, body } => (
+            title.clone(),
+            body.clone(),
+            Messages::esc_enter_to_close(lang).into(),
+        ),
+        Modal::ConnectorUrl(url) => (
+            Messages::chatgpt_url_private(lang).into(),
+            format!(
+                "{}\n\n{url}\n\n{}",
+                Messages::in_chatgpt_choose_no_authentication_and_paste(lang),
+                Messages::warn_credential_url(lang)
+            ),
+            Messages::c_copy_to_clipboard_enter_esc_close(lang).into(),
+        ),
+        Modal::SetupResult(message) => (
+            Messages::setup_complete_2(lang).into(),
+            message.clone(),
+            Messages::enter_esc_to_close(lang).into(),
+        ),
         Modal::Edit(field) => {
-            let title = match field { Field::Port => "Modifica porta HTTP", Field::Chrome => "Percorso Chrome", Field::Root => "Aggiungi directory autorizzata", Field::NgrokDomain => "Dominio ngrok (hostname)", Field::NovaSource => "Percorso workspace NovaGPT sorgente" };
-            let error = app.input_error.clone().unwrap_or_default();
-            (title.into(), format!("Inserisci il valore e premi Invio:\n\n{}▏\n\n{}", app.input, error),
-                "Invio applica • Esc annulla".into())
+            let title = match field {
+                Field::Port => Messages::edit_http_port(lang),
+                Field::Chrome => Messages::chrome_path(lang),
+                Field::Root => Messages::add_authorized_directory(lang),
+                Field::NgrokDomain => Messages::ngrok_domain_hostname(lang),
+                Field::NovaSource => Messages::edit_novagpt_source_path(lang),
+            };
+            (
+                title.into(),
+                format!(
+                    "{}\n\n{}▏\n\n{}",
+                    Messages::edit_input_prompt(lang),
+                    app.input,
+                    app.input_error.as_deref().unwrap_or("")
+                ),
+                Messages::enter_apply_esc_cancel(lang).into(),
+            )
         }
-        Modal::Roots => ("Rimuovi directory".into(),
-            app.draft.allowed_roots.iter().enumerate().map(|(i, p)|
-                format!("{} {}", if i == app.root_selection { "›" } else { " " }, p.display())
-            ).collect::<Vec<_>>().join("\n"),
-            "↑↓ seleziona • Invio conferma • Esc annulla".into()),
+        Modal::Roots => (
+            Messages::remove_directory(lang).into(),
+            app.draft
+                .allowed_roots
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    format!(
+                        "{} {}",
+                        if i == app.root_selection { "›" } else { " " },
+                        p.display()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Messages::select_enter_confirm_esc_cancel(lang).into(),
+        ),
         Modal::ImportPreview => {
             let selected = app.profiles.get(app.profile);
-            ("Anteprima importazione".into(), selected.map_or("Nessun profilo.".into(), |p|
-                format!("Sorgente: {}\nProfilo {}\nWorkspace profilo: {}\nPorta HTTP: {} -> {}\nTunnel sorgente: {}\nDominio ngrok importabile: {}\n\nImporta nella bozza solo porta, tunnel ngrok e hostname valido. Non importa token, file ngrokConfig, root, dati VM o browser.\nNessuna modifica finche' non confermi e salvi.",
-                    p.origin.display(), p.source, p.root_label, app.draft.port, p.port.map_or_else(|| "non disponibile".to_string(), |port| port.to_string()),
-                    p.tunnel.as_deref().unwrap_or("(assente)"), p.ngrok_domain.as_deref().unwrap_or("(non disponibile)"))),
-            "Invio prosegui alla conferma • Esc annulla".into())
+            let body = selected.map_or_else(
+                || Messages::no_profiles_available(lang).to_owned(),
+                |p| {
+                    format!(
+                        "{} {}\n{} {}\n{} {}\n{} {} -> {}\n{} {}\n{} {}\n\n{}\n{}",
+                        Messages::source(lang),
+                        p.origin.display(),
+                        Messages::profile(lang),
+                        p.source,
+                        Messages::profile_workspace(lang),
+                        p.root_label,
+                        Messages::connector_http_port(lang),
+                        app.draft.port,
+                        p.port.map_or_else(
+                            || Messages::unavailable_2(lang).to_owned(),
+                            |port| port.to_string()
+                        ),
+                        Messages::source_tunnel(lang),
+                        p.tunnel.as_deref().unwrap_or("—"),
+                        Messages::importable_ngrok_hostname(lang),
+                        p.ngrok_domain.as_deref().unwrap_or("—"),
+                        Messages::only_port_ngrok_tunnel_and_valid_hostname(lang),
+                        Messages::no_changes_until_you_confirm_and_save(lang),
+                    )
+                },
+            );
+            (
+                Messages::import_preview(lang).into(),
+                body,
+                Messages::enter_to_confirm_esc_cancel(lang).into(),
+            )
         }
         Modal::Confirm(action) => {
             let message = match action {
-                Confirm::Save => if app.setup {
-                    "Salvare la configurazione NovaGPT e installare il launcher locale? Nessun file esistente sara' sovrascritto."
-                } else { "Salvare la configurazione in .novagpt/config.json?" },
-                Confirm::Import => "Importare nella bozza porta HTTP e preferenze ngrok supportate? I token non saranno importati.",
-                Confirm::RemoveRoot => "Revocare questa directory autorizzata dalla bozza?",
-                Confirm::Discard => "Annullare tutte le modifiche non salvate?",
-                Confirm::Stop => "Interrompere il server HTTP avviato da questa TUI?",
-                Confirm::Quit => "Uscire perdendo le modifiche non salvate?",
+                Confirm::Save if app.setup => {
+                    Messages::save_novagpt_settings_and_install_the_local(lang)
+                }
+                Confirm::Save => Messages::save_settings_in_novagpt_config_json(lang),
+                Confirm::Import => Messages::confirm_import_port(lang),
+                Confirm::RemoveRoot => {
+                    Messages::revoke_this_authorized_directory_from_the_draft(lang)
+                }
+                Confirm::Discard => Messages::discard_all_unsaved_changes_2(lang),
+                Confirm::Stop => Messages::stop_the_http_server_started_by_this(lang),
+                Confirm::Quit => Messages::quit_and_lose_unsaved_changes(lang),
             };
-            ("Conferma richiesta".into(), message.into(),
-                format!("  {}    {}  • ← → seleziona  Enter conferma  Esc annulla",
-                    if app.yes { "[ SI ]" } else { "  SI  " },
-                    if app.yes { "  NO  " } else { "[ NO ]" }))
+            let choices = format!(
+                "  {}    {}  • {}",
+                if app.yes {
+                    Messages::edit_confirm_yes(lang)
+                } else if lang == Language::English {
+                    "  YES  "
+                } else {
+                    "  SI  "
+                },
+                if app.yes {
+                    "  NO  "
+                } else {
+                    Messages::edit_confirm_no(lang)
+                },
+                Messages::modal_confirm_short(lang)
+            );
+            (
+                Messages::confirmation_required(lang).into(),
+                message.into(),
+                choices,
+            )
         }
     };
-    // Account for wrapped lines, especially long connector URLs and help text.
-    // Never draw beyond the terminal or expose the URL outside its modal.
+    // Wrap only the already localized text. Dynamic URLs and file paths stay byte-identical.
     let width_percent: u16 = if area.width >= 100 {
         65
     } else if area.width >= 70 {
@@ -643,9 +774,9 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
     let rect = centered(area, width_percent, height);
     let footer = if rect.width < 70 {
         match modal {
-            Modal::ConnectorUrl(_) => "C copia · Esc chiudi".to_string(),
-            Modal::Confirm(_) => "←→ scegli · Enter conferma · Esc annulla".to_string(),
-            Modal::Edit(_) => "Enter applica · Esc annulla".to_string(),
+            Modal::ConnectorUrl(_) => Messages::c_copy_esc_close(lang).to_owned(),
+            Modal::Confirm(_) => Messages::modal_confirm_short(lang).to_owned(),
+            Modal::Edit(_) => Messages::enter_apply_esc_cancel_2(lang).to_owned(),
             _ => footer,
         }
     } else {
@@ -656,25 +787,27 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(rect);
-    let text = Paragraph::new(body).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
-            .title(format!(" {title} ")),
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT))
+                .title(format!(" {title} ")),
+        ),
+        chunks[0],
     );
-    frame.render_widget(text, chunks[0]);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(WARN)),
         chunks[1],
     );
 }
 pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
+    let lang = app.language();
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
     if area.width < 28 || area.height < 10 {
         frame.render_widget(
-            Paragraph::new("NovaGPT · amplia il terminale\nCtrl+C per uscire")
-                .style(Style::default().fg(WARN)),
+            Paragraph::new(Messages::terminal_too_small(lang)).style(Style::default().fg(WARN)),
             area,
         );
         return;
@@ -696,10 +829,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         ])
         .split(inner);
     frame.render_widget(Paragraph::new(title_line(app, inner.width)), slots[0]);
-    let tabs = Tabs::new([" Panoramica ", " Attività ", " Impostazioni "])
-        .select(app.tab)
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-        .divider("  │  ");
+    let tabs = Tabs::new([
+        Messages::tab_overview(lang),
+        Messages::tab_activity(lang),
+        Messages::tab_settings(lang),
+    ])
+    .select(app.tab)
+    .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+    .divider("  │  ");
     frame.render_widget(tabs, slots[1]);
     match app.tab {
         0 => commands(frame, app, slots[2]),
@@ -707,12 +844,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         _ => config(frame, app, slots[2]),
     }
     let keys = if app.modal.is_some() {
-        "Enter conferma · Esc annulla"
+        Messages::enter_confirm_esc_cancel(lang)
     } else {
         match app.tab {
-            0 => "↑↓ azioni   Enter esegui   a avanzate   Tab schede   ? aiuto   q esci",
-            1 => "↑↓ / PgUp PgDn eventi   Tab schede   ? aiuto   q esci",
-            _ => "↑↓ campi   Enter modifica   s salva   Tab schede   ? aiuto   q esci",
+            0 => Messages::keys_overview(lang),
+            1 => Messages::keys_activity(lang),
+            _ => Messages::fields_enter_edit_s_save_tab_views(lang),
         }
     };
     let foot = vec![
