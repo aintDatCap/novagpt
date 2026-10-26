@@ -161,7 +161,7 @@ fn read_token(file: &Path) -> io::Result<String> {
     Ok(text)
 }
 /// Internal target helper allows deterministic tests without writing to the real user profile.
-fn ensure_at(file: &Path) -> io::Result<Resolved> {
+fn ensure_token_directory(file: &Path) -> io::Result<()> {
     let dir = file
         .parent()
         .ok_or_else(|| invalid("missing token parent directory"))?;
@@ -174,7 +174,76 @@ fn ensure_at(file: &Path) -> io::Result<Resolved> {
         .ok_or_else(|| invalid("missing user state directory"))?;
     fs::create_dir_all(state_base)?;
     private_directory(app_dir)?;
-    private_directory(dir)?;
+    private_directory(dir)
+}
+
+/// Persist a caller-selected token in private per-workspace state, never in
+/// config.json. A new random temporary file is synced before atomic rename;
+/// failed replacements leave the previous token untouched.
+fn set_at(file: &Path, value: &str, replace: bool) -> io::Result<()> {
+    validate_saved(value)?;
+    ensure_token_directory(file)?;
+
+    match fs::symlink_metadata(file) {
+        Ok(_) => {
+            private_file(file)?;
+            if !replace {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "workspace token already exists; use --replace to overwrite it",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let dir = file
+        .parent()
+        .ok_or_else(|| invalid("missing token parent directory"))?;
+    let temporary = dir.join(format!(".{}.tmp", Uuid::new_v4().simple()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let outcome = (|| -> io::Result<()> {
+        let mut handle = options.open(&temporary)?;
+        handle.write_all(value.as_bytes())?;
+        handle.sync_all()?;
+        drop(handle);
+        // Recheck target type before replacing: never follow a symlink.
+        match fs::symlink_metadata(file) {
+            Ok(_) => {
+                private_file(file)?;
+                if !replace {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "workspace token created concurrently; use --replace",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(&temporary, file)
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    outcome
+}
+
+/// Set a chosen token for one canonical workspace. Does not consult or alter
+/// NOVAGPT_HTTP_TOKEN, which continues to override persisted credentials.
+pub fn set(root: &Path, value: &str, replace: bool) -> io::Result<()> {
+    set_at(&path(root)?, value, replace)
+}
+
+fn ensure_at(file: &Path) -> io::Result<Resolved> {
+    ensure_token_directory(file)?;
     let generated = generate();
     let create = {
         let mut options = OpenOptions::new();
@@ -232,6 +301,81 @@ fn ensure_at(file: &Path) -> io::Result<Resolved> {
         Err(error) => Err(error),
     }
 }
+/// Read one token from a pipe without echoing it or passing it in argv.
+/// Only an optional final CRLF/LF is removed; extra lines are rejected.
+fn parse_piped_token(input: &str) -> io::Result<&str> {
+    let value = input
+        .strip_suffix("\r\n")
+        .or_else(|| input.strip_suffix('\n'))
+        .unwrap_or(input);
+    validate_saved(value)?;
+    Ok(value)
+}
+
+pub fn read_from_stdin() -> io::Result<String> {
+    use std::io::IsTerminal;
+    if io::stdin().is_terminal() {
+        return Err(invalid("--stdin needs a pipe, not an interactive terminal"));
+    }
+    let mut data = String::new();
+    io::stdin().take(FILE_BYTES + 3).read_to_string(&mut data)?;
+    Ok(parse_piped_token(&data)?.to_owned())
+}
+
+/// Read a secret using Crossterm raw terminal mode, never echoing the value.
+/// Raw mode is restored on return/error/cancellation.
+pub fn prompt_secret() -> io::Result<String> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        terminal::enable_raw_mode,
+    };
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(invalid(
+            "interactive token entry needs a terminal; use token set --stdin for pipes",
+        ));
+    }
+    eprint!("Inserisci il token (64 caratteri esadecimali, input nascosto): ");
+    io::stderr().flush()?;
+    enable_raw_mode()?;
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+    let guard = RawModeGuard;
+    let mut secret = String::new();
+    let result = loop {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => break parse_piped_token(&secret).map(str::to_owned),
+                KeyCode::Esc => break Err(invalid("token entry cancelled")),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err(invalid("token entry cancelled"));
+                }
+                KeyCode::Backspace => {
+                    secret.pop();
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && secret.len() < FILE_BYTES as usize =>
+                {
+                    secret.push(ch);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    };
+    drop(guard);
+    eprintln!();
+    // Do not print the submitted token even on validation failure.
+    result
+}
+
 pub fn resolve(root: &Path) -> io::Result<Resolved> {
     if let Some(value) = env::var_os("NOVAGPT_HTTP_TOKEN") {
         let value = value
@@ -285,6 +429,72 @@ mod tests {
                 0o700
             );
         }
+    }
+    #[test]
+    fn chosen_token_persists_and_requires_explicit_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp
+            .path()
+            .join("NovaGPT")
+            .join("tokens")
+            .join("chosen.token");
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        set_at(&file, &first, false).unwrap();
+        assert_eq!(read_token(&file).unwrap(), first);
+        assert_eq!(
+            set_at(&file, &second, false).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(read_token(&file).unwrap(), first);
+        set_at(&file, &second, true).unwrap();
+        assert_eq!(read_token(&file).unwrap(), second);
+        assert_eq!(
+            fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1,
+            "no temporary token file should remain"
+        );
+    }
+    #[test]
+    fn invalid_custom_token_does_not_create_or_replace_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp
+            .path()
+            .join("NovaGPT")
+            .join("tokens")
+            .join("chosen.token");
+        for value in ["short", "z", "a\\nb"] {
+            assert!(set_at(&file, value, true).is_err());
+            assert!(!file.exists());
+        }
+        let original = "e".repeat(64);
+        set_at(&file, &original, false).unwrap();
+        assert!(set_at(&file, &"Z".repeat(64), true).is_err());
+        assert_eq!(read_token(&file).unwrap(), original);
+    }
+    #[test]
+    fn piped_secret_parsing_accepts_one_line_and_rejects_extra_input() {
+        let secret = "c".repeat(64);
+        assert_eq!(parse_piped_token(&format!("{secret}\r\n")).unwrap(), secret);
+        assert_eq!(parse_piped_token(&format!("{secret}\n")).unwrap(), secret);
+        assert_eq!(parse_piped_token(&secret).unwrap(), secret);
+        assert!(parse_piped_token(&format!("{secret}\nextra")).is_err());
+        assert!(parse_piped_token(&format!("{secret}\n\n")).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn custom_token_refuses_symlink_overwrite() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("NovaGPT").join("tokens");
+        fs::create_dir(temp.path().join("NovaGPT")).unwrap();
+        fs::create_dir(&dir).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "unchanged").unwrap();
+        let file = dir.join("chosen.token");
+        symlink(&outside, &file).unwrap();
+        assert!(set_at(&file, &"f".repeat(64), true).is_err());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "unchanged");
     }
     #[test]
     fn malformed_file_is_not_silently_replaced() {

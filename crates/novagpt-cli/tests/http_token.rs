@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::Path,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 fn with_private_state(command: &mut Command, home: &Path) {
@@ -17,6 +18,111 @@ fn run(root: &Path, home: &Path, action: &str) -> Output {
     command.env_remove("NOVAGPT_HTTP_TOKEN");
     with_private_state(&mut command, home);
     command.output().expect("run CLI")
+}
+
+fn set_by_pipe(root: &Path, home: &Path, value: &str, replace: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_novagpt"));
+    command
+        .arg("--root")
+        .arg(root)
+        .args(["token", "set", "--stdin"])
+        .env_remove("NOVAGPT_HTTP_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if replace {
+        command.arg("--replace");
+    }
+    with_private_state(&mut command, home);
+    let mut child = command.spawn().expect("spawn secret input");
+    child
+        .stdin
+        .take()
+        .expect("secret input pipe")
+        .write_all(value.as_bytes())
+        .expect("send fixture token");
+    child.wait_with_output().expect("finish token set")
+}
+
+#[test]
+fn chosen_secret_is_workspace_scoped_persistent_and_never_echoed() {
+    let root = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let first = "a".repeat(64);
+    let replacement = "b".repeat(64);
+    let written = set_by_pipe(root.path(), private.path(), &first, false);
+    assert!(
+        written.status.success(),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&written.stdout).contains(&first));
+    assert!(!String::from_utf8_lossy(&written.stderr).contains(&first));
+    assert_eq!(
+        String::from_utf8(run(root.path(), private.path(), "show").stdout)
+            .unwrap()
+            .trim(),
+        first
+    );
+    let other_token = run(other.path(), private.path(), "show");
+    assert!(other_token.status.success());
+    assert_ne!(String::from_utf8(other_token.stdout).unwrap().trim(), first);
+
+    let denied = set_by_pipe(root.path(), private.path(), &replacement, false);
+    assert!(
+        !denied.status.success(),
+        "replacing should require --replace"
+    );
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains(&replacement));
+    assert_eq!(
+        String::from_utf8(run(root.path(), private.path(), "show").stdout)
+            .unwrap()
+            .trim(),
+        first
+    );
+    let changed = set_by_pipe(root.path(), private.path(), &replacement, true);
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&changed.stdout).contains(&replacement));
+    assert_eq!(
+        String::from_utf8(run(root.path(), private.path(), "show").stdout)
+            .unwrap()
+            .trim(),
+        replacement
+    );
+    assert!(!root.path().join(".novagpt").exists());
+}
+
+#[test]
+fn malformed_piped_secret_never_replaces_saved_value() {
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let first = "d".repeat(64);
+    assert!(
+        set_by_pipe(root.path(), private.path(), &first, false)
+            .status
+            .success()
+    );
+    for invalid in ["short".to_string(), "z".repeat(64)] {
+        let output = set_by_pipe(root.path(), private.path(), &invalid, true);
+        assert!(!output.status.success());
+    }
+    let multiline = format!("{}\nextra\n", "a".repeat(64));
+    assert!(
+        !set_by_pipe(root.path(), private.path(), &multiline, true)
+            .status
+            .success()
+    );
+    assert_eq!(
+        String::from_utf8(run(root.path(), private.path(), "show").stdout)
+            .unwrap()
+            .trim(),
+        first
+    );
 }
 
 struct ProcessGuard(std::process::Child);
@@ -52,6 +158,53 @@ fn response_status(port: u16, token: Option<&str>) -> String {
         .unwrap_or("")
         .to_string()
 }
+#[test]
+fn manually_set_secret_authenticates_real_http_server() {
+    use std::{
+        net::{TcpListener, TcpStream},
+        thread,
+        time::Duration,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let chosen = "b".repeat(64);
+    assert!(
+        set_by_pipe(root.path(), private.path(), &chosen, false)
+            .status
+            .success()
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_novagpt"));
+    cmd.arg("--root")
+        .arg(root.path())
+        .arg("http")
+        .arg("--port")
+        .arg(port.to_string())
+        .env_remove("NOVAGPT_HTTP_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    with_private_state(&mut cmd, private.path());
+    let mut child = ProcessGuard(cmd.spawn().expect("start real MCP HTTP process"));
+    let mut ready = false;
+    for _ in 0..150 {
+        if let Some(exit) = child.0.try_wait().unwrap() {
+            panic!("MCP server exited during startup: {exit}");
+        }
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(ready, "HTTP server did not start");
+    assert!(response_status(port, None).contains("401"));
+    assert!(response_status(port, Some(&"a".repeat(64))).contains("401"));
+    assert!(!response_status(port, Some(&chosen)).contains("401"));
+}
+
 #[test]
 fn generated_secret_is_accepted_by_real_http_server() {
     use std::{

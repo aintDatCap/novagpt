@@ -1,4 +1,5 @@
 //! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
+mod chrome;
 mod connection;
 mod logging;
 mod settings;
@@ -44,7 +45,7 @@ struct Cli {
     /// Explicit NovaGPT VM storage path; overrides local settings.
     #[arg(long)]
     vm_home: Option<PathBuf>,
-    /// Dedicated Chrome executable; overrides local settings.
+    /// Dedicated Chrome executable; otherwise detect Google Chrome automatically.
     #[arg(long)]
     chatgpt_chrome: Option<PathBuf>,
     /// Dedicated browser profile path; never reuse a personal or CodexPro profile.
@@ -150,6 +151,15 @@ enum TokenCommand {
     Show,
     /// Print the local token-file path without revealing the token.
     Path,
+    /// Persist a chosen per-workspace token without putting it in the command line.
+    Set {
+        /// Intentionally replace an already stored workspace token.
+        #[arg(long)]
+        replace: bool,
+        /// Read the secret from piped standard input instead of a hidden terminal prompt.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +214,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match action {
             TokenCommand::Show => println!("{}", token::resolve(&root)?.value),
             TokenCommand::Path => println!("{}", token::path(&root)?.display()),
+            TokenCommand::Set { replace, stdin } => {
+                let value = if *stdin {
+                    token::read_from_stdin()?
+                } else {
+                    token::prompt_secret()?
+                };
+                token::set(&root, &value, *replace)?;
+                println!(
+                    "Token salvato per il workspace (valore nascosto). Riavvia HTTP per applicarlo."
+                );
+                if std::env::var_os("NOVAGPT_HTTP_TOKEN").is_some() {
+                    eprintln!("Attenzione: NOVAGPT_HTTP_TOKEN ha precedenza sul token salvato.");
+                }
+            }
         }
         return Ok(());
     }
@@ -331,11 +355,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let vm = vm_home.map(VmManager::new).transpose()?;
     let browser_enabled = local.browser_enabled;
-    let chrome = cli.chatgpt_chrome.or(if browser_enabled {
-        local.chrome_executable
+    let requested_browser = browser_enabled || cli.chatgpt_chrome.is_some();
+    let configured_chrome = cli
+        .chatgpt_chrome
+        .or_else(|| std::env::var_os("NOVAGPT_CHROME_PATH").map(PathBuf::from))
+        .or(local.chrome_executable);
+    let chrome = if requested_browser {
+        Some(chrome::discover(configured_chrome.as_deref())?)
     } else {
         None
-    });
+    };
     let profile = cli
         .chatgpt_profile
         .or_else(|| browser_enabled.then(|| settings::local_dir(&root).join("browser")));

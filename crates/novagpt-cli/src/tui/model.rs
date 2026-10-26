@@ -196,7 +196,9 @@ impl App {
             modal: None,
             input: String::new(),
             input_error: None,
-            chrome_valid: Some(settings.chrome_executable.is_some()),
+            chrome_valid: Some(
+                crate::chrome::discover(settings.chrome_executable.as_deref()).is_ok(),
+            ),
             auth_state: "Non verificato".to_string(),
             yes: false,
             busy: false,
@@ -507,7 +509,7 @@ impl App {
                 }
                 let path = (!value.is_empty()).then(|| PathBuf::from(value));
                 self.draft.chrome_executable = path.clone();
-                self.chrome_valid = if path.is_some() { None } else { Some(false) };
+                self.chrome_valid = Some(crate::chrome::discover(path.as_deref()).is_ok());
                 self.modal = None;
                 self.input.clear();
                 return path.map(Effect::ValidateChrome);
@@ -565,6 +567,8 @@ impl App {
             }
             2 => {
                 self.draft.browser_enabled = !self.draft.browser_enabled;
+                self.chrome_valid =
+                    Some(crate::chrome::discover(self.draft.chrome_executable.as_deref()).is_ok());
                 self.log(Level::Info, "Opzione browser modificata.");
             }
             3 => self.start_edit(Field::Chrome),
@@ -668,7 +672,8 @@ impl App {
             }
             Confirm::Discard => {
                 self.draft = self.persisted.clone();
-                self.chrome_valid = Some(self.draft.chrome_executable.is_some());
+                self.chrome_valid =
+                    Some(crate::chrome::discover(self.draft.chrome_executable.as_deref()).is_ok());
                 self.log(Level::Info, "Modifiche annullate.");
                 None
             }

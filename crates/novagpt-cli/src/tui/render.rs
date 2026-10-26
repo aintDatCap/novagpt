@@ -78,9 +78,7 @@ fn config_value(app: &App, index: usize) -> String {
             app.draft
                 .chrome_executable
                 .as_ref()
-                .map_or("(automatico/non impostato)".into(), |p| p
-                    .display()
-                    .to_string()),
+                .map_or("(ricerca automatica)".into(), |p| p.display().to_string()),
             dirty_mark(app.draft.chrome_executable != app.persisted.chrome_executable)
         ),
         4 | 5 => format!(
@@ -375,9 +373,8 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let items = (0..app.config_len())
         .map(|i| {
             let value = config_value(app, i);
-            let invalid = (i == 3 || i == 2)
-                && app.draft.browser_enabled
-                && app.draft.chrome_executable.is_none();
+            let invalid =
+                (i == 3 || i == 2) && app.draft.browser_enabled && app.chrome_valid == Some(false);
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(" {} ", CONFIG_ITEMS[i]),

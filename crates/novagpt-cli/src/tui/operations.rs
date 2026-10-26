@@ -250,7 +250,7 @@ impl Controller {
                     None
                 };
                 let agents = if config.browser_enabled {
-                    let chrome = config.chrome_executable.ok_or("Chrome non configurato.")?;
+                    let chrome = crate::chrome::discover(config.chrome_executable.as_deref()).map_err(|_| "Chrome non disponibile.")?;
                     let browser = novagpt_browser::ChatGptBrowser::new(
                         chrome,
                         settings::local_dir(&root).join("browser"),

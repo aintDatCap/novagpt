@@ -84,13 +84,10 @@ impl LocalSettings {
             return Err(invalid("invalid ngrok hostname"));
         }
         if self.browser_enabled
-            && !self
-                .chrome_executable
-                .as_ref()
-                .is_some_and(|p| p.is_absolute() && p.is_file())
+            && crate::chrome::discover(self.chrome_executable.as_deref()).is_err()
         {
             return Err(invalid(
-                "browser requires a valid absolute Chrome executable path",
+                "browser requires an installed Chrome executable or valid override",
             ));
         }
         Ok(())
@@ -448,8 +445,10 @@ mod tests {
 
     #[test]
     fn bad_settings_rejected() {
+        let dir = tempfile::tempdir().unwrap();
         let cfg = LocalSettings {
             browser_enabled: true,
+            chrome_executable: Some(dir.path().join("missing-chrome")),
             ..LocalSettings::default()
         };
         assert!(cfg.validate().is_err());

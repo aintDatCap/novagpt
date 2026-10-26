@@ -6,7 +6,7 @@ Architecture: `novagpt-core` (workspace/security/file operations), `novagpt-mcp`
 
 ## Build and Ratatui TUI
 
-`novagpt` without a subcommand opens an interactive, three-tab terminal UI for the current directory (or `--root`). Navigate its stateful command/config menus with arrows and `Enter`; `?` shows help. `novagpt --setup` opens the same TUI with a guided, four-step configuration flow. Choose Save (`s` is optional) and **explicitly confirm** before writing local settings and installing a non-overwriting launcher under `<workspace>/.novagpt/`. CodexPro import is **read-only and port-only**, with preview and separate confirmation; no credentials or browser/VM data are copied. HTTP tokens are automatically generated per workspace, kept in per-user private state outside the repository, and revealed only on explicit `novagpt token show`. See [TUI setup instructions](docs/TUI_SETUP.md).
+`novagpt` without a subcommand opens an interactive, three-tab terminal UI for the current directory (or `--root`). Navigate its stateful command/config menus with arrows and `Enter`; `?` shows help. `novagpt --setup` opens the same TUI with a guided, four-step configuration flow. Choose Save (`s` is optional) and **explicitly confirm** before writing local settings and installing a non-overwriting launcher under `<workspace>/.novagpt/`. CodexPro import is **read-only and port-only**, with preview and separate confirmation; no credentials or browser/VM data are copied. HTTP tokens are generated per workspace by default, or can be **chosen explicitly** with `novagpt --root C:\Projects token set --replace` (hidden interactive input). They are kept in per-user private state outside the repository and revealed only on explicit `novagpt token show`. See [TUI setup instructions](docs/TUI_SETUP.md).
 
 ```powershell
 cargo build --workspace
@@ -19,6 +19,8 @@ For Streamable HTTP on localhost, NovaGPT automatically generates and reuses a s
 ```powershell
 cargo run -p novagpt-cli -- --root C:\path\to\repo http --port 8787
 ```
+
+Chrome executable auto-discovery now matches CodexPro's standard locations: Windows Program Files (64-bit and x86) and LocalAppData, macOS Applications, and common Chrome/Chromium names on the Linux PATH. Enable ChatGPT Browser in the TUI and leave its executable field blank to auto-detect; explicit `--chatgpt-chrome`, `NOVAGPT_CHROME_PATH`, or saved `chrome_executable` remain overrides. Browser profiles stay NovaGPT-owned, never copied or shared with CodexPro. This does not enable ChatGPT browser integration unless opted in.
 
 The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP always requires a token; stdio does not. Retrieve the active token locally with `novagpt token show` (secret output) or view its path with `novagpt token path`. Do not paste the token into logs, screenshots or Git.
 
