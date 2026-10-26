@@ -1076,10 +1076,12 @@ name = "novagpt-agents"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "novagpt-browser",
  "novagpt-core",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",

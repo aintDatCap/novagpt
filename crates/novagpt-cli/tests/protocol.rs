@@ -131,6 +131,11 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             json!({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{
                 "name":"subagent_wait","arguments":{"id":"agent-unknown","max_wait_seconds":1}
             }}),
+            json!({"jsonrpc":"2.0","id":14,"method":"tools/call","params":{
+                "name":"subagent_finished","arguments":{
+                    "id":"agent-unknown","code":"ABC123","result":"should be rejected"
+                }
+            }}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
                 "name":"view_image","arguments":{"path":"image.png"}
             }}),
@@ -216,6 +221,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "subagent_browser_diagnostics",
         "subagent_status",
         "subagent_wait",
+        "subagent_finished",
         "subagent_result",
         "subagent_cancel",
     ] {
@@ -224,8 +230,9 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 44);
+    assert_eq!(listed.len(), 45);
     assert_eq!(by_id(13)["result"]["isError"], true);
+    assert_eq!(by_id(14)["result"]["isError"], true);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],

@@ -403,6 +403,15 @@ struct AgentWaitArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentFinishedArgs {
+    id: String,
+    /// Private six-character code from the delegated prompt (never log this).
+    code: String,
+    /// Untrusted completed report; bounded by the agent manager.
+    result: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentCancelArgs {
     id: String,
     #[serde(default)]
@@ -1148,6 +1157,22 @@ impl NovaMcp {
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_wait", response)
+    }
+
+    #[tool(
+        description = "For a delegated subagent only: mark its current task completed using the private six-character code from its prompt. Call once after finishing with id, code, and full result. Code is per execution and is not returned by spawn/status/wait."
+    )]
+    async fn subagent_finished(
+        &self,
+        Parameters(args): Parameters<AgentFinishedArgs>,
+    ) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => {
+                external_reply(manager.finished(&args.id, &args.code, &args.result).await)
+            }
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_finished", response)
     }
 
     #[tool(
