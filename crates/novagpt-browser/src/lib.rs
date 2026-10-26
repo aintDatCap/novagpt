@@ -8,7 +8,7 @@ use profile::ProfileLease;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -29,10 +29,67 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const HOME: &str = "https://chatgpt.com/";
 const BROWSE_TAB: &str = "browse-main";
 const MAX_BROWSE_TEXT: usize = 20_000;
-const COMPOSER: &str = "#prompt-textarea, [data-testid='prompt-textarea'], [contenteditable='true'][data-lexical-editor='true'], textarea";
+// Match CodexPro's textbox-first discovery, but require a real visible,
+// editable element before typing. A matching wrapper is not a composer.
+const COMPOSER_SELECTORS: &[&str] = &[
+    "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
+    "[contenteditable='true'][data-lexical-editor='true']",
+    "[role='textbox'][contenteditable='true']",
+    "textarea",
+];
+const UI_HELPERS: &str = r#"
+    const isVisible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const style = getComputedStyle(el);
+        return style.visibility !== 'hidden' && style.visibility !== 'collapse'
+            && style.display !== 'none';
+    };
+    const findEditor = () => {
+        for (const selector of selectors) {
+            for (const node of document.querySelectorAll(selector)) {
+                // isContentEditable alone can be inherited by a non-editable
+                // wrapper; require an explicitly editable node.
+                const ownEditor = node.tagName === 'TEXTAREA' ||
+                    (node.hasAttribute('contenteditable') && node.isContentEditable);
+                const el = ownEditor ? node : node.querySelector('[contenteditable], textarea');
+                if (!el || (el.tagName !== 'TEXTAREA' &&
+                    !(el.hasAttribute('contenteditable') && el.isContentEditable))) continue;
+                if (el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true') continue;
+                if (isVisible(el)) return el;
+            }
+        }
+        return null;
+    };
+    const editorText = (el) => el?.tagName === 'TEXTAREA'
+        ? el.value : (el?.innerText || '');
+    const findSendButton = () => {
+        const buttons = document.querySelectorAll('button, [role="button"]');
+        for (const button of buttons) {
+            if (!isVisible(button) || button.disabled ||
+                button.getAttribute('aria-disabled') === 'true') continue;
+            const label = (button.getAttribute('aria-label') ||
+                button.getAttribute('title') || button.textContent || '').trim();
+            if (button.getAttribute('data-testid') === 'send-button' ||
+                /^(send|submit|invia)(?: (?:message|prompt|messaggio))?$/i.test(label)) {
+                return button;
+            }
+        }
+        return null;
+    };
+"#;
+
+fn ui_expression(body: &str) -> String {
+    let selectors = json!(COMPOSER_SELECTORS);
+    format!("(() => {{ const selectors = {selectors}; {UI_HELPERS} {body} }})()")
+}
 const ASSISTANTS: &str = "[data-message-author-role='assistant']";
 const MAX_PROMPT: usize = 80_000;
 const MAX_REPLY: usize = 180_000;
+const MAX_DIAGNOSTIC_EVENTS: usize = 24;
+type DiagnosticReporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
@@ -66,6 +123,9 @@ pub struct BrowserDiagnostics {
     pub manual_check: Option<String>,
     pub page_ready: bool,
     pub automation_driver: &'static str,
+    /// Bounded metadata-only lifecycle events; never includes a prompt, URL or response.
+    pub recent_events: Vec<String>,
+    pub last_step: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -88,8 +148,64 @@ struct Page {
     cancelled: AtomicBool,
     pending_before: Mutex<Option<usize>>,
     manual: Mutex<Option<String>>,
+    recent_events: Mutex<VecDeque<String>>,
+    previous_state: Mutex<Option<String>>,
+    reporter: Option<DiagnosticReporter>,
 }
 impl Page {
+    async fn diagnostic(&self, stage: &'static str, flags: &str) {
+        // Only fixed event names and locally generated boolean/count flags.
+        // Never log the page's text, prompt, URL, cookies or CDP arguments.
+        let record = if flags.is_empty() {
+            stage.to_owned()
+        } else {
+            format!("{stage} {flags}")
+        };
+        {
+            let mut events = self.recent_events.lock().await;
+            if events.len() == MAX_DIAGNOSTIC_EVENTS {
+                events.pop_front();
+            }
+            events.push_back(record.clone());
+        }
+        tracing::info!(target: "novagpt", event = %record, "subagent browser");
+        if let Some(reporter) = &self.reporter {
+            reporter(&record);
+        }
+        // Console output is best-effort: diagnostics must never change the
+        // outcome of a browser action when navigation invalidates the context.
+        let js = format!(
+            "console.log({})",
+            json!(format!("[NovaGPT/browser] {record}"))
+        );
+        let _ = self.eval(&js).await;
+    }
+
+    async fn note_state(&self, state: &Value) {
+        let flags = format!(
+            "page_kind={} composer={} challenge={} login={} external={} assistants={} complete={}",
+            match state["page_kind"].as_str() {
+                Some("chatgpt") => "chatgpt",
+                Some("initial_blank") => "initial_blank",
+                Some("authentication") => "authentication",
+                Some("external_other") => "external_other",
+                _ => "unknown",
+            },
+            state["composer"] == true,
+            state["challenge"] == true,
+            state["login"] == true,
+            state["external"] == true,
+            state["assistant_count"].as_u64().unwrap_or(0).min(10_000),
+            state["complete"] == true,
+        );
+        let mut previous = self.previous_state.lock().await;
+        if previous.as_deref() != Some(flags.as_str()) {
+            *previous = Some(flags.clone());
+            drop(previous);
+            self.diagnostic("page_state", &flags).await;
+        }
+    }
+
     async fn command(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
         let id = self.next_command.fetch_add(1, Ordering::Relaxed);
         let mut socket = self.socket.lock().await;
@@ -106,6 +222,9 @@ impl Page {
                         serde_json::from_str(&text).map_err(|_| BrowserError::Protocol)?;
                     if response["id"].as_u64() == Some(id) {
                         if response.get("error").is_some() {
+                            // Never print the CDP error payload or original
+                            // command params: these may include user text.
+                            tracing::warn!(target: "novagpt", method, "browser CDP command rejected");
                             return Err(BrowserError::Protocol);
                         }
                         return Ok(response.get("result").cloned().unwrap_or(Value::Null));
@@ -128,6 +247,9 @@ impl Page {
             )
             .await?;
         if result.get("exceptionDetails").is_some() {
+            // The exception may quote a page's private DOM or the prompt.
+            // Record only its presence, never its message or stack.
+            tracing::warn!(target: "novagpt", "browser DOM evaluation failed");
             return Err(BrowserError::Protocol);
         }
         Ok(result
@@ -147,6 +269,7 @@ struct Inner {
     pages: Mutex<HashMap<String, Arc<Page>>>,
     http: reqwest::Client,
     start_interval: Duration,
+    reporter: Option<DiagnosticReporter>,
 }
 #[derive(Clone)]
 pub struct ChatGptBrowser {
@@ -199,8 +322,21 @@ impl ChatGptBrowser {
                     .build()
                     .map_err(|_| BrowserError::Protocol)?,
                 start_interval: Duration::from_millis(400),
+                reporter: None,
             }),
         })
+    }
+
+    /// Forward redacted browser lifecycle steps to an embedding UI (e.g. the
+    /// TUI Activity tab). Install before cloning the browser handle.
+    pub fn with_diagnostic_reporter(
+        mut self,
+        reporter: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.reporter = Some(Arc::new(reporter));
+        }
+        self
     }
 
     /// Starts ordinary Chrome *without* any remote debugging or automation
@@ -377,7 +513,11 @@ impl ChatGptBrowser {
             cancelled: AtomicBool::new(false),
             pending_before: Mutex::new(None),
             manual: Mutex::new(None),
+            recent_events: Mutex::new(VecDeque::new()),
+            previous_state: Mutex::new(None),
+            reporter: self.inner.reporter.clone(),
         });
+        page.diagnostic("tab_opened", "").await;
         page.command("Runtime.enable", json!({})).await?;
         self.inner.pages.lock().await.insert(id.to_owned(), page);
         sleep(self.inner.start_interval).await;
@@ -486,11 +626,20 @@ impl ChatGptBrowser {
     pub async fn diagnostics(&self, id: Option<&str>) -> BrowserDiagnostics {
         let pages = self.inner.pages.lock().await;
         let target = id.and_then(|id| pages.get(id));
-        let manual = if let Some(page) = target {
-            page.manual.lock().await.clone()
+        let (manual, recent_events) = if let Some(page) = target {
+            (
+                page.manual.lock().await.clone(),
+                page.recent_events
+                    .lock()
+                    .await
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
         } else {
-            None
+            (None, Vec::new())
         };
+        let last_step = recent_events.last().cloned();
         BrowserDiagnostics {
             browser_state: {
                 let running = self
@@ -514,6 +663,8 @@ impl ChatGptBrowser {
             manual_check: manual,
             page_ready: target.is_some(),
             automation_driver: "chrome-cdp",
+            recent_events,
+            last_step,
         }
     }
 
@@ -523,15 +674,42 @@ impl ChatGptBrowser {
         }
         let page = self.page(id).await?;
         page.cancelled.store(false, Ordering::Relaxed);
+        page.diagnostic("send_started", "").await;
         // A new Chrome target may still be navigating when the first worker
         // request arrives. Give the real page time to render instead of
         // immediately reporting a false authentication challenge.
         let ready_deadline = Instant::now() + Duration::from_secs(20);
+        let mut navigation_retry_logged = false;
         let state = loop {
             if page.cancelled.load(Ordering::Relaxed) {
                 return Err(BrowserError::Cancelled);
             }
-            let state = self.dom_state(&page).await?;
+            let state = match self.dom_state(&page).await {
+                Ok(state) => state,
+                // CDP may switch execution contexts while the newly created
+                // tab navigates. Keep the same bounded wait as CodexPro.
+                Err(BrowserError::Protocol) if Instant::now() < ready_deadline => {
+                    if !navigation_retry_logged {
+                        page.diagnostic("navigation_context_retry", "").await;
+                        navigation_retry_logged = true;
+                    }
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                Err(error) => {
+                    page.diagnostic("page_probe_failed", "").await;
+                    return Err(error);
+                }
+            };
+            page.note_state(&state).await;
+            if state["transient"] == true {
+                if Instant::now() >= ready_deadline {
+                    page.diagnostic("initial_navigation_timeout", "").await;
+                    return Err(BrowserError::Timeout);
+                }
+                sleep(Duration::from_millis(250)).await;
+                continue;
+            }
             if state["composer"] == true
                 || state["challenge"] == true
                 || state["login"] == true
@@ -544,34 +722,107 @@ impl ChatGptBrowser {
         };
         if let Some(manual) = manual_reason(&state) {
             *page.manual.lock().await = Some(manual.to_string());
+            page.diagnostic("manual_check_required", manual).await;
             return Err(BrowserError::Manual(manual));
         }
+        page.diagnostic("composer_ready", "").await;
         let pending = *page.pending_before.lock().await;
         let before = if let Some(before) = pending {
             before
         } else {
             let before = state["assistant_count"].as_u64().unwrap_or(0) as usize;
-            // Focus the composer, then use CDP Input.insertText to produce a
-            // trusted browser text input rather than injecting a synthetic event.
-            let focussed = page.eval(&format!("(() => {{ const el = document.querySelector({}); if(!el || !el.getClientRects().length) return false; el.focus(); return true }})()", json!(COMPOSER))).await?;
-            if focussed != Value::Bool(true) {
-                return Err(BrowserError::Manual("authentication"));
-            }
-            page.command("Input.insertText", json!({"text": prompt}))
+            // Select the actual visible, editable textbox (not its wrapper).
+            // Replacing a selection via CDP generates browser input events,
+            // unlike writing directly to the DOM or dispatching fake events.
+            let focused = page
+                .eval(&ui_expression(
+                    r#"const el = findEditor();
+                    if (!el) return false;
+                    el.focus();
+                    if (el.tagName === 'TEXTAREA') {
+                        el.select();
+                    } else {
+                        const selection = window.getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                    }
+                    return document.activeElement === el;"#,
+                ))
                 .await?;
-            // Check that the text is visible in the composer before sending.
-            let has_text = page.eval(&format!("(() => {{ const el = document.querySelector({}); return !!el && (el.innerText || el.value || '').length > 0 }})()", json!(COMPOSER))).await?;
-            if has_text != Value::Bool(true) {
+            if focused != Value::Bool(true) {
+                page.diagnostic("composer_focus_failed", "").await;
                 return Err(BrowserError::Unavailable);
             }
-            let clicked = page.eval("(() => { const b=document.querySelector('[data-testid=send-button]'); if(b && !b.disabled) { b.click(); return true } return false })()").await?;
-            if clicked != Value::Bool(true) {
-                page.command("Input.dispatchKeyEvent", json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13})).await?;
+            page.diagnostic("composer_focused", "").await;
+            page.command("Input.insertText", json!({"text": prompt}))
+                .await?;
+            page.diagnostic("text_input_dispatched", "").await;
+            // Check an actual prefix of the inserted prompt, not merely that
+            // some unrelated element had nonempty text.
+            let inserted = page
+                .eval(&ui_expression("return editorText(findEditor());"))
+                .await?;
+            let prefix: String = prompt
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(prompt)
+                .chars()
+                .take(24)
+                .collect();
+            if !inserted.as_str().is_some_and(|text| text.contains(&prefix)) {
+                page.diagnostic("text_check_failed", "").await;
+                return Err(BrowserError::Unavailable);
+            }
+            page.diagnostic("text_verified", "").await;
+            // Native CDP mouse events, rather than DOM .click(), match the
+            // physical input that CodexPro's Playwright locator.click uses.
+            // Retry briefly for React to enable the button after typing.
+            let mut button = Value::Null;
+            for _ in 0..8 {
+                button = page
+                    .eval(&ui_expression(
+                        r#"const el = findSendButton();
+                        if (!el) return null;
+                        const rect = el.getBoundingClientRect();
+                        return {x:rect.left + rect.width/2, y:rect.top + rect.height/2};"#,
+                    ))
+                    .await?;
+                if button.is_object() {
+                    break;
+                }
+                sleep(Duration::from_millis(125)).await;
+            }
+            if let (Some(x), Some(y)) = (button["x"].as_f64(), button["y"].as_f64()) {
+                page.diagnostic("send_button_found", "").await;
+                page.command(
+                    "Input.dispatchMouseEvent",
+                    json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
+                )
+                .await?;
+                page.command(
+                    "Input.dispatchMouseEvent",
+                    json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
+                )
+                .await?;
+                page.diagnostic("send_mouse_dispatched", "").await;
+            } else {
+                page.diagnostic("send_button_missing_enter_fallback", "")
+                    .await;
+                // The send button is absent in some ChatGPT layouts; Enter is
+                // CodexPro's fallback after filling the editor.
+                page.command(
+                    "Input.dispatchKeyEvent",
+                    json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}),
+                )
+                .await?;
                 page.command(
                     "Input.dispatchKeyEvent",
                     json!({"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}),
                 )
                 .await?;
+                page.diagnostic("send_enter_dispatched", "").await;
             }
             *page.pending_before.lock().await = Some(before);
             before
@@ -585,11 +836,14 @@ impl ChatGptBrowser {
                 return Err(BrowserError::Cancelled);
             }
             if Instant::now() >= deadline {
+                page.diagnostic("reply_timeout", "").await;
                 return Err(BrowserError::Timeout);
             }
             let state = self.dom_state(&page).await?;
+            page.note_state(&state).await;
             if let Some(manual) = manual_reason(&state) {
                 *page.manual.lock().await = Some(manual.to_owned());
+                page.diagnostic("manual_check_after_send", manual).await;
                 // Keep pending_before, so resume does not send prompt twice.
                 return Err(BrowserError::Manual(manual));
             }
@@ -608,6 +862,7 @@ impl ChatGptBrowser {
                 last = reply.to_owned();
                 if stable >= 3 {
                     *page.pending_before.lock().await = None;
+                    page.diagnostic("reply_completed", "").await;
                     let conversation_url = state["url"]
                         .as_str()
                         .filter(|url| url.starts_with("https://chatgpt.com/c/"))
@@ -624,26 +879,41 @@ impl ChatGptBrowser {
 
     async fn dom_state(&self, page: &Page) -> Result<Value, BrowserError> {
         // Never reads cookies/localStorage. Inspect only visible UI controls.
-        let expression = format!(
-            r#"(() => {{
-            if (!location.href.startsWith('https://chatgpt.com/') && !location.href.startsWith('https://chat.openai.com/')) {{
-                return {{ external:true }};
+        let expression = ui_expression(&format!(
+            r#"// A newly created CDP target can briefly be about:blank
+            // before Chrome commits its requested ChatGPT navigation.
+            if (location.href === 'about:blank' ||
+                location.href === 'chrome://newtab/' ||
+                location.href === 'chrome://new-tab-page/') {{
+                return {{external:true, transient:true, page_kind:'initial_blank'}};
             }}
-            const editor = document.querySelector({});
-            const challenge = !!document.querySelector('iframe[src*="challenges.cloudflare.com"], [class*="cf-turnstile"], #challenge-running, #challenge-form');
+            if (location.origin !== 'https://chatgpt.com' &&
+                location.origin !== 'https://chat.openai.com') {{
+                const authentication = location.origin === 'https://auth.openai.com' ||
+                    location.origin === 'https://login.openai.com';
+                return {{external:true, transient:false,
+                    page_kind:authentication ? 'authentication' : 'external_other'}};
+            }}
+            const editor = findEditor();
+            // Hidden verification/login widgets are common in an authenticated
+            // session. Only a *visible* challenge requires human intervention.
+            const challenge = [...document.querySelectorAll(
+                'iframe[src*="challenges.cloudflare.com"], [class*="cf-turnstile"], #challenge-running, #challenge-form'
+            )].some(isVisible);
+            const login = [...document.querySelectorAll(
+                '[data-testid="login-button"], a[href*="/auth/login"]'
+            )].some(isVisible);
             const assistants = [...document.querySelectorAll({})];
-            const last = assistants[assistants.length-1];
+            const last = assistants[assistants.length - 1];
             const content = last?.querySelector('.markdown, [data-message-content], .prose') || last;
             const stop = !!document.querySelector('[data-testid="stop-button"]');
             const copy = !!last?.querySelector('[data-testid="copy-turn-action-button"]');
-            return {{url:location.href, composer:!!editor && !!editor.getClientRects().length, challenge,
-                login:!!document.querySelector('[data-testid="login-button"]'),
+            return {{url:location.href, page_kind:'chatgpt',
+                composer:!!editor, challenge, login,
                 assistant_count:assistants.length, last_text:content?.innerText || '',
-                complete: copy || !stop}};
-        }})()"#,
-            json!(COMPOSER),
+                complete:copy || !stop}};"#,
             json!(ASSISTANTS)
-        );
+        ));
         page.eval(&expression).await
     }
 
@@ -713,12 +983,18 @@ fn safe_id(id: &str) -> bool {
 }
 fn manual_reason(state: &Value) -> Option<&'static str> {
     if state["external"] == true {
-        return Some("verification");
+        return Some(if state["page_kind"] == "authentication" {
+            "authentication"
+        } else {
+            "verification"
+        });
     }
     if state["challenge"] == true {
         return Some("verification");
     }
-    if state["composer"] != true || state["login"] == true {
+    // An optional login control can coexist with a functioning textbox.
+    // CodexPro accepts the visible composer as evidence the user can type.
+    if state["composer"] != true {
         return Some("authentication");
     }
     None
@@ -766,7 +1042,211 @@ mod tests {
             manual_reason(&json!({"composer":true,"challenge":false,"login":false})),
             None
         );
+        // The login link may be present while the usable composer is visible.
+        assert_eq!(
+            manual_reason(&json!({"composer":true,"challenge":false,"login":true})),
+            None
+        );
+        assert_eq!(
+            manual_reason(&json!({"external":true,"page_kind":"authentication"})),
+            Some("authentication")
+        );
+        assert_eq!(
+            manual_reason(&json!({"external":true,"page_kind":"external_other"})),
+            Some("verification")
+        );
+        // Visible verification always needs a person, even with an editor.
+        assert_eq!(
+            manual_reason(&json!({"composer":true,"challenge":true,"login":false})),
+            Some("verification")
+        );
     }
+    #[test]
+    fn ui_adapter_discovers_editable_textboxes_and_requires_visible_controls() {
+        let expression = ui_expression("return !!findEditor() && !!findSendButton();");
+        assert!(expression.contains("[role='textbox'][contenteditable='true']"));
+        assert!(expression.contains("getBoundingClientRect()"));
+        assert!(expression.contains("el.disabled || el.readOnly"));
+        assert!(expression.contains("aria-disabled"));
+        assert!(expression.contains("findSendButton()"));
+    }
+    #[tokio::test]
+    async fn subagent_send_uses_cdp_text_and_physical_send_button() {
+        // A local, disposable CDP websocket stub proves the command sequence
+        // without contacting ChatGPT, using a real Chrome profile or sending data.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local CDP fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("fixture client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("fixture websocket");
+            let mut inserted = false;
+            let mut pressed = false;
+            let mut released = false;
+            let mut console_logged = false;
+            let mut reply_logged = false;
+            let mut state_polls = 0;
+            while let Some(Ok(Message::Text(raw))) = socket.next().await {
+                let request: Value = serde_json::from_str(&raw).expect("CDP request");
+                let method = request["method"].as_str().expect("CDP method");
+                let result = match method {
+                    "Runtime.evaluate" => {
+                        let expression = request["params"]["expression"]
+                            .as_str()
+                            .expect("expression");
+                        if expression.contains("console.log(")
+                            && expression.contains("[NovaGPT/browser]")
+                        {
+                            console_logged = true;
+                            if expression.contains("reply_completed") {
+                                reply_logged = true;
+                            }
+                        }
+                        let value = if expression.contains("assistant_count:assistants.length") {
+                            state_polls += 1;
+                            if state_polls <= 2 {
+                                json!({
+                                    "external":true,
+                                    "transient":true,
+                                    "page_kind":"initial_blank"
+                                })
+                            } else {
+                                json!({
+                                    "url":"https://chatgpt.com/c/mock",
+                                    "page_kind":"chatgpt",
+                                    "composer":true,"challenge":false,"login":false,
+                                    "assistant_count":if released { 1 } else { 0 },
+                                    "last_text":if released { "Fixture answer" } else { "" },
+                                    "complete":true
+                                })
+                            }
+                        } else if expression.contains("document.activeElement === el") {
+                            json!(true)
+                        } else if expression.contains("return editorText(findEditor())") {
+                            json!(if inserted { "Fixture prompt" } else { "" })
+                        } else if expression.contains("rect.left + rect.width/2") {
+                            json!({"x": 100.0,"y": 40.0})
+                        } else {
+                            Value::Null
+                        };
+                        if expression.contains("assistant_count:assistants.length")
+                            && (3..=4).contains(&state_polls)
+                        {
+                            json!({"exceptionDetails":{"text":"navigation context replaced"}})
+                        } else {
+                            json!({"result":{"value":value}})
+                        }
+                    }
+                    "Input.insertText" => {
+                        inserted = request["params"]["text"] == "Fixture prompt";
+                        json!({})
+                    }
+                    "Input.dispatchMouseEvent" => {
+                        if request["params"]["type"] == "mousePressed" {
+                            pressed = true;
+                        } else if request["params"]["type"] == "mouseReleased" {
+                            released = pressed;
+                        }
+                        json!({})
+                    }
+                    "Input.dispatchKeyEvent" => panic!("send button available; Enter not needed"),
+                    _ => panic!("unexpected CDP method: {method}"),
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("CDP fixture response");
+                if released && reply_logged {
+                    return inserted && pressed && released && console_logged;
+                }
+            }
+            false
+        });
+        let (socket, _) = connect_async(format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("fixture websocket client");
+        let executable = tempfile::NamedTempFile::new().expect("fixture executable");
+        let profile = tempfile::tempdir().expect("fixture profile");
+        let browser = ChatGptBrowser::new(executable.path(), profile.path().join("owned"))
+            .expect("fixture browser");
+        browser.inner.pages.lock().await.insert(
+            "agent-test123".into(),
+            Arc::new(Page {
+                target_id: "abcdef".into(),
+                socket: Mutex::new(socket),
+                next_command: AtomicU64::new(1),
+                cancelled: AtomicBool::new(false),
+                pending_before: Mutex::new(None),
+                manual: Mutex::new(None),
+                recent_events: Mutex::new(VecDeque::new()),
+                previous_state: Mutex::new(None),
+                reporter: None,
+            }),
+        );
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-test123", "Fixture prompt"),
+        )
+        .await
+        .expect("mock send timeout")
+        .expect("mock send result");
+        assert_eq!(reply.content, "Fixture answer");
+        assert_eq!(
+            reply.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/mock")
+        );
+        let diagnostics = browser.diagnostics(Some("agent-test123")).await;
+        assert_eq!(diagnostics.last_step.as_deref(), Some("reply_completed"));
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|step| step.contains("page_kind=initial_blank"))
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|step| step.contains("page_kind=chatgpt"))
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|step| step == "composer_ready")
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|step| step == "text_verified")
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|step| step == "send_mouse_dispatched")
+        );
+        assert!(diagnostics.recent_events.len() <= MAX_DIAGNOSTIC_EVENTS);
+        let serialized = serde_json::to_string(&diagnostics).expect("diagnostic json");
+        assert!(!serialized.contains("Fixture prompt"));
+        assert!(!serialized.contains("Fixture answer"));
+        assert!(!serialized.contains("https://chatgpt.com/c/mock"));
+        assert!(
+            timeout(Duration::from_secs(2), server)
+                .await
+                .expect("fixture completion")
+                .expect("fixture join")
+        );
+    }
+
     #[test]
     fn browser_only_accepts_public_https_urls_without_credentials() {
         for allowed in [

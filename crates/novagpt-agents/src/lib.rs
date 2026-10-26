@@ -5,7 +5,8 @@ use novagpt_core::WorkspaceRegistry;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 const MAX_AGENTS: usize = 6;
@@ -13,6 +14,7 @@ const MAX_RECORDS: usize = 64;
 const MAX_TASK: usize = 50_000;
 const MAX_MESSAGE: usize = 50_000;
 const MAX_RESULT: usize = 180_000;
+const MAX_WAIT_SECONDS: u64 = 25;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -90,6 +92,14 @@ pub struct AgentStatus {
     pub agents: Vec<AgentInfo>,
 }
 
+/// A bounded wait returns the current snapshot without cancelling the worker.
+/// `waiting` requires human action and is not a completed result.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentWait {
+    pub agent: AgentInfo,
+    pub timed_out: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum BackendFailure {
     #[error("Manual {0} required")]
@@ -165,6 +175,7 @@ struct Entry {
     pending_prompt: String,
     epoch: u64,
     ready: bool,
+    updates: watch::Sender<AgentInfo>,
 }
 
 struct Inner {
@@ -257,6 +268,7 @@ impl AgentManager {
             {
                 return Err(AgentError::Capacity);
             }
+            let (updates, _) = watch::channel(info.clone());
             agents.insert(
                 id.clone(),
                 Entry {
@@ -264,6 +276,7 @@ impl AgentManager {
                     pending_prompt: prompt.clone(),
                     epoch: 1,
                     ready: false,
+                    updates,
                 },
             );
         }
@@ -320,6 +333,7 @@ impl AgentManager {
                         entry.info.error = Some("Subagent backend failed or is unavailable".into());
                     }
                 }
+                entry.updates.send_replace(entry.info.clone());
             }
         });
     }
@@ -385,6 +399,7 @@ impl AgentManager {
         entry.info.error = None;
         entry.info.result = None;
         entry.pending_prompt = prompt.clone();
+        entry.updates.send_replace(entry.info.clone());
         let created = !entry.ready;
         let info = entry.info.clone();
         drop(agents);
@@ -399,6 +414,7 @@ impl AgentManager {
             entry.epoch += 1; // invalidates any pending backend completion
             entry.info.state = AgentState::Cancelled;
             entry.pending_prompt.clear();
+            entry.updates.send_replace(entry.info.clone());
             entry.info.clone()
         };
         self.inner.backend.cancel(id).await;
@@ -423,6 +439,54 @@ impl AgentManager {
                 .collect(),
         })
     }
+    /// Wait for the next terminal or human-action state using a watch channel.
+    /// No polling loops or mutex guards are held across the wait; callers can
+    /// repeat a timed-out request without interrupting the running subagent.
+    pub async fn wait(&self, id: &str, max_wait_seconds: u64) -> AgentResult<AgentWait> {
+        if !(1..=MAX_WAIT_SECONDS).contains(&max_wait_seconds) {
+            return Err(AgentError::Invalid);
+        }
+        let mut changes = {
+            let agents = self.inner.entries.lock().await;
+            agents
+                .get(id)
+                .ok_or(AgentError::NotFound)?
+                .updates
+                .subscribe()
+        };
+        let snapshot = changes.borrow_and_update().clone();
+        if snapshot.state != AgentState::Running {
+            return Ok(AgentWait {
+                agent: snapshot,
+                timed_out: false,
+            });
+        }
+        let update = timeout(Duration::from_secs(max_wait_seconds), async {
+            loop {
+                changes.changed().await.map_err(|_| AgentError::Backend)?;
+                let snapshot = changes.borrow_and_update().clone();
+                if snapshot.state != AgentState::Running {
+                    return Ok(snapshot);
+                }
+            }
+        })
+        .await;
+        match update {
+            Ok(Ok(agent)) => Ok(AgentWait {
+                agent,
+                timed_out: false,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                let agent = changes.borrow().clone();
+                Ok(AgentWait {
+                    timed_out: agent.state == AgentState::Running,
+                    agent,
+                })
+            }
+        }
+    }
+
     pub async fn result(&self, id: &str) -> AgentResult<AgentInfo> {
         self.inner
             .entries
@@ -557,6 +621,151 @@ mod tests {
         assert_eq!(
             manager.result(&agent.id).await.expect("status").state,
             AgentState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_completed_output_and_rejects_invalid_requests() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            Arc::new(FakeBackend),
+        );
+        assert!(matches!(
+            manager.wait("agent-unknown", 1).await,
+            Err(AgentError::NotFound)
+        ));
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "read-only review".into(),
+                role: AgentRole::Reviewer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        assert!(matches!(
+            manager.wait(&info.id, 0).await,
+            Err(AgentError::Invalid)
+        ));
+        assert!(matches!(
+            manager.wait(&info.id, MAX_WAIT_SECONDS + 1).await,
+            Err(AgentError::Invalid)
+        ));
+        let finished = manager
+            .wait(&info.id, 2)
+            .await
+            .expect("wait for completion");
+        assert!(!finished.timed_out);
+        assert_eq!(finished.agent.state, AgentState::Completed);
+        let result = finished.agent.result.expect("untrusted result");
+        assert!(result.raw_response.contains("read-only review"));
+        assert!(result.untrusted);
+        assert!(!result.applied_to_workspace);
+        // Already completed: return immediately without waiting.
+        let again = manager.wait(&info.id, 2).await.expect("already terminal");
+        assert_eq!(again.agent.state, AgentState::Completed);
+        assert!(!again.timed_out);
+    }
+
+    #[tokio::test]
+    async fn wait_timeout_does_not_cancel_worker_and_cancel_wakes_waiter() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = Arc::new(PausedBackend {
+            created: tokio::sync::Notify::new(),
+            continue_create: tokio::sync::Notify::new(),
+            sent: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            backend.clone(),
+        );
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "pause".into(),
+                role: AgentRole::Tester,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        backend.created.notified().await;
+        let timed = manager.wait(&info.id, 1).await.expect("bounded wait");
+        assert!(timed.timed_out);
+        assert_eq!(timed.agent.state, AgentState::Running);
+        let waiting_manager = manager.clone();
+        let id = info.id.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_manager
+                .wait(&id, 5)
+                .await
+                .expect("wait for cancellation")
+        });
+        tokio::task::yield_now().await;
+        manager.cancel(&info.id).await.expect("cancel");
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("woken promptly")
+            .expect("task join");
+        assert_eq!(cancelled.agent.state, AgentState::Cancelled);
+        assert!(!cancelled.timed_out);
+        backend.continue_create.notify_one();
+    }
+
+    struct ManualBackend;
+    #[async_trait]
+    impl AgentBackend for ManualBackend {
+        fn name(&self) -> &'static str {
+            "manual-test"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            _id: &str,
+            _prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            Err(BackendFailure::Manual("verification"))
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_stops_on_human_action_without_claiming_completion() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            Arc::new(ManualBackend),
+        );
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "requires human".into(),
+                role: AgentRole::Explorer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        let snapshot = manager.wait(&info.id, 2).await.expect("wait for manual");
+        assert!(!snapshot.timed_out);
+        assert_eq!(snapshot.agent.state, AgentState::Waiting);
+        assert!(snapshot.agent.result.is_none());
+        assert!(
+            snapshot
+                .agent
+                .error
+                .as_deref()
+                .is_some_and(|s| s.contains("verification"))
         );
     }
 

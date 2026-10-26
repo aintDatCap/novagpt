@@ -295,12 +295,19 @@ impl Controller {
                 let browser = if config.browser_enabled {
                     let chrome = crate::chrome::discover(config.chrome_executable.as_deref())
                         .map_err(|_| "Chrome non disponibile.")?;
+                    let browser_tx = tx_info.clone();
                     Some(
                         novagpt_browser::ChatGptBrowser::new(
                             chrome,
                             settings::local_dir(&root).join("browser"),
                         )
-                        .map_err(|_| "Browser non inizializzabile.".to_string())?,
+                        .map_err(|_| "Browser non inizializzabile.".to_string())?
+                        .with_diagnostic_reporter(move |event| {
+                            let _ = browser_tx.send(OperationEvent::Log(
+                                Level::Info,
+                                format!("Browser: {event}"),
+                            ));
+                        }),
                     )
                 } else {
                     None

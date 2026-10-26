@@ -395,6 +395,14 @@ struct AgentStatusArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentWaitArgs {
+    id: String,
+    /// Bounded long-poll: defaults to 20 seconds, maximum 25 seconds.
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentCancelArgs {
     id: String,
     #[serde(default)]
@@ -1125,6 +1133,21 @@ impl NovaMcp {
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_status", response)
+    }
+
+    #[tool(
+        description = "Wait up to 25 seconds for a subagent to complete, fail, be cancelled, or need human action. Returns {agent, timed_out}; timed_out=true means still running. Includes untrusted result on completion. No polling or cancellation."
+    )]
+    async fn subagent_wait(&self, Parameters(args): Parameters<AgentWaitArgs>) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => external_reply(
+                manager
+                    .wait(&args.id, args.max_wait_seconds.unwrap_or(20))
+                    .await,
+            ),
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_wait", response)
     }
 
     #[tool(
