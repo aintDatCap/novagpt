@@ -1,0 +1,187 @@
+name: Manual release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: novagpt-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version from workspace Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Run releases from the main branch only."
+            exit 1
+          fi
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unsupported Cargo version: $version"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Preparing NovaGPT v$version"
+      - name: Prevent overwriting an existing tag
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          refs="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")"
+          if [[ -n "$refs" ]]; then
+            echo "::error::Tag $RELEASE_TAG already exists. Bump workspace.package.version first."
+            exit 1
+          fi
+
+  verify:
+    name: Verify release candidate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust, rustfmt and Clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-release-check-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: [prepare, verify]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - runner: macos-15-intel
+            platform: macos-x86_64
+          - runner: macos-15
+            platform: macos-aarch64
+          - runner: windows-2025
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-release-build-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build native release binary
+        run: cargo build --release --locked -p novagpt-cli
+      - name: Package executable and SHA-256
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          platform = os.environ["PLATFORM"]
+          is_windows = platform.startswith("windows-")
+          executable = Path("target/release") / ("novagpt.exe" if is_windows else "novagpt")
+          if not executable.is_file():
+              raise SystemExit(f"Missing release executable: {executable}")
+
+          dist = Path("dist")
+          dist.mkdir(exist_ok=True)
+          archive = dist / f"novagpt-{platform}.{ 'zip' if is_windows else 'tar.gz' }"
+          if is_windows:
+              with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as out:
+                  out.write(executable, executable.name)
+                  out.write("LICENSE.md")
+          else:
+              with tarfile.open(archive, "w:gz") as out:
+                  out.add(executable, arcname="novagpt")
+                  out.add("LICENSE.md")
+          with archive.open("rb") as artifact:
+              sha256 = hashlib.file_digest(artifact, "sha256").hexdigest()
+          (dist / (archive.name + ".sha256")).write_text(sha256 + "\n", encoding="ascii")
+          print(f"Packaged {archive} (sha256 {sha256})")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64; do
+            if [[ "$platform" == windows-* ]]; then
+              archive="dist/novagpt-$platform.zip"
+            else
+              archive="dist/novagpt-$platform.tar.gz"
+            fi
+            test -s "$archive"
+            test -s "$archive.sha256"
+            actual="$(sha256sum "$archive" | cut -d' ' -f1)"
+            expected="$(tr -d '\r\n' < "$archive.sha256")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::Checksum mismatch for $archive"
+              exit 1
+            fi
+          done
+      - name: Create release and version tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "NovaGPT $RELEASE_TAG" \
+            --generate-notes
