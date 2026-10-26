@@ -1,6 +1,59 @@
 # NovaGPT
 
-**Separate, in-progress Rust rewrite of CodexPro.** It does not replace or modify the CodexPro TypeScript installation.
+**NovaGPT is an experimental Rust MCP coding server for working with explicitly approved local workspaces from ChatGPT.** It is a separate, in-progress rewrite of CodexPro, not a drop-in replacement, and does not modify the CodexPro installation or its user data.
+
+## Installation
+
+The installers download the latest **published GitHub release**, verify the release archive's SHA-256 checksum, and install NovaGPT for your user account without administrator privileges. You do not need to clone the repository or install Rust.
+
+### Linux / macOS
+
+Run this command in a terminal (requires Bash, `curl`, `tar`, and `sha256sum` or `shasum`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh | bash
+```
+
+The installer supports Linux and macOS on x86_64 and ARM64, installs `novagpt` to `~/.local/bin` by default, and adds that directory to your shell startup file if needed.
+
+### Windows (PowerShell)
+
+Run this command in PowerShell on **Windows x64**:
+
+```powershell
+irm https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1 | iex
+```
+
+The installer puts `novagpt.exe` in `%LOCALAPPDATA%\Programs\NovaGPT\bin` by default and adds it to your user PATH. A native Windows ARM64 release is not currently included.
+
+**Open a new terminal** after installation so PATH changes take effect. These one-line commands execute the downloaded scripts immediately; review the [Bash installer](script/install.sh) or [PowerShell installer](script/install.ps1) before using them, or follow the download-first instructions in the [installation guide](docs/INSTALLATION.md). The scripts require an accessible, published [GitHub release](https://github.com/aintDatCap/novagpt/releases); they do not build NovaGPT from source. See [installation options and version pinning](script/README.md).
+
+## Configuration
+
+NovaGPT works on an existing directory that you explicitly select as its workspace. The simplest way to configure it is the interactive setup:
+
+```bash
+cd /path/to/your/project
+novagpt --setup
+```
+
+Or run `novagpt --root /absolute/path/to/your/project --setup` from anywhere. On Windows, for example: `novagpt --root "C:\Projects\my-project" --setup`.
+
+1. **Choose the workspace.** The current directory is the default; `--root` selects another existing directory. Add any other explicitly allowed roots in **Settings**.
+2. **Set connection preferences.** The default HTTP port is `8787`. Enable ngrok only if you need remote access; enable the dedicated ChatGPT Browser or VM integration only if you intend to use them.
+3. **Save and confirm.** Press `s` in **Settings**, then confirm the changes. Settings are stored in `<workspace>/.novagpt/config.json`. A per-workspace HTTP token is generated and kept in private user state outside the repository; `NOVAGPT_HTTP_TOKEN`, if set, overrides it.
+
+To start the local MCP server, use **Start MCP HTTP** from the TUI, or run this in a terminal:
+
+```bash
+novagpt --root /absolute/path/to/your/project http --port 8787
+```
+
+The local endpoint is `http://127.0.0.1:8787/mcp` and requires the workspace token. For a local stdio-based MCP client, run `novagpt --root /absolute/path/to/your/project stdio` instead. To connect ChatGPT remotely, configure an ngrok tunnel and generate a connector URL explicitly; **treat that URL as a password**, because authenticated MCP clients can execute host-shell commands. Remote ChatGPT interoperability is still being verified.
+
+For step-by-step configuration, token management, optional browser login, ngrok/ChatGPT connector setup, troubleshooting, and building from source, see the **[Installation and configuration guide](docs/INSTALLATION.md)**.
+
+## Further details
 
 Architecture: `novagpt-core` (workspace/security/file operations), `novagpt-mcp` (official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk), transports), and `novagpt-cli` (binary/configuration).
 

@@ -17,7 +17,11 @@ The current release matrix produces:
 
 Each archive includes the executable and `LICENSE.md`. The workflow needs permission to create releases using its built-in `GITHUB_TOKEN` (job permission `contents: write`). These archives are **not code-signed**, and an install/rollback smoke test on every supported OS is still needed before treating them as production-quality distributions.
 
-## Install from a published GitHub release
+## Installation options
+
+To install directly from GitHub without cloning this repository, follow the [quick installation and configuration guide](../docs/INSTALLATION.md). It includes download commands for Linux/macOS and Windows, initial setup, and MCP connection instructions.
+
+### Install using a local clone
 
 From a clone of this repository:
 
