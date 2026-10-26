@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Testing"
+  short_description: "Design robust Rust tests and quality gates"
+  default_prompt: "Use $rust-testing to design and verify this Rust testing strategy."

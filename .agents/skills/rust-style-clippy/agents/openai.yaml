@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Style and Clippy"
+  short_description: "Apply rustfmt, Clippy, editions, and Rust idioms"
+  default_prompt: "Use $rust-style-clippy to improve and verify this Rust code style or lint change."

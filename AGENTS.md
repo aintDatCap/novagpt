@@ -65,3 +65,4 @@ For each change report: summary, exact files, commands with real outcomes, compa
 - [Extension playbook](docs/EXTENSION_PLAYBOOK.md): how to add MCP tools, core features and optional subsystems.
 - [Quality gates](docs/QUALITY_GATES.md): testing matrix, review checklist and acceptance evidence.
 - [Parity ledger](docs/PARITY.md): tracked gaps to CodexPro and evidence, never a declaration based on intention.
+- [Project agent skills](docs/AGENT_SKILLS.md): optional skills.sh guidance installed under `.agents/skills/`; load the relevant `SKILL.md` for Rust, structure, security, README or TUI tasks. These external skills never override this contract or grant permission to run exploits, code, or unrelated refactors.
