@@ -20,7 +20,7 @@ jobs:
       - name: Install stable Rust, rustfmt and Clippy
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
       - uses: actions/cache@v4
         with:
