@@ -74,27 +74,27 @@ The `--root` argument is optional when your terminal is already in the intended 
 3. **Optional services:** ChatGPT Browser and virtual machines are opt-in. If enabling ChatGPT Browser, install Google Chrome; leave its executable path blank to use auto-discovery or provide a valid absolute path. NovaGPT uses its own browser profile, never a personal or CodexPro profile.
 4. **Save:** In **Settings**, press `s` and confirm the save. The guided `--setup` flow also has an explicit final review/confirmation step. Unsaved changes do not become active server settings.
 
-Settings are written to `<workspace>/.novagpt/config.json`; local launcher files may also be created under `<workspace>/.novagpt/` after confirmation, without overwriting an existing launcher.
+Settings are written once per OS user to `%LOCALAPPDATA%\\NovaGPT\\config.json` on Windows or `$XDG_STATE_HOME/NovaGPT/config.json` (by default `~/.local/state/NovaGPT/config.json`) on Unix. Every workspace uses the same settings, including HTTP port, language, approved additional roots, VM and browser preferences. The workspace path still determines which project the server opens. Old `<workspace>/.novagpt/config.json` files are not loaded automatically or deleted. A per-workspace launcher may still be created under `<workspace>/.novagpt/` after explicit setup approval, without overwriting existing files.
 
 The default TUI language is English. In **Settings → General → Interface language**, select English, Italian, or Automatic.
 
 ### HTTP authentication
 
-NovaGPT automatically creates a strong, per-workspace HTTP token when needed. It is stored in private per-user state **outside the repository**, not in `config.json`.
+NovaGPT automatically creates a strong **single HTTP token per OS user** when needed. All NovaGPT workspaces for that user share it. It is stored in private user state **outside repositories**, not in `config.json`. Different OS users have different tokens.
 
 You can display the token only when deliberately requested:
 
 ```bash
-novagpt --root /absolute/path/to/my-project token show
+novagpt token show
 ```
 
 Or display only the token file location:
 
 ```bash
-novagpt --root /absolute/path/to/my-project token path
+novagpt token path
 ```
 
-To enter a custom token securely, run `novagpt --root /absolute/path/to/my-project token set --replace` and follow the hidden input prompt. The `NOVAGPT_HTTP_TOKEN` environment variable takes precedence over the stored token. Changing the active token requires restarting the HTTP server and updating any connector URL using the old token.
+To enter a custom token securely, run `novagpt token set --replace` and follow the hidden input prompt. Token management does not require choosing a workspace. The shared file is `%LOCALAPPDATA%\\NovaGPT\\tokens\\http.token` on Windows or `$XDG_STATE_HOME/NovaGPT/tokens/http.token` (by default `~/.local/state/NovaGPT/tokens/http.token`) on Unix. On first use, one old workspace token is preserved, but if multiple old token files exist, NovaGPT creates a fresh shared token and removes those old files after validating them. Unsafe or malformed legacy files block migration rather than being deleted. When multiple old tokens are replaced, the CLI/TUI warns that saved ChatGPT connections require updating. The `NOVAGPT_HTTP_TOKEN` environment variable remains an explicit per-process override. Changing the active token requires restarting **all** NovaGPT HTTP servers and updating any connector URLs using the old token. Anyone holding the shared token can access all workspaces authorized to the server.
 
 **Never commit, paste into logs, or publicly share a token.**
 

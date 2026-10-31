@@ -282,8 +282,13 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
 fn browser_config_and_shell_are_both_available_without_mode_flags() {
     let workspace = tempfile::tempdir().expect("workspace");
     let private = tempfile::tempdir().expect("private state");
-    let directory = workspace.path().join(".novagpt");
-    fs::create_dir(&directory).expect("configuration directory");
+    let directory = private.path().join("NovaGPT");
+    fs::create_dir(&directory).expect("global configuration directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     // A non-Chrome executable ensures this fixture never opens a real
     // browser or account; browser and shell remain independent.
     fs::write(

@@ -74,3 +74,46 @@ fn omitted_root_uses_cwd_for_explicit_stdio_transport() {
         "from cwd"
     );
 }
+
+#[test]
+fn different_workspaces_use_same_global_settings_without_local_config() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let global = state.path().join("NovaGPT");
+    fs::create_dir(&global).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(
+        global.join("config.json"),
+        serde_json::json!({
+            "version": 1, "port": 9193, "vm_enabled": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+    for root in [first.path(), second.path()] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_novagpt"));
+        command.arg("--root").arg(root).args(["doctor", "--json"]);
+        command.env(
+            if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_STATE_HOME"
+            },
+            state.path(),
+        );
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let parsed: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(parsed["vm_configured"], true);
+        assert!(!root.join(".novagpt/config.json").exists());
+    }
+}

@@ -1,6 +1,6 @@
-//! Per-workspace HTTP secrets in user-private state, never in a project or config.json.
-//! A missing secret is generated once; environment override always takes precedence.
-use sha2::{Digest, Sha256};
+//! One HTTP secret per OS user, outside workspaces and config.json.
+//! Legacy workspace secrets are migrated once; environment override takes precedence.
+use fs2::FileExt;
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -12,24 +12,42 @@ use std::{
 use uuid::Uuid;
 
 const FILE_BYTES: u64 = 256;
+const SHARED_NAME: &str = "http.token";
+const MIGRATION_LOCK: &str = ".token.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Environment,
     Stored { path: PathBuf, created: bool },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Migration {
+    None,
+    Preserved,
+    Rotated,
+    Cleaned,
+}
+
 pub struct Resolved {
     pub value: String,
     pub origin: Origin,
+    pub migration: Migration,
 }
 impl Resolved {
+    pub fn rotation_warning(&self) -> Option<&'static str> {
+        (self.migration == Migration::Rotated).then_some(
+            "ATTENZIONE: trovati piu' vecchi token. E' stato creato un token condiviso nuovo: riavvia i server HTTP NovaGPT e aggiorna i connettori ChatGPT.",
+        )
+    }
+
     pub fn description(&self) -> String {
-        match &self.origin {
+        let summary = match &self.origin {
             Origin::Environment => {
-                "Token HTTP: uso NOVAGPT_HTTP_TOKEN dall'ambiente (valore nascosto).".into()
+                "Token HTTP condiviso: uso NOVAGPT_HTTP_TOKEN dall'ambiente (valore nascosto)."
+                    .into()
             }
             Origin::Stored { path, created } => format!(
-                "Token HTTP {}: {} (valore nascosto). Per visualizzarlo: novagpt token show",
+                "Token HTTP condiviso {}: {} (valore nascosto). Per visualizzarlo: novagpt token show",
                 if *created {
                     "generato"
                 } else {
@@ -37,6 +55,13 @@ impl Resolved {
                 },
                 path.display()
             ),
+        };
+        if let Some(warning) = self.rotation_warning() {
+            format!("{summary} {warning}")
+        } else if self.migration == Migration::Preserved {
+            format!("{summary} Il precedente token e' stato conservato per tutti i workspace.")
+        } else {
+            summary
         }
     }
 }
@@ -136,16 +161,12 @@ fn user_state_dir() -> io::Result<PathBuf> {
     }
     Ok(path)
 }
-pub fn path(root: &Path) -> io::Result<PathBuf> {
-    let canonical = fs::canonicalize(root)?;
-    if !canonical.is_dir() {
-        return Err(invalid("workspace is not a directory"));
-    }
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    Ok(user_state_dir()?
-        .join("NovaGPT")
-        .join("tokens")
-        .join(format!("{:x}.token", digest)))
+pub(crate) fn app_state_dir() -> io::Result<PathBuf> {
+    Ok(user_state_dir()?.join("NovaGPT"))
+}
+
+pub fn path() -> io::Result<PathBuf> {
+    Ok(app_state_dir()?.join("tokens").join(SHARED_NAME))
 }
 fn read_token(file: &Path) -> io::Result<String> {
     private_file(file)?;
@@ -177,7 +198,7 @@ fn ensure_token_directory(file: &Path) -> io::Result<()> {
     private_directory(dir)
 }
 
-/// Persist a caller-selected token in private per-workspace state, never in
+/// Persist a caller-selected token in private per-user state, never in
 /// config.json. A new random temporary file is synced before atomic rename;
 /// failed replacements leave the previous token untouched.
 fn set_at(file: &Path, value: &str, replace: bool) -> io::Result<()> {
@@ -190,7 +211,7 @@ fn set_at(file: &Path, value: &str, replace: bool) -> io::Result<()> {
             if !replace {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    "workspace token already exists; use --replace to overwrite it",
+                    "shared token already exists; use --replace to overwrite it",
                 ));
             }
         }
@@ -221,7 +242,7 @@ fn set_at(file: &Path, value: &str, replace: bool) -> io::Result<()> {
                 if !replace {
                     return Err(io::Error::new(
                         io::ErrorKind::AlreadyExists,
-                        "workspace token created concurrently; use --replace",
+                        "shared token created concurrently; use --replace",
                     ));
                 }
             }
@@ -234,12 +255,6 @@ fn set_at(file: &Path, value: &str, replace: bool) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
     }
     outcome
-}
-
-/// Set a chosen token for one canonical workspace. Does not consult or alter
-/// NOVAGPT_HTTP_TOKEN, which continues to override persisted credentials.
-pub fn set(root: &Path, value: &str, replace: bool) -> io::Result<()> {
-    set_at(&path(root)?, value, replace)
 }
 
 fn ensure_at(file: &Path) -> io::Result<Resolved> {
@@ -266,6 +281,7 @@ fn ensure_at(file: &Path) -> io::Result<Resolved> {
                     path: file.into(),
                     created: true,
                 },
+                migration: Migration::None,
             })
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -279,6 +295,7 @@ fn ensure_at(file: &Path) -> io::Result<Resolved> {
                                 path: file.into(),
                                 created: false,
                             },
+                            migration: Migration::None,
                         });
                     }
                     Err(err) if err.kind() == io::ErrorKind::InvalidData => {
@@ -301,6 +318,108 @@ fn ensure_at(file: &Path) -> io::Result<Resolved> {
         Err(error) => Err(error),
     }
 }
+/// Locking prevents concurrent NovaGPT processes from choosing different
+/// shared tokens during migration or replacement. The file is never unlinked:
+/// waiting processes must not accidentally lock separate inodes.
+fn with_token_lock<T>(file: &Path, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    ensure_token_directory(file)?;
+    let lock_path = file
+        .parent()
+        .ok_or_else(|| invalid("missing token directory"))?
+        .join(MIGRATION_LOCK);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let guard = match options.open(&lock_path) {
+        Ok(guard) => guard,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            private_file(&lock_path)?;
+            OpenOptions::new().read(true).write(true).open(&lock_path)?
+        }
+        Err(error) => return Err(error),
+    };
+    private_file(&lock_path)?;
+    guard.lock_exclusive()?;
+    action()
+}
+
+/// Only consider old NovaGPT workspace-token filenames. Other files stay intact.
+fn legacy_files(file: &Path) -> io::Result<Vec<PathBuf>> {
+    let dir = file
+        .parent()
+        .ok_or_else(|| invalid("missing token directory"))?;
+    let mut legacy = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".token")) else {
+            continue;
+        };
+        if stem.len() == 64 && stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+            legacy.push(entry.path());
+        }
+    }
+    legacy.sort();
+    Ok(legacy)
+}
+
+/// Install the common token before removing legacy files. If interrupted,
+/// the existing common token takes precedence and cleanup can safely resume.
+fn migrate_at(file: &Path) -> io::Result<Migration> {
+    let legacy = legacy_files(file)?;
+    // Check every old file before changing anything: reject unsafe paths,
+    // malformed credentials and loose permissions rather than deleting them.
+    let mut preserved = None;
+    for old in &legacy {
+        let value = read_token(old)?;
+        if legacy.len() == 1 {
+            preserved = Some(value);
+        }
+    }
+    let migration = match fs::symlink_metadata(file) {
+        Ok(_) => {
+            read_token(file)?;
+            if legacy.is_empty() {
+                Migration::None
+            } else {
+                Migration::Cleaned
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(value) = preserved {
+                set_at(file, &value, false)?;
+                Migration::Preserved
+            } else if !legacy.is_empty() {
+                ensure_at(file)?;
+                Migration::Rotated
+            } else {
+                Migration::None
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    for old in legacy {
+        // Never follow a symlink introduced after the initial scan.
+        private_file(&old)?;
+        fs::remove_file(old)?;
+    }
+    Ok(migration)
+}
+
+/// Set one token for all workspaces owned by this OS user.
+pub fn set(value: &str, replace: bool) -> io::Result<()> {
+    validate_saved(value)?;
+    let file = path()?;
+    with_token_lock(&file, || {
+        migrate_at(&file)?;
+        set_at(&file, value, replace)
+    })
+}
+
 /// Read one token from a pipe without echoing it or passing it in argv.
 /// Only an optional final CRLF/LF is removed; extra lines are rejected.
 fn parse_piped_token(input: &str) -> io::Result<&str> {
@@ -376,7 +495,7 @@ pub fn prompt_secret() -> io::Result<String> {
     result
 }
 
-pub fn resolve(root: &Path) -> io::Result<Resolved> {
+pub fn resolve() -> io::Result<Resolved> {
     if let Some(value) = env::var_os("NOVAGPT_HTTP_TOKEN") {
         let value = value
             .into_string()
@@ -385,9 +504,16 @@ pub fn resolve(root: &Path) -> io::Result<Resolved> {
         return Ok(Resolved {
             value,
             origin: Origin::Environment,
+            migration: Migration::None,
         });
     }
-    ensure_at(&path(root)?)
+    let file = path()?;
+    with_token_lock(&file, || {
+        let migration = migrate_at(&file)?;
+        let mut resolved = ensure_at(&file)?;
+        resolved.migration = migration;
+        Ok(resolved)
+    })
 }
 
 #[cfg(test)]

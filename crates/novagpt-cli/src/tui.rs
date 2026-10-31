@@ -212,6 +212,11 @@ mod tests {
     #[test]
     fn save_is_confirmed_and_validated_by_settings() {
         let dir = tempfile::tempdir().expect("workspace");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut a = App::new(
             dir.path().to_path_buf(),
             LocalSettings::default(),
@@ -227,20 +232,20 @@ mod tests {
             Some(Modal::Confirm(model::Confirm::Save))
         ));
         a.key(key(KeyCode::Esc));
-        assert!(!crate::settings::config_path(dir.path()).exists());
+        assert!(!dir.path().join("NovaGPT/config.json").exists());
         a.key(key(KeyCode::Enter));
         let effect = a.key(key(KeyCode::Char('y')));
         let Some(Effect::Save(saved, false)) = effect else {
             panic!("expected save");
         };
         assert_eq!(saved.port, 9191);
-        let path = saved.save(dir.path()).expect("save fixture");
+        let path = crate::settings::save_to_for_test(&saved, dir.path()).expect("save fixture");
         a.on_event(OperationEvent::Saved {
             settings: saved.clone(),
             outcome: Ok(format!("Saved {}", path.display())),
         });
         assert_eq!(
-            crate::settings::LocalSettings::load(dir.path()).unwrap(),
+            crate::settings::load_from_for_test(dir.path()).unwrap(),
             saved
         );
         assert!(!a.dirty());
@@ -281,7 +286,7 @@ mod tests {
         );
         assert!(!a.draft.vm_enabled);
         assert!(!a.draft.browser_enabled);
-        assert!(!crate::settings::config_path(dir.path()).exists());
+        assert!(!dir.path().join("NovaGPT/config.json").exists());
         // Imported ngrok preference is honored by the normal start command.
         a.tab = 0;
         assert!(a.key(key(KeyCode::Enter)).is_none()); // Unsaved changes block launch.
@@ -780,7 +785,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Generate / verify HTTP token"));
+        assert!(rendered.contains("Generate / verify shared HTTP token"));
         assert!(rendered.contains("Ready"));
     }
     #[test]

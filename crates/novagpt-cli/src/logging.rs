@@ -1,25 +1,23 @@
 //! Per-workspace audit storage outside the repository and CodexPro profiles.
-//! Reuses the same canonical root digest and OS-private state base as token storage,
-//! but never reads the token or creates a token for log-only operations.
+//! Keeps a separate canonical-root digest regardless of the shared HTTP token.
+//! Log-only operations never read or create credentials.
 use crate::token;
+use sha2::{Digest, Sha256};
 use std::{
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
 pub fn audit_directory(root: &Path) -> io::Result<PathBuf> {
-    let token_path = token::path(root)?;
-    let digest = token_path.file_stem().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Invalid workspace identifier")
-    })?;
-    let tokens = token_path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "Invalid token state location")
-    })?;
-    let app = tokens.parent().ok_or_else(|| {
-        io::Error::new(
+    let canonical = fs::canonicalize(root)?;
+    if !canonical.is_dir() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Missing application state directory",
-        )
-    })?;
-    Ok(app.join("logs").join(digest))
+            "workspace is not a directory",
+        ));
+    }
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    Ok(token::app_state_dir()?
+        .join("logs")
+        .join(format!("{digest:x}")))
 }

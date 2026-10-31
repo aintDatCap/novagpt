@@ -199,7 +199,7 @@ pub fn connector_url(endpoint: &str, token: &str) -> Result<String, &'static str
         || token.len() < 24
         || token.len() > 256
     {
-        return Err("Invalid endpoint or workspace token");
+        return Err("Invalid endpoint or shared HTTP token");
     }
     url.query_pairs_mut().append_pair("codexpro_token", token);
     Ok(url.to_string())

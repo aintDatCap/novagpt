@@ -120,7 +120,7 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Manage the auto-generated per-workspace MCP HTTP token.
+    /// Manage the shared per-user MCP HTTP token.
     Token {
         #[command(subcommand)]
         action: TokenCommand,
@@ -149,9 +149,9 @@ enum TokenCommand {
     Show,
     /// Print the local token-file path without revealing the token.
     Path,
-    /// Persist a chosen per-workspace token without putting it in the command line.
+    /// Persist a chosen shared token without putting it in the command line.
     Set {
-        /// Intentionally replace an already stored workspace token.
+        /// Intentionally replace the already stored shared token.
         #[arg(long)]
         replace: bool,
         /// Read the secret from piped standard input instead of a hidden terminal prompt.
@@ -174,14 +174,43 @@ enum LogsCommand {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if cli.setup && cli.command.is_some() {
+        return Err("--setup cannot be combined with a server subcommand".into());
+    }
+    // A user-wide token can be managed from any directory without loading
+    // workspace configuration or requiring a valid --root.
+    if let Some(Command::Token { action }) = &cli.command {
+        match action {
+            TokenCommand::Show => {
+                let resolved = token::resolve()?;
+                if let Some(warning) = resolved.rotation_warning() {
+                    eprintln!("{warning}");
+                }
+                println!("{}", resolved.value);
+            }
+            TokenCommand::Path => println!("{}", token::path()?.display()),
+            TokenCommand::Set { replace, stdin } => {
+                let value = if *stdin {
+                    token::read_from_stdin()?
+                } else {
+                    token::prompt_secret()?
+                };
+                token::set(&value, *replace)?;
+                println!(
+                    "Token condiviso salvato (valore nascosto). Riavvia tutti i server HTTP NovaGPT e aggiorna i connettori se il token e' cambiato."
+                );
+                if std::env::var_os("NOVAGPT_HTTP_TOKEN").is_some() {
+                    eprintln!("Warning: NOVAGPT_HTTP_TOKEN overrides the stored token.");
+                }
+            }
+        }
+        return Ok(());
+    }
     let root = std::fs::canonicalize(&cli.root)?;
     if !root.is_dir() {
         return Err("workspace root must be an existing directory".into());
     }
-    if cli.setup && cli.command.is_some() {
-        return Err("--setup cannot be combined with a server subcommand".into());
-    }
-    let local = LocalSettings::load(&root)?;
+    let local = LocalSettings::load()?;
     if let Some(Command::Logs { action }) = &cli.command {
         let directory = logging::audit_directory(&root)?;
         match action {
@@ -208,27 +237,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    if let Some(Command::Token { action }) = &cli.command {
-        match action {
-            TokenCommand::Show => println!("{}", token::resolve(&root)?.value),
-            TokenCommand::Path => println!("{}", token::path(&root)?.display()),
-            TokenCommand::Set { replace, stdin } => {
-                let value = if *stdin {
-                    token::read_from_stdin()?
-                } else {
-                    token::prompt_secret()?
-                };
-                token::set(&root, &value, *replace)?;
-                println!(
-                    "Token salvato per il workspace (valore nascosto). Riavvia HTTP per applicarlo."
-                );
-                if std::env::var_os("NOVAGPT_HTTP_TOKEN").is_some() {
-                    eprintln!("Warning: NOVAGPT_HTTP_TOKEN overrides the stored token.");
-                }
-            }
-        }
-        return Ok(());
-    }
     if let Some(action) = &cli.command {
         match action {
             Command::BrowserLogin => {
@@ -239,10 +247,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .or(env_chrome.as_deref())
                     .or(local.chrome_executable.as_deref());
                 let executable = chrome::discover(chosen)?;
-                let profile = cli
-                    .chatgpt_profile
-                    .clone()
-                    .unwrap_or_else(|| settings::local_dir(&root).join("browser"));
+                let profile = cli.chatgpt_profile.clone().unwrap_or_else(|| {
+                    settings::global_dir()
+                        .expect("user state directory required")
+                        .join("browser")
+                });
                 println!("Opening dedicated NovaGPT Chrome for manual authentication.");
                 println!("Complete any login/verification yourself, then close the Chrome window.");
                 ChatGptBrowser::manual_login(executable, profile).await?;
@@ -253,7 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Command::ConnectorUrl { port } => {
                 let port = port.unwrap_or(local.port);
-                let resolved = token::resolve(&root)?;
+                let resolved = token::resolve()?;
                 connection::probe(port, &resolved.value).await?;
                 let endpoint = tunnel::NgrokTunnel::discover_endpoint(port, None)
                     .await
@@ -263,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Command::ConnectionTest { port, json } => {
-                let token = token::resolve(&root)?.value;
+                let token = token::resolve()?.value;
                 let result = connection::probe(port.unwrap_or(local.port), &token).await?;
                 if *json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -339,7 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
         let mut profiles = settings::discover_codexpro_profiles(&home)?;
         if let Some(folder) = cli.novagpt_source.as_deref() {
-            let imported = settings::discover_novagpt_workspace(folder, &root)?;
+            let imported = settings::discover_novagpt_workspace(folder)?;
             profiles.push(imported);
         }
         let handle = tokio::runtime::Handle::current();
@@ -362,11 +371,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut approved_roots = local.allowed_roots;
     approved_roots.extend(cli.allow_root);
     let workspaces = WorkspaceRegistry::new(&root, &approved_roots)?;
-    let vm_home = cli.vm_home.or_else(|| {
-        local
-            .vm_enabled
-            .then(|| settings::local_dir(&root).join("vms"))
-    });
+    let vm_home = match cli.vm_home {
+        Some(dir) => Some(dir),
+        None if local.vm_enabled => Some(settings::global_dir()?.join("vms")),
+        None => None,
+    };
     let vm = vm_home.map(VmManager::new).transpose()?;
     let browser_enabled = local.browser_enabled;
     let requested_browser = browser_enabled || cli.chatgpt_chrome.is_some();
@@ -379,9 +388,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let profile = cli
-        .chatgpt_profile
-        .or_else(|| browser_enabled.then(|| settings::local_dir(&root).join("browser")));
+    let profile = match cli.chatgpt_profile {
+        Some(path) => Some(path),
+        None if browser_enabled => Some(settings::global_dir()?.join("browser")),
+        None => None,
+    };
     let browser = match (chrome, profile) {
         (Some(executable), Some(profile)) => Some(ChatGptBrowser::new(executable, profile)?),
         (None, None) => None,
@@ -425,7 +436,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let port = port.unwrap_or(local.port);
             let ngrok = !no_ngrok && (ngrok || local.ngrok_enabled);
             let ngrok_domain = ngrok_domain.or_else(|| local.ngrok_domain.clone());
-            let token = token::resolve(&root)?.value;
+            let resolved = token::resolve()?;
+            if let Some(warning) = resolved.rotation_warning() {
+                eprintln!("{warning}");
+            }
+            let token = resolved.value;
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             if ngrok {
                 // Own the loopback socket BEFORE starting a public tunnel.

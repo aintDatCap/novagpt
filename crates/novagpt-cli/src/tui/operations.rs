@@ -45,7 +45,7 @@ impl Controller {
                 let tx = self.tx.clone();
                 self.runtime.spawn(async move {
                     let result: Result<String, String> = async {
-                        let resolved = tokio::task::spawn_blocking(move || token::resolve(&root))
+                        let resolved = tokio::task::spawn_blocking(token::resolve)
                             .await
                             .map_err(|_| "Token non disponibile".to_string())?
                             .map_err(|_| "Token non disponibile".to_string())?;
@@ -109,7 +109,7 @@ impl Controller {
             Effect::LoadNovaSource(source) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    let result = settings::discover_novagpt_workspace(&source, &root)
+                    let result = settings::discover_novagpt_workspace(&source)
                         .map_err(|_| "Impossibile importare la cartella: verifica percorso e .novagpt/config.json.".to_string());
                     let _ = tx.send(OperationEvent::NovaSourceLoaded(result));
                 });
@@ -133,7 +133,15 @@ impl Controller {
                         .and_then(|result| result.map_err(|_| BrowserOpenFailure::ChromeMissing));
                         let result = match executable {
                             Ok(executable) => {
-                                let profile = settings::local_dir(&root).join("browser");
+                                let profile = match settings::global_dir() {
+                                    Ok(dir) => dir.join("browser"),
+                                    Err(_) => {
+                                        let _ = tx.send(OperationEvent::BrowserLoginFinished(Err(
+                                            BrowserOpenFailure::ProfileInvalid,
+                                        )));
+                                        return;
+                                    }
+                                };
                                 novagpt_browser::ChatGptBrowser::manual_login(executable, profile)
                                     .await
                                     .map_err(|error| match error {
@@ -156,8 +164,12 @@ impl Controller {
             Effect::Inventory => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    let result = novagpt_vm::VmManager::new(settings::local_dir(&root).join("vms"))
-                        .and_then(|vm| vm.images());
+                    let result = settings::global_dir()
+                        .map_err(|e| e.to_string())
+                        .and_then(|dir| {
+                            novagpt_vm::VmManager::new(dir.join("vms")).map_err(|e| e.to_string())
+                        })
+                        .and_then(|vm| vm.images().map_err(|e| e.to_string()));
                     let message = OperationEvent::VmInventory(match result {
                         Ok(images) => Ok(images.image_count),
                         Err(_) => Err(
@@ -170,12 +182,12 @@ impl Controller {
             Effect::Diagnose(config) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    let location = settings::config_path(&root);
+                    let location = settings::config_path();
                     let result = novagpt_core::WorkspaceRegistry::new(&root, &config.allowed_roots);
                     let msg = format!(
                         "Diagnostica: workspace {}; config {}; VM {}; browser {}.",
                         if result.is_ok() { "OK" } else { "NON VALIDO" },
-                        if location.is_file() {
+                        if location.as_ref().is_ok_and(|path| path.is_file()) {
                             "salvata"
                         } else {
                             "non salvata"
@@ -227,7 +239,7 @@ impl Controller {
             Effect::EnsureToken => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    let result = token::resolve(&root)
+                    let result = token::resolve()
                         .map(|value| value.description())
                         .map_err(|err| format!("Impossibile preparare il token HTTP: {err}"));
                     let _ = tx.send(OperationEvent::TokenReady(result));
@@ -236,7 +248,7 @@ impl Controller {
             Effect::Save(settings, setup) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    let outcome = match settings.save(&root) {
+                    let outcome = match settings.save() {
                         Ok(path) => {
                             let mut report = format!("Configurazione salvata: {}.", path.display());
                             if setup {
@@ -246,7 +258,7 @@ impl Controller {
                                         report.push_str(" ATTENZIONE: launcher non installato.")
                                     }
                                 }
-                                match token::resolve(&root) {
+                                match token::resolve() {
                                     Ok(resolved) => {
                                         let message = resolved.description();
                                         let _ =
@@ -286,8 +298,12 @@ impl Controller {
                     .map_err(|_| "Workspace non valido.".to_string())?;
                 let vm = if config.vm_enabled {
                     Some(
-                        novagpt_vm::VmManager::new(settings::local_dir(&root).join("vms"))
-                            .map_err(|_| "Impossibile inizializzare VM.".to_string())?,
+                        novagpt_vm::VmManager::new(
+                            settings::global_dir()
+                                .map_err(|_| "Percorso VM globale non disponibile".to_string())?
+                                .join("vms"),
+                        )
+                        .map_err(|_| "Impossibile inizializzare VM.".to_string())?,
                     )
                 } else {
                     None
@@ -299,7 +315,9 @@ impl Controller {
                     Some(
                         novagpt_browser::ChatGptBrowser::new(
                             chrome,
-                            settings::local_dir(&root).join("browser"),
+                            settings::global_dir()
+                                .map_err(|_| "Percorso browser globale non disponibile".to_string())?
+                                .join("browser"),
                         )
                         .map_err(|_| "Browser non inizializzabile.".to_string())?
                         .with_diagnostic_reporter(move |event| {
@@ -318,7 +336,7 @@ impl Controller {
                         Arc::new(novagpt_agents::ChatGptBackend::new(browser.clone())),
                     )
                 });
-                let resolved = token::resolve(&root)
+                let resolved = token::resolve()
                     .map_err(|err| format!("Token HTTP non disponibile: {err}"))?;
                 let _ = tx_info.send(OperationEvent::TokenPresent(resolved.description()));
                 Ok((
