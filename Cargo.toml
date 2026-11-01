@@ -29,4 +29,4 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
