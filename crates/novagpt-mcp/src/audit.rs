@@ -231,7 +231,24 @@ fn append(dir: &Path, event: &AuditEvent) -> io::Result<()> {
     }
     let mut file = options.open(&current)?;
     file.write_all(&line)?;
-    file.sync_data()?;
+    // The writer acknowledges durability at Flush rather than forcing an
+    // expensive disk sync for every event (especially slow on Windows).
+    Ok(())
+}
+
+/// Flush every bounded log segment: rotation may have moved recently written
+/// events out of audit.log before a caller requests a durable snapshot.
+fn sync_files(dir: &Path) -> io::Result<()> {
+    for index in 0..MAX_FILES {
+        let path = dir.join(file_name(index));
+        if checked_file(&path)?.is_some() {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?
+                .sync_data()?;
+        }
+    }
     Ok(())
 }
 
@@ -244,6 +261,9 @@ fn writer_loop(dir: PathBuf, rx: mpsc::Receiver<WriteCommand>, errors: Arc<Atomi
                 }
             }
             WriteCommand::Flush(reply) => {
+                if sync_files(&dir).is_err() {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                }
                 let _ = reply.send(());
             }
         }
@@ -438,6 +458,55 @@ mod tests {
         assert!(text.contains("tool read"));
         assert!(!text.contains("token"));
         assert!(!text.contains("root"));
+    }
+
+    #[test]
+    fn flushing_reports_disk_sync_errors() {
+        let home = tempfile::tempdir().expect("fixture");
+        let dir = home.path().join("logs");
+        fs::create_dir(&dir).expect("audit directory");
+        // A directory masquerading as a log segment is never followed or synced.
+        fs::create_dir(dir.join("audit.1.log")).expect("unsafe segment");
+        let (tx, rx) = mpsc::sync_channel(2);
+        let errors = Arc::new(AtomicU64::new(0));
+        let worker_errors = errors.clone();
+        let worker = std::thread::spawn(move || writer_loop(dir, rx, worker_errors));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(WriteCommand::Flush(reply_tx)).expect("flush");
+        reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer acknowledged flush");
+        assert_eq!(errors.load(Ordering::Relaxed), 1);
+        drop(tx);
+        worker.join().expect("writer exited");
+    }
+
+    #[test]
+    fn flush_synchronizes_rotated_segments_without_exceeding_file_limits() {
+        let home = tempfile::tempdir().expect("fixture");
+        let dir = home.path().join("logs");
+        fs::create_dir(&dir).expect("audit directory");
+        for sequence in 1..=2100 {
+            append(
+                &dir,
+                &AuditEvent {
+                    sequence,
+                    unix_seconds: 0,
+                    tool: "read".to_string(),
+                    status: "ok".to_string(),
+                },
+            )
+            .expect("write audit event");
+        }
+        assert!(dir.join("audit.1.log").is_file(), "rotation must occur");
+        sync_files(&dir).expect("synchronize current and rotated segments");
+        for index in 0..MAX_FILES {
+            if let Some(len) = checked_file(&dir.join(file_name(index))).expect("safe log") {
+                assert!(len <= MAX_FILE_BYTES);
+            }
+        }
+        let persisted = history(&dir).expect("read after flush");
+        assert_eq!(persisted.count, 2100);
     }
 
     #[tokio::test]
