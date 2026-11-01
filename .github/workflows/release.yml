@@ -17,7 +17,7 @@ jobs:
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Read version from workspace Cargo.toml
         id: version
         shell: bash
@@ -48,7 +48,7 @@ jobs:
     name: Verify release candidate
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stable Rust, rustfmt and Clippy
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
@@ -84,7 +84,7 @@ jobs:
           - runner: windows-2025
             platform: windows-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stable Rust
         shell: bash
         run: |
