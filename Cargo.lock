@@ -1076,7 +1076,7 @@ name = "novagpt-agents"
 version = "0.1.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "novagpt-browser",
  "novagpt-core",
  "serde",
@@ -1147,7 +1147,7 @@ name = "novagpt-mcp"
 version = "0.1.1"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "novagpt-agents",
  "novagpt-browser",
  "novagpt-core",
@@ -1169,7 +1169,7 @@ dependencies = [
 name = "novagpt-vm"
 version = "0.1.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "hex",
  "serde",
  "serde_json",
