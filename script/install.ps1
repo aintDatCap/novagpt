@@ -1,5 +1,5 @@
 # Install a SHA-256-verified NovaGPT release binary for Windows x64 (current user).
-# Example: powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -Version v0.1.0
+# Example: powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -Version v0.1.1
 [CmdletBinding()]
 param(
     [ValidatePattern('^(latest|v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$')]

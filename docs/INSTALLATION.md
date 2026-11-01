@@ -20,7 +20,7 @@ The default destination is `~/.local/bin/novagpt`. The script adds the bin direc
 To install a specific published version or choose another absolute destination:
 
 ```bash
-bash novagpt-install.sh --version v0.1.0
+bash novagpt-install.sh --version v0.1.1
 bash novagpt-install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -40,7 +40,7 @@ The default destination is `%LOCALAPPDATA%\Programs\NovaGPT\bin\novagpt.exe`. Th
 To select a specific published version or another destination:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1" -Version v0.1.0
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1" -Version v0.1.1
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1" -InstallDir "$env:LOCALAPPDATA\Programs\NovaGPT\bin"
 ```
 

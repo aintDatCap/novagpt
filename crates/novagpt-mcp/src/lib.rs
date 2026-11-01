@@ -1225,7 +1225,7 @@ impl NovaMcp {
 
 #[tool_handler(
     name = "novagpt",
-    version = "0.1.0",
+    version = "0.1.1",
     instructions = "Use workspace_id explicitly for non-default roots; these are guarded local coding tools."
 )]
 impl ServerHandler for NovaMcp {}

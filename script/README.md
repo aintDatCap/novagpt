@@ -3,7 +3,7 @@
 ## GitHub Actions
 
 - **PR testing** (`.github/workflows/test.yml`): every pull request runs `cargo fmt`, Clippy with warnings denied, `cargo check` and the workspace tests on Ubuntu x64, Windows x64 and macOS ARM64.
-- **Manual release** (`.github/workflows/release.yml`): from **Actions → Manual release → Run workflow** on **main**. The tag is derived from `[workspace.package].version` in root `Cargo.toml` (for example, `0.1.0` becomes `v0.1.0`). It runs the release checks, builds native `novagpt` binaries, uploads release archives and matching `.sha256` checksums, then creates a GitHub release with generated notes. An existing tag stops the workflow; bump the Cargo version before the next release.
+- **Manual release** (`.github/workflows/release.yml`): from **Actions → Manual release → Run workflow** on **main**. The tag is derived from `[workspace.package].version` in root `Cargo.toml` (for example, `0.1.1` becomes `v0.1.1`). It runs the release checks, builds native `novagpt` binaries, uploads release archives and matching `.sha256` checksums, then creates a GitHub release with generated notes. An existing tag stops the workflow; bump the Cargo version before the next release.
 
 The current release matrix produces:
 
@@ -29,7 +29,7 @@ From a clone of this repository:
 
 ```bash
 bash script/install.sh
-bash script/install.sh --version v0.1.0
+bash script/install.sh --version v0.1.1
 bash script/install.sh --install-dir "$HOME/.local/bin"
 ```
 
@@ -39,7 +39,7 @@ Requires `curl` or `wget`, `tar`, and `sha256sum` or `shasum`. By default, the l
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\script\install.ps1
-powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -Version v0.1.0
+powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -Version v0.1.1
 powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -InstallDir "$env:LOCALAPPDATA\Programs\NovaGPT\bin"
 ```
 

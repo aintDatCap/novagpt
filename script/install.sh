@@ -41,7 +41,7 @@ while (( $# )); do
 done
 
 if [[ "$VERSION" != "latest" && ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-  echo "Version must be 'latest' or a tag such as v0.1.0." >&2
+  echo "Version must be 'latest' or a tag such as v0.1.1." >&2
   exit 2
 fi
 case "$INSTALL_DIR" in

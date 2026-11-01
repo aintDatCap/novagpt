@@ -180,6 +180,10 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             .expect("matching response")
     };
     assert_eq!(by_id(1)["result"]["serverInfo"]["name"], "novagpt");
+    assert_eq!(
+        by_id(1)["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
     let listed = by_id(2)["result"]["tools"]
         .as_array()
         .expect("tools/list array");
