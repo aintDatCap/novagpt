@@ -136,7 +136,7 @@ jobs:
           (dist / (archive.name + ".sha256")).write_text(sha256 + "\n", encoding="ascii")
           print(f"Packaged {archive} (sha256 {sha256})")
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}
           path: dist/
