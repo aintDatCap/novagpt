@@ -19,5 +19,5 @@ pub fn audit_directory(root: &Path) -> io::Result<PathBuf> {
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
     Ok(token::app_state_dir()?
         .join("logs")
-        .join(format!("{digest:x}")))
+        .join(hex::encode(digest)))
 }
