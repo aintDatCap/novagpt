@@ -156,6 +156,8 @@ pub struct AgentPatchReceipt {
 pub enum BackendFailure {
     #[error("Manual {0} required")]
     Manual(&'static str),
+    #[error("{0}")]
+    Blocked(&'static str),
     #[error("Backend unavailable")]
     Unavailable,
 }
@@ -221,7 +223,18 @@ impl AgentBackend for ChatGptBackend {
 fn map_browser(error: BrowserError) -> BackendFailure {
     match error {
         BrowserError::Manual(kind) => BackendFailure::Manual(kind),
-        BrowserError::Timeout => BackendFailure::Manual("inspection"),
+        BrowserError::NavigationTimeout => {
+            BackendFailure::Blocked("ChatGPT navigation timed out before prompt submission")
+        }
+        BrowserError::ComposerUnavailable => {
+            BackendFailure::Blocked("ChatGPT composer unavailable; no prompt submitted")
+        }
+        BrowserError::AmbiguousSubmission => BackendFailure::Blocked(
+            "Chrome disconnected after possible submission; prompt replay refused",
+        ),
+        BrowserError::Timeout => BackendFailure::Blocked("Browser action timed out"),
+        BrowserError::ProfileBusy => BackendFailure::Blocked("Dedicated Chrome profile is in use"),
+        BrowserError::NotRunning => BackendFailure::Blocked("Dedicated Chrome is unavailable"),
         _ => BackendFailure::Unavailable,
     }
 }
@@ -424,6 +437,10 @@ impl AgentManager {
                     Err(BackendFailure::Unavailable) => {
                         entry.info.state = AgentState::Failed;
                         entry.info.error = Some("Subagent backend failed or is unavailable".into());
+                    }
+                    Err(BackendFailure::Blocked(reason)) => {
+                        entry.info.state = AgentState::Failed;
+                        entry.info.error = Some(reason.to_owned());
                     }
                 }
                 entry.updates.send_replace(entry.info.clone());
@@ -895,6 +912,84 @@ impl AgentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_failures_have_specific_safe_parent_messages() {
+        assert_eq!(
+            map_browser(BrowserError::NavigationTimeout).to_string(),
+            "ChatGPT navigation timed out before prompt submission"
+        );
+        assert_eq!(
+            map_browser(BrowserError::ComposerUnavailable).to_string(),
+            "ChatGPT composer unavailable; no prompt submitted"
+        );
+        assert_eq!(
+            map_browser(BrowserError::AmbiguousSubmission).to_string(),
+            "Chrome disconnected after possible submission; prompt replay refused"
+        );
+        assert_eq!(
+            map_browser(BrowserError::Timeout).to_string(),
+            "Browser action timed out"
+        );
+        assert!(matches!(
+            map_browser(BrowserError::Manual("verification")),
+            BackendFailure::Manual("verification")
+        ));
+    }
+
+    struct BlockedBackend;
+    #[async_trait]
+    impl AgentBackend for BlockedBackend {
+        fn name(&self) -> &'static str {
+            "blocked-fixture"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            _id: &str,
+            _prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            Err(BackendFailure::Blocked(
+                "ChatGPT composer unavailable; no prompt submitted",
+            ))
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_browser_reason_reaches_parent_without_manual_wait() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            Arc::new(BlockedBackend),
+        );
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "review".into(),
+                role: AgentRole::Reviewer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        let result = manager.wait(&info.id, 2).await.expect("completed wait");
+        assert!(!result.timed_out);
+        assert_eq!(result.agent.state, AgentState::Failed);
+        assert_eq!(
+            result.agent.error.as_deref(),
+            Some("ChatGPT composer unavailable; no prompt submitted")
+        );
+    }
+
     struct FakeBackend;
     #[async_trait]
     impl AgentBackend for FakeBackend {

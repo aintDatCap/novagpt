@@ -1,7 +1,7 @@
 //! Exclusive ownership of the dedicated NovaGPT browser profile.
 //! A lock file stays open for the lifetime of the Chrome process. The lock
 //! is released by the OS after a crash (unlike a persistent sentinel lock).
-use crate::DriverError;
+use super::error::UpstreamError;
 use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
@@ -15,8 +15,8 @@ pub(crate) struct ProfileLease {
     _lock: File,
 }
 
-fn redirected(path: &Path) -> Result<bool, DriverError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| DriverError::InvalidProfile)?;
+fn redirected(path: &Path) -> Result<bool, UpstreamError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| UpstreamError::InvalidProfile)?;
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -28,44 +28,46 @@ fn redirected(path: &Path) -> Result<bool, DriverError> {
     Ok(metadata.file_type().is_symlink())
 }
 
-pub(crate) fn acquire(profile: &Path) -> Result<ProfileLease, DriverError> {
+pub(crate) fn acquire(profile: &Path) -> Result<ProfileLease, UpstreamError> {
     if profile.as_os_str().is_empty() || !profile.is_absolute() {
-        return Err(DriverError::InvalidProfile);
+        return Err(UpstreamError::InvalidProfile);
     }
     if profile.exists() && redirected(profile)? {
-        return Err(DriverError::InvalidProfile);
+        return Err(UpstreamError::InvalidProfile);
     }
-    fs::create_dir_all(profile).map_err(|_| DriverError::InvalidProfile)?;
+    fs::create_dir_all(profile).map_err(|_| UpstreamError::InvalidProfile)?;
     if redirected(profile)? {
-        return Err(DriverError::InvalidProfile);
+        return Err(UpstreamError::InvalidProfile);
     }
     let marker = profile.join("novagpt-browser-owner");
     if marker.exists() {
         if redirected(&marker)?
-            || fs::read(&marker).map_err(|_| DriverError::InvalidProfile)? != OWNER
+            || fs::read(&marker).map_err(|_| UpstreamError::InvalidProfile)? != OWNER
         {
-            return Err(DriverError::InvalidProfile);
+            return Err(UpstreamError::InvalidProfile);
         }
     } else {
-        let mut entries = fs::read_dir(profile).map_err(|_| DriverError::InvalidProfile)?;
+        let mut entries = fs::read_dir(profile).map_err(|_| UpstreamError::InvalidProfile)?;
         if entries.next().is_some() {
             // Never take over an arbitrary existing profile.
-            return Err(DriverError::InvalidProfile);
+            return Err(UpstreamError::InvalidProfile);
         }
         let mut owner = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&marker)
-            .map_err(|_| DriverError::InvalidProfile)?;
+            .map_err(|_| UpstreamError::InvalidProfile)?;
         use std::io::Write;
         owner
             .write_all(OWNER)
-            .map_err(|_| DriverError::InvalidProfile)?;
-        owner.sync_all().map_err(|_| DriverError::InvalidProfile)?;
+            .map_err(|_| UpstreamError::InvalidProfile)?;
+        owner
+            .sync_all()
+            .map_err(|_| UpstreamError::InvalidProfile)?;
     }
     let lock_path = profile.join(LOCK_FILE);
     if lock_path.exists() && redirected(&lock_path)? {
-        return Err(DriverError::InvalidProfile);
+        return Err(UpstreamError::InvalidProfile);
     }
     let lock = OpenOptions::new()
         .read(true)
@@ -73,9 +75,21 @@ pub(crate) fn acquire(profile: &Path) -> Result<ProfileLease, DriverError> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|_| DriverError::InvalidProfile)?;
-    lock.try_lock_exclusive()
-        .map_err(|_| DriverError::ProfileBusy)?;
+        .map_err(|_| UpstreamError::InvalidProfile)?;
+    // A concurrent `fork` in another thread can briefly inherit this lock's
+    // file description before exec closes it (close-on-exec). Retry briefly so
+    // a transient inherited descriptor is not reported as another owner.
+    let mut attempts = 0;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(_) if attempts < 10 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return Err(UpstreamError::ProfileBusy),
+        }
+    }
     Ok(ProfileLease { _lock: lock })
 }
 
@@ -87,7 +101,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temp profile");
         let profile = root.path().join("dedicated");
         let lease = acquire(&profile).expect("first lease");
-        assert!(matches!(acquire(&profile), Err(DriverError::ProfileBusy)));
+        assert!(matches!(acquire(&profile), Err(UpstreamError::ProfileBusy)));
         fs::write(profile.join("saved-session-fixture"), "kept").expect("fixture");
         drop(lease);
         let second = acquire(&profile).expect("OS lock released");
@@ -105,11 +119,14 @@ mod tests {
         fs::write(personal.join("Preferences"), "{}").unwrap();
         assert!(matches!(
             acquire(&personal),
-            Err(DriverError::InvalidProfile)
+            Err(UpstreamError::InvalidProfile)
         ));
         let owned = root.path().join("owned");
         fs::create_dir_all(&owned).unwrap();
         fs::write(owned.join("novagpt-browser-owner"), "another owner").unwrap();
-        assert!(matches!(acquire(&owned), Err(DriverError::InvalidProfile)));
+        assert!(matches!(
+            acquire(&owned),
+            Err(UpstreamError::InvalidProfile)
+        ));
     }
 }

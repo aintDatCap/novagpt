@@ -1,10 +1,14 @@
-//! Dedicated visible Chrome CDP transport for ChatGPT subagents.
-//! Never reads Chrome cookies/credentials; manual challenges are for the user.
+//! Dedicated visible Chrome transport for ChatGPT subagents, backed by the
+//! native ChromeDriver/WebDriver lifecycle. Never reads Chrome
+//! cookies/credentials; manual challenges are for the user.
 mod bridge;
 pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
-#[cfg(test)]
-use futures_util::{SinkExt, StreamExt};
-use novagpt_browser_driver::{BrowserDriver, DriverConfig, DriverError, DriverPage};
+/// Native managed Chrome/ChromeDriver lifecycle. Exposed so the CLI and
+/// embedders can install/inspect a verified driver without starting a browser.
+pub use novagpt_browser_driver::undetected as managed;
+use novagpt_browser_driver::undetected::{
+    ChromeDriverStore, DriverChoice, ManagedConfig, UndetectedChrome, UpstreamError, WebDriverTab,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -20,8 +24,6 @@ use tokio::{
     sync::Mutex,
     time::{Duration, Instant, sleep},
 };
-#[cfg(test)]
-use tokio_tungstenite::tungstenite::Message;
 
 const HOME: &str = "https://chatgpt.com/";
 const BROWSE_TAB: &str = "browse-main";
@@ -98,6 +100,12 @@ pub enum BrowserError {
     NotRunning,
     #[error("ChatGPT requires manual {0} in the visible dedicated Chrome window")]
     Manual(&'static str),
+    #[error("ChatGPT navigation did not complete; no prompt was submitted")]
+    NavigationTimeout,
+    #[error("ChatGPT composer unavailable after waiting; no prompt was submitted")]
+    ComposerUnavailable,
+    #[error("Chrome disconnected after possible prompt submission; no automatic replay")]
+    AmbiguousSubmission,
     #[error("Browser operation timed out; inspect the visible ChatGPT tab")]
     Timeout,
     #[error("The ChatGPT page changed unexpectedly; no message was sent")]
@@ -122,18 +130,31 @@ pub enum BrowserError {
     InvalidDevOrigin,
 }
 
-impl From<DriverError> for BrowserError {
-    fn from(value: DriverError) -> Self {
+impl From<UpstreamError> for BrowserError {
+    fn from(value: UpstreamError) -> Self {
         match value {
-            DriverError::NotRunning => Self::NotRunning,
-            DriverError::InvalidConfig | DriverError::InvalidProfile => Self::InvalidProfile,
-            DriverError::ProfileBusy => Self::ProfileBusy,
-            DriverError::Timeout => Self::Timeout,
-            DriverError::Cancelled => Self::Cancelled,
-            DriverError::InvalidControl => Self::InvalidControl,
-            DriverError::TooLarge => Self::TooLarge,
-            DriverError::Protocol => Self::Protocol,
-            DriverError::StalePage => Self::Unavailable,
+            UpstreamError::Chrome
+            | UpstreamError::ChromeStartup
+            | UpstreamError::UnsupportedPlatform
+            | UpstreamError::VersionMismatch => Self::NotRunning,
+            UpstreamError::InvalidProfile => Self::InvalidProfile,
+            UpstreamError::ProfileBusy => Self::ProfileBusy,
+            UpstreamError::Timeout | UpstreamError::ServiceTimeout => Self::Timeout,
+            UpstreamError::Cancelled => Self::Cancelled,
+            UpstreamError::TooLarge => Self::TooLarge,
+            UpstreamError::SessionExpired | UpstreamError::TabClosed => Self::Unavailable,
+            UpstreamError::InvalidConfig
+            | UpstreamError::StoreNotOwned
+            | UpstreamError::WebDriver
+            | UpstreamError::Protocol
+            | UpstreamError::InvalidArchive
+            | UpstreamError::Integrity
+            | UpstreamError::Manifest
+            | UpstreamError::Download
+            | UpstreamError::Unpatchable
+            | UpstreamError::ForeignPatch
+            | UpstreamError::Service
+            | UpstreamError::Io => Self::Protocol,
         }
     }
 }
@@ -212,14 +233,17 @@ pub struct BrowserReply {
 }
 
 struct Page {
-    transport: DriverPage,
+    transport: WebDriverTab,
     cancelled: AtomicBool,
+    // A crashed tab must never cause automatic replay after a send event.
+    submission_attempted: AtomicBool,
     send_lock: Mutex<()>,
     pending_before: Mutex<Option<usize>>,
     manual: Mutex<Option<String>>,
     recent_events: Mutex<VecDeque<String>>,
     previous_state: Mutex<Option<String>>,
     console: Mutex<VecDeque<BrowserConsoleEntry>>,
+    console_seen: Mutex<VecDeque<String>>,
     reporter: Option<DiagnosticReporter>,
 }
 impl Page {
@@ -253,10 +277,12 @@ impl Page {
 
     async fn note_state(&self, state: &Value) {
         let flags = format!(
-            "page_kind={} composer={} challenge={} login={} external={} assistants={} complete={}",
+            "phase={} page_kind={} composer={} challenge={} login={} external={} assistants={} complete={}",
+            page_phase(state).as_str(),
             match state["page_kind"].as_str() {
                 Some("chatgpt") => "chatgpt",
                 Some("initial_blank") => "initial_blank",
+                Some("navigation") => "navigation",
                 Some("authentication") => "authentication",
                 Some("external_other") => "external_other",
                 _ => "unknown",
@@ -276,32 +302,47 @@ impl Page {
         }
     }
 
-    async fn record_events(&self) {
-        for event in self.transport.drain_events().await {
-            if let Some(entry) = browser_event(&event) {
-                let mut entries = self.console.lock().await;
-                if entries.len() == MAX_DEV_EVENTS {
-                    entries.pop_front();
+    async fn refresh_console(&self) {
+        let Ok(entries) = self.transport.browser_log().await else {
+            return;
+        };
+        let mut seen = self.console_seen.lock().await;
+        let mut console = self.console.lock().await;
+        for entry in entries.into_iter().take(MAX_DEV_EVENTS) {
+            if let Some(entry) = browser_log_entry(&entry) {
+                let key = format!("{}\u{0}{}", entry.kind, entry.message);
+                if seen.iter().any(|known| known == &key) {
+                    continue;
                 }
-                entries.push_back(entry);
+                if seen.len() == MAX_DEV_EVENTS {
+                    seen.pop_front();
+                }
+                seen.push_back(key);
+                if console.len() == MAX_DEV_EVENTS {
+                    console.pop_front();
+                }
+                console.push_back(entry);
             }
         }
     }
 
     async fn command(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
-        let result = self.transport.command(method, params).await;
-        self.record_events().await;
-        result.map_err(BrowserError::from)
+        self.transport
+            .cdp_execute(method, params)
+            .await
+            .map_err(BrowserError::from)
     }
 
     async fn eval(&self, source: &str) -> Result<Value, BrowserError> {
-        let result = self.transport.evaluate_trusted(source).await;
-        self.record_events().await;
-        result.map_err(BrowserError::from)
+        self.transport
+            .evaluate(source)
+            .await
+            .map_err(BrowserError::from)
     }
 }
 struct Inner {
-    driver: BrowserDriver,
+    config: ManagedConfig,
+    runtime: Mutex<Option<UndetectedChrome>>,
     dev_origin: Option<reqwest::Url>,
     create_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
@@ -317,21 +358,84 @@ impl ChatGptBrowser {
         executable: impl AsRef<Path>,
         profile: impl AsRef<Path>,
     ) -> Result<Self, BrowserError> {
+        let root = ChromeDriverStore::default_root().map_err(|_| BrowserError::NotRunning)?;
+        let store = ChromeDriverStore::new(root).map_err(BrowserError::from)?;
+        Self::with_driver(executable, profile, DriverChoice::Install(Arc::new(store)))
+    }
+
+    /// Construct with an explicit managed-driver source. The Chrome process is
+    /// launched lazily on the first tab operation, matching the previous
+    /// lifecycle and avoiding work when subagents are never used.
+    pub fn with_driver(
+        executable: impl AsRef<Path>,
+        profile: impl AsRef<Path>,
+        driver: DriverChoice,
+    ) -> Result<Self, BrowserError> {
+        let executable = executable.as_ref();
         let profile = profile.as_ref();
+        if !executable.is_file() || !profile.is_absolute() {
+            return Err(BrowserError::InvalidProfile);
+        }
         if profile.exists() && profile.is_symlink() {
             return Err(BrowserError::InvalidProfile);
         }
-        let config = DriverConfig::new(executable, profile).map_err(BrowserError::from)?;
-        let driver = BrowserDriver::new(config).map_err(BrowserError::from)?;
+        let config = ManagedConfig::new(executable, profile, driver);
         Ok(Self {
             inner: Arc::new(Inner {
-                driver,
+                config,
+                runtime: Mutex::new(None),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_session(
+        session: novagpt_browser_driver::undetected::WebDriverSession,
+    ) -> Self {
+        use std::path::PathBuf;
+        let placeholder = PathBuf::from("/nonexistent/novagpt-test");
+        let config = ManagedConfig::new(
+            &placeholder,
+            "/nonexistent/novagpt-test-profile",
+            DriverChoice::Existing(placeholder.clone()),
+        );
+        Self {
+            inner: Arc::new(Inner {
+                config,
+                runtime: Mutex::new(Some(UndetectedChrome::from_session_for_test(session))),
+                dev_origin: None,
+                create_lock: Mutex::new(()),
+                pages: Mutex::new(HashMap::new()),
+                reporter: None,
+            }),
+        }
+    }
+
+    async fn chrome(&self) -> Result<UndetectedChrome, BrowserError> {
+        let mut runtime = self.inner.runtime.lock().await;
+        if let Some(chrome) = runtime.as_ref() {
+            return Ok(chrome.clone());
+        }
+        let chrome = UndetectedChrome::launch(self.inner.config.clone())
+            .await
+            .map_err(BrowserError::from)?;
+        *runtime = Some(chrome.clone());
+        Ok(chrome)
+    }
+
+    /// Explicitly close the WebDriver session, ChromeDriver child, and owned
+    /// Chrome. Idempotent; normally the process is terminated when the last
+    /// handle is dropped.
+    pub async fn shutdown(&self) {
+        let chrome = self.inner.runtime.lock().await.take();
+        self.inner.pages.lock().await.clear();
+        if let Some(chrome) = chrome {
+            chrome.shutdown().await;
+        }
     }
 
     /// Optionally restrict local browsing to one exact HTTP development origin.
@@ -370,14 +474,39 @@ impl ChatGptBrowser {
 
     /// Starts ordinary Chrome *without* any remote debugging or automation
     /// switches. The user performs all authentication steps visibly, closes
-    /// this window, then starts NovaGPT's CDP-capable server separately.
+    /// this window, then starts NovaGPT's automation-capable server separately.
     pub async fn manual_login(
         executable: impl AsRef<Path>,
         profile: impl AsRef<Path>,
     ) -> Result<(), BrowserError> {
-        BrowserDriver::manual_login(executable.as_ref(), profile.as_ref(), HOME)
-            .await
-            .map_err(BrowserError::from)
+        novagpt_browser_driver::undetected::manual_login(
+            executable.as_ref(),
+            profile.as_ref(),
+            HOME,
+        )
+        .await
+        .map_err(BrowserError::from)
+    }
+
+    async fn create_tab(
+        &self,
+        chrome: &UndetectedChrome,
+        url: &str,
+    ) -> Result<WebDriverTab, BrowserError> {
+        match chrome.new_tab(url).await {
+            Ok(tab) => Ok(tab),
+            Err(
+                UpstreamError::SessionExpired
+                | UpstreamError::TabClosed
+                | UpstreamError::WebDriver
+                | UpstreamError::Chrome
+                | UpstreamError::ChromeStartup,
+            ) => {
+                chrome.reconnect().await.map_err(BrowserError::from)?;
+                chrome.new_tab(url).await.map_err(BrowserError::from)
+            }
+            Err(error) => Err(BrowserError::from(error)),
+        }
     }
 
     pub async fn open(&self, id: &str) -> Result<(), BrowserError> {
@@ -385,57 +514,36 @@ impl ChatGptBrowser {
             return Err(BrowserError::Protocol);
         }
         let _serial = self.inner.create_lock.lock().await;
-        self.inner
-            .driver
-            .ensure_started()
-            .await
-            .map_err(BrowserError::from)?;
+        let chrome = self.chrome().await?;
         {
             let mut pages = self.inner.pages.lock().await;
-            pages.retain(|_, page| !page.transport.is_stale());
-            if pages.contains_key(id) {
+            // Preserve other agents' stale handles until their send state can
+            // determine whether a pre-submission recovery is safe.
+            if pages
+                .get(id)
+                .is_some_and(|page| !page.transport.is_closed())
+            {
                 return Err(BrowserError::Unavailable);
             }
+            pages.remove(id);
         }
         let transport = self
-            .inner
-            .driver
-            .new_page()
-            .await
-            .map_err(BrowserError::from)?;
+            .create_tab(&chrome, if id == BROWSE_TAB { "" } else { HOME })
+            .await?;
         let page = Arc::new(Page {
             transport,
             cancelled: AtomicBool::new(false),
+            submission_attempted: AtomicBool::new(false),
             send_lock: Mutex::new(()),
             pending_before: Mutex::new(None),
             manual: Mutex::new(None),
             recent_events: Mutex::new(VecDeque::new()),
             previous_state: Mutex::new(None),
             console: Mutex::new(VecDeque::new()),
+            console_seen: Mutex::new(VecDeque::new()),
             reporter: self.inner.reporter.clone(),
         });
-        // On new targets, navigate only after CDP attachment. Login and
-        // verification redirects are handled by the ChatGPT adapter.
-        let initialized = async {
-            if id != BROWSE_TAB {
-                page.command("Page.enable", json!({})).await?;
-                let nav = page.command("Page.navigate", json!({"url":HOME})).await?;
-                if nav.get("errorText").is_some() {
-                    return Err(BrowserError::Unavailable);
-                }
-            }
-            page.diagnostic("tab_opened", "").await;
-            if id == BROWSE_TAB {
-                page.command("Log.enable", json!({})).await?;
-                page.command("Network.enable", json!({})).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = initialized {
-            let _ = page.transport.close().await;
-            return Err(error);
-        }
+        page.diagnostic("tab_opened", "").await;
         self.inner.pages.lock().await.insert(id.to_owned(), page);
         Ok(())
     }
@@ -444,11 +552,7 @@ impl ChatGptBrowser {
     /// This operation reuses the same owned Chrome process/profile.
     pub async fn browse_open(&self) -> Result<BrowserDiagnostics, BrowserError> {
         // Validate the owned Chrome process before reusing a remembered tab.
-        self.inner
-            .driver
-            .ensure_started()
-            .await
-            .map_err(BrowserError::from)?;
+        let _ = self.chrome().await?;
         if self.page(BROWSE_TAB).await.is_err() {
             match self.open(BROWSE_TAB).await {
                 Ok(()) | Err(BrowserError::Unavailable) => {}
@@ -469,16 +573,14 @@ impl ChatGptBrowser {
             .as_str()
             .unwrap_or("")
             .to_owned();
-        page.command("Page.enable", json!({})).await?;
         // Diagnostics from a previous browsing destination must not be
         // mistaken for errors produced by the next website.
         page.console.lock().await.clear();
-        let navigation = page
-            .command("Page.navigate", json!({"url":target.as_str()}))
-            .await?;
-        if navigation.get("errorText").is_some() {
-            return Err(BrowserError::Unavailable);
-        }
+        page.console_seen.lock().await.clear();
+        page.transport
+            .goto(target.as_str())
+            .await
+            .map_err(BrowserError::from)?;
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let state = page
@@ -643,15 +745,10 @@ impl ChatGptBrowser {
         })
     }
 
-    /// Click a visible, unobscured element using a real CDP mouse event.
+    /// Click a visible, unobscured element using a physical browser mouse event.
     pub async fn browse_click(&self, selector: &str) -> Result<bool, BrowserError> {
         validate_selector(selector)?;
         let page = self.page(BROWSE_TAB).await?;
-        let _input = page
-            .transport
-            .acquire_input()
-            .await
-            .map_err(BrowserError::from)?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
         let expression = format!(
@@ -678,13 +775,10 @@ impl ChatGptBrowser {
         let (Some(x), Some(y)) = (point["x"].as_f64(), point["y"].as_f64()) else {
             return Err(BrowserError::InvalidControl);
         };
-        for kind in ["mousePressed", "mouseReleased"] {
-            page.command(
-                "Input.dispatchMouseEvent",
-                json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1}),
-            )
-            .await?;
-        }
+        page.transport
+            .click_at(x, y)
+            .await
+            .map_err(BrowserError::from)?;
         Ok(true)
     }
 
@@ -696,11 +790,6 @@ impl ChatGptBrowser {
             return Err(BrowserError::InvalidControl);
         }
         let page = self.page(BROWSE_TAB).await?;
-        let _input = page
-            .transport
-            .acquire_input()
-            .await
-            .map_err(BrowserError::from)?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
         let expression = format!(
@@ -730,8 +819,10 @@ impl ChatGptBrowser {
         if page.eval(&expression).await? != Value::Bool(true) {
             return Err(BrowserError::InvalidControl);
         }
-        page.command("Input.insertText", json!({"text":text}))
-            .await?;
+        page.transport
+            .insert_text(text)
+            .await
+            .map_err(BrowserError::from)?;
         Ok(true)
     }
 
@@ -739,11 +830,12 @@ impl ChatGptBrowser {
     /// failures captured from the browsing tab. Stored only in process memory.
     pub async fn browse_console(&self) -> Result<BrowserConsole, BrowserError> {
         let page = self.page(BROWSE_TAB).await?;
-        // The evaluate command also drains queued CDP events. Its result is
-        // validated so redirects to private/internal origins cannot be read.
+        // Refresh ChromeDriver's browser log after validating the origin;
+        // entries are redacted and bounded before they leave the process.
         let location = page.eval("location.href").await?;
         let url = location.as_str().ok_or(BrowserError::Protocol)?;
         self.approved_url(url)?;
+        page.refresh_console().await;
         let entries = page.console.lock().await.iter().cloned().collect();
         Ok(BrowserConsole {
             url: url.to_owned(),
@@ -764,7 +856,7 @@ impl ChatGptBrowser {
             .get(id)
             .cloned()
             .ok_or(BrowserError::Unavailable)?;
-        if page.transport.is_stale() {
+        if page.transport.is_closed() {
             return Err(BrowserError::Unavailable);
         }
         Ok(page)
@@ -786,14 +878,24 @@ impl ChatGptBrowser {
         } else {
             (None, Vec::new())
         };
+        let page_ready = target.is_some();
+        let page_count = pages.len();
+        drop(pages);
+        let browser_state = {
+            let runtime = self.inner.runtime.lock().await;
+            match runtime.as_ref() {
+                Some(chrome) => chrome.status().await.to_string(),
+                None => "stopped".to_owned(),
+            }
+        };
         let last_step = recent_events.last().cloned();
         BrowserDiagnostics {
-            browser_state: self.inner.driver.status().await.to_string(),
-            page_count: pages.len(),
+            browser_state,
+            page_count,
             queued_page_creations: 0,
             manual_check: manual,
-            page_ready: target.is_some(),
-            automation_driver: "chrome-cdp",
+            page_ready,
+            automation_driver: "chrome-driver-webdriver",
             recent_events,
             last_step,
         }
@@ -803,8 +905,76 @@ impl ChatGptBrowser {
         if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT {
             return Err(BrowserError::TooLarge);
         }
-        let page = self.page(id).await?;
-        // The old CDP poller must leave before a new prompt resets its
+        let mut outcome = self.send_inner(id, prompt).await;
+        if matches!(
+            outcome,
+            Err(BrowserError::Unavailable
+                | BrowserError::Protocol
+                | BrowserError::Timeout
+                | BrowserError::NotRunning)
+        ) {
+            let attempted = self
+                .inner
+                .pages
+                .lock()
+                .await
+                .get(id)
+                .is_some_and(|page| page.submission_attempted.load(Ordering::Acquire));
+            if attempted {
+                return Err(BrowserError::AmbiguousSubmission);
+            }
+            // No possible submission occurred. Recover the driver/session and
+            // retry the unsent prompt exactly once; this is the only automatic
+            // replay path, and it is gated on submission_attempted == false.
+            if self.reconnect_runtime().await.is_ok() {
+                outcome = self.send_inner(id, prompt).await;
+                let attempted = self
+                    .inner
+                    .pages
+                    .lock()
+                    .await
+                    .get(id)
+                    .is_some_and(|page| page.submission_attempted.load(Ordering::Acquire));
+                if attempted && outcome.is_err() {
+                    return Err(BrowserError::AmbiguousSubmission);
+                }
+            }
+        }
+        outcome
+    }
+
+    async fn reconnect_runtime(&self) -> Result<(), BrowserError> {
+        let chrome = self.inner.runtime.lock().await.clone();
+        let chrome = chrome.ok_or(BrowserError::NotRunning)?;
+        chrome
+            .reconnect()
+            .await
+            .map(|_| ())
+            .map_err(BrowserError::from)
+    }
+
+    async fn send_inner(&self, id: &str, prompt: &str) -> Result<BrowserReply, BrowserError> {
+        let page = match self.page(id).await {
+            Ok(page) => page,
+            Err(error) => {
+                let stale = self.inner.pages.lock().await.get(id).cloned();
+                if let Some(stale) = stale {
+                    if stale.submission_attempted.load(Ordering::Acquire) {
+                        stale.diagnostic("recovery_blocked_after_send", "").await;
+                        return Err(BrowserError::AmbiguousSubmission);
+                    }
+                    // Only recover a page that never attempted submission.
+                    // Keep the same owned profile; never replay a sent prompt.
+                    self.open(id).await?;
+                    let recovered = self.page(id).await?;
+                    recovered.diagnostic("tab_recovered_before_send", "").await;
+                    recovered
+                } else {
+                    return Err(error);
+                }
+            }
+        };
+        // The previous send poller must leave before a new prompt resets its
         // cancellation flag or reuses the per-tab pending response state.
         let _send_guard = page.send_lock.lock().await;
         page.cancelled.store(false, Ordering::Relaxed);
@@ -820,7 +990,7 @@ impl ChatGptBrowser {
             }
             let state = match self.dom_state(&page).await {
                 Ok(state) => state,
-                // CDP may switch execution contexts while the newly created
+                // Navigation may switch execution contexts while the newly created
                 // tab navigates. Keep the same bounded wait as the original adapter.
                 Err(BrowserError::Protocol) if Instant::now() < ready_deadline => {
                     if !navigation_retry_logged {
@@ -836,21 +1006,20 @@ impl ChatGptBrowser {
                 }
             };
             page.note_state(&state).await;
-            if state["transient"] == true {
-                if Instant::now() >= ready_deadline {
-                    page.diagnostic("initial_navigation_timeout", "").await;
-                    return Err(BrowserError::Timeout);
+            match page_phase(&state) {
+                PagePhase::Ready | PagePhase::Authentication | PagePhase::Verification => {
+                    break state;
                 }
-                sleep(Duration::from_millis(250)).await;
-                continue;
-            }
-            if state["composer"] == true
-                || state["challenge"] == true
-                || state["login"] == true
-                || state["external"] == true
-                || Instant::now() >= ready_deadline
-            {
-                break state;
+                PagePhase::Navigation | PagePhase::Unavailable => {
+                    if Instant::now() >= ready_deadline {
+                        if page_phase(&state) == PagePhase::Navigation {
+                            page.diagnostic("navigation_timeout", "").await;
+                            return Err(BrowserError::NavigationTimeout);
+                        }
+                        page.diagnostic("composer_unavailable", "").await;
+                        return Err(BrowserError::ComposerUnavailable);
+                    }
+                }
             }
             sleep(Duration::from_millis(250)).await;
         };
@@ -859,19 +1028,15 @@ impl ChatGptBrowser {
             page.diagnostic("manual_check_required", manual).await;
             return Err(BrowserError::Manual(manual));
         }
+        *page.manual.lock().await = None;
         page.diagnostic("composer_ready", "").await;
         let pending = *page.pending_before.lock().await;
         let before = if let Some(before) = pending {
             before
         } else {
             let before = state["assistant_count"].as_u64().unwrap_or(0) as usize;
-            let _input = page
-                .transport
-                .acquire_input()
-                .await
-                .map_err(BrowserError::from)?;
             // Select the actual visible, editable textbox (not its wrapper).
-            // Replacing a selection via CDP generates browser input events,
+            // Replacing a selection via browser input generates real input events,
             // unlike writing directly to the DOM or dispatching fake events.
             let focused = page
                 .eval(&ui_expression(
@@ -895,8 +1060,10 @@ impl ChatGptBrowser {
                 return Err(BrowserError::Unavailable);
             }
             page.diagnostic("composer_focused", "").await;
-            page.command("Input.insertText", json!({"text": prompt}))
-                .await?;
+            page.transport
+                .insert_text(prompt)
+                .await
+                .map_err(BrowserError::from)?;
             page.diagnostic("text_input_dispatched", "").await;
             // Check an actual prefix of the inserted prompt, not merely that
             // some unrelated element had nonempty text.
@@ -915,7 +1082,7 @@ impl ChatGptBrowser {
                 return Err(BrowserError::Unavailable);
             }
             page.diagnostic("text_verified", "").await;
-            // Native CDP mouse events, rather than DOM .click(), match the
+            // Physical mouse events, rather than DOM .click(), match the
             // physical input that a browser automation click uses.
             // Retry briefly for React to enable the button after typing.
             let mut button = Value::Null;
@@ -935,32 +1102,23 @@ impl ChatGptBrowser {
             }
             if let (Some(x), Some(y)) = (button["x"].as_f64(), button["y"].as_f64()) {
                 page.diagnostic("send_button_found", "").await;
-                page.command(
-                    "Input.dispatchMouseEvent",
-                    json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
-                )
-                .await?;
-                page.command(
-                    "Input.dispatchMouseEvent",
-                    json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
-                )
-                .await?;
+                // ChromeDriver can fail after the first event with unknown outcome.
+                page.submission_attempted.store(true, Ordering::Release);
+                page.transport
+                    .click_at(x, y)
+                    .await
+                    .map_err(BrowserError::from)?;
                 page.diagnostic("send_mouse_dispatched", "").await;
             } else {
                 page.diagnostic("send_button_missing_enter_fallback", "")
                     .await;
                 // The send button is absent in some ChatGPT layouts; Enter is
                 // the fallback after filling the editor.
-                page.command(
-                    "Input.dispatchKeyEvent",
-                    json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}),
-                )
-                .await?;
-                page.command(
-                    "Input.dispatchKeyEvent",
-                    json!({"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}),
-                )
-                .await?;
+                page.submission_attempted.store(true, Ordering::Release);
+                page.transport
+                    .press_enter()
+                    .await
+                    .map_err(BrowserError::from)?;
                 page.diagnostic("send_enter_dispatched", "").await;
             }
             *page.pending_before.lock().await = Some(before);
@@ -1001,6 +1159,7 @@ impl ChatGptBrowser {
                 last = reply.to_owned();
                 if stable >= 3 {
                     *page.pending_before.lock().await = None;
+                    page.submission_attempted.store(false, Ordering::Release);
                     page.diagnostic("reply_completed", "").await;
                     let conversation_url = state["url"]
                         .as_str()
@@ -1019,18 +1178,23 @@ impl ChatGptBrowser {
     async fn dom_state(&self, page: &Page) -> Result<Value, BrowserError> {
         // Never reads cookies/localStorage. Inspect only visible UI controls.
         let expression = ui_expression(&format!(
-            r#"// A newly created CDP target can briefly be about:blank
+            r#"// A newly created tab can briefly be about:blank
             // before Chrome commits its requested ChatGPT navigation.
             if (location.href === 'about:blank' ||
                 location.href === 'chrome://newtab/' ||
                 location.href === 'chrome://new-tab-page/') {{
                 return {{external:true, transient:true, page_kind:'initial_blank'}};
             }}
+            // Title is bounded metadata, never included in diagnostic records.
+            const title = (document.title || '').slice(0, 96);
+            if (document.readyState === 'loading') {{
+                return {{transient:true, page_kind:'navigation', title}};
+            }}
             if (location.origin !== 'https://chatgpt.com' &&
                 location.origin !== 'https://chat.openai.com') {{
                 const authentication = location.origin === 'https://auth.openai.com' ||
                     location.origin === 'https://login.openai.com';
-                return {{external:true, transient:false,
+                return {{external:true, transient:false, title,
                     page_kind:authentication ? 'authentication' : 'external_other'}};
             }}
             const editor = findEditor();
@@ -1047,7 +1211,7 @@ impl ChatGptBrowser {
             const content = last?.querySelector('.markdown, [data-message-content], .prose') || last;
             const stop = !!document.querySelector('[data-testid="stop-button"]');
             const copy = !!last?.querySelector('[data-testid="copy-turn-action-button"]');
-            return {{url:location.href, page_kind:'chatgpt',
+            return {{url:location.href, title, page_kind:'chatgpt',
                 composer:!!editor, challenge, login,
                 assistant_count:assistants.length, last_text:content?.innerText || '',
                 complete:copy || !stop}};"#,
@@ -1063,6 +1227,7 @@ impl ChatGptBrowser {
         let page = self.page(id).await?;
         page.cancelled.store(true, Ordering::Relaxed);
         *page.pending_before.lock().await = None;
+        page.submission_attempted.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1147,61 +1312,30 @@ fn public_https_url(input: &str) -> Result<reqwest::Url, BrowserError> {
     Ok(url)
 }
 
-/// Retain only bounded diagnostics from the dedicated browsing target.
-fn browser_event(event: &Value) -> Option<BrowserConsoleEntry> {
-    let (kind, message) = match event["method"].as_str()? {
-        "Runtime.consoleAPICalled" => {
-            let kind = event["params"]["type"].as_str().unwrap_or("console");
-            let message = event["params"]["args"]
-                .as_array()?
-                .iter()
-                .take(4)
-                .filter_map(|arg| {
-                    arg["value"]
-                        .as_str()
-                        .or_else(|| arg["description"].as_str())
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            (kind.to_owned(), message)
-        }
-        "Runtime.exceptionThrown" => (
-            "exception".to_owned(),
-            event["params"]["exceptionDetails"]["text"]
-                .as_str()
-                .unwrap_or("Uncaught exception")
-                .to_owned(),
-        ),
-        "Log.entryAdded" => (
-            event["params"]["entry"]["level"]
-                .as_str()
-                .unwrap_or("log")
-                .to_owned(),
-            event["params"]["entry"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned(),
-        ),
-        "Network.loadingFailed" => (
-            "network_error".to_owned(),
-            event["params"]["errorText"]
-                .as_str()
-                .unwrap_or("Request failed")
-                .to_owned(),
-        ),
-        "Network.responseReceived" => {
-            let status = event["params"]["response"]["status"].as_u64()?;
-            if status < 400 {
-                return None;
+/// Map one ChromeDriver browser-log entry to a bounded console record.
+/// Chrome includes the page URL in log text; redact URL-shaped tokens before
+/// the value can reach MCP output.
+fn browser_log_entry(entry: &Value) -> Option<BrowserConsoleEntry> {
+    let kind = entry["level"].as_str().unwrap_or("log");
+    let message = entry["message"].as_str()?;
+    if message.is_empty() {
+        return None;
+    }
+    let message = message
+        .split_whitespace()
+        .map(|token| {
+            if token.starts_with("http://")
+                || token.starts_with("https://")
+                || token.starts_with("ws://")
+                || token.starts_with("wss://")
+            {
+                "[url]"
+            } else {
+                token
             }
-            let resource = event["params"]["type"].as_str().unwrap_or("Other");
-            (
-                "http_error".to_owned(),
-                format!("HTTP {status} ({resource})"),
-            )
-        }
-        _ => return None,
-    };
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     if message.is_empty() {
         return None;
     }
@@ -1227,29 +1361,82 @@ fn safe_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PagePhase {
+    Ready,
+    Navigation,
+    Authentication,
+    Verification,
+    Unavailable,
+}
+
+impl PagePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Navigation => "navigation",
+            Self::Authentication => "authentication",
+            Self::Verification => "verification",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+fn verification_title(title: &str) -> bool {
+    // Some Cloudflare interstitials show no visible Turnstile element.
+    let title = title.trim().to_ascii_lowercase();
+    matches!(
+        title.as_str(),
+        "just a moment..." | "just a moment…" | "attention required! | cloudflare"
+    )
+}
+
+fn page_phase(state: &Value) -> PagePhase {
+    // A verification interstitial can also appear on an auth redirect.
+    if state["challenge"] == true
+        || (state["composer"] != true && state["title"].as_str().is_some_and(verification_title))
+    {
+        return PagePhase::Verification;
+    }
+    if state["page_kind"] == "authentication" {
+        return PagePhase::Authentication;
+    }
+    if state["external"] == true && state["transient"] != true {
+        return PagePhase::Unavailable;
+    }
+    if state["composer"] == true {
+        // A login link can coexist with a functioning composer.
+        return PagePhase::Ready;
+    }
+    if state["login"] == true {
+        return PagePhase::Authentication;
+    }
+    if state["transient"] == true {
+        return PagePhase::Navigation;
+    }
+    PagePhase::Unavailable
+}
+
 fn manual_reason(state: &Value) -> Option<&'static str> {
-    if state["external"] == true {
-        return Some(if state["page_kind"] == "authentication" {
-            "authentication"
-        } else {
-            "verification"
-        });
+    match page_phase(state) {
+        PagePhase::Authentication => Some("authentication"),
+        PagePhase::Verification => Some("verification"),
+        _ => None,
     }
-    if state["challenge"] == true {
-        return Some("verification");
-    }
-    // An optional login control can coexist with a functioning textbox.
-    // This implementation accepts the visible composer as evidence the user can type.
-    if state["composer"] != true {
-        return Some("authentication");
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::timeout;
+    use novagpt_browser_driver::undetected::{WebDriverClient, WebDriverSession};
+    use std::{sync::Arc, time::Duration};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::TcpListener,
+        sync::Mutex,
+        time::timeout,
+    };
+
     #[test]
     fn manual_checks_are_never_bypassed() {
         assert_eq!(
@@ -1257,14 +1444,13 @@ mod tests {
             Some("verification")
         );
         assert_eq!(
-            manual_reason(&json!({"composer":false})),
+            manual_reason(&json!({"composer":false,"login":true})),
             Some("authentication")
         );
         assert_eq!(
             manual_reason(&json!({"composer":true,"challenge":false,"login":false})),
             None
         );
-        // The login link may be present while the usable composer is visible.
         assert_eq!(
             manual_reason(&json!({"composer":true,"challenge":false,"login":true})),
             None
@@ -1275,205 +1461,68 @@ mod tests {
         );
         assert_eq!(
             manual_reason(&json!({"external":true,"page_kind":"external_other"})),
-            Some("verification")
+            None
         );
-        // Visible verification always needs a person, even with an editor.
         assert_eq!(
             manual_reason(&json!({"composer":true,"challenge":true,"login":false})),
             Some("verification")
         );
     }
+
+    #[test]
+    fn interstitial_authentication_and_navigation_are_distinct() {
+        for title in [
+            "Just a moment...",
+            "Just a moment…",
+            " ATTENTION REQUIRED! | CLOUDFLARE ",
+        ] {
+            let state = json!({"page_kind":"chatgpt", "title":title, "composer":false});
+            assert_eq!(page_phase(&state), PagePhase::Verification);
+            assert_eq!(manual_reason(&state), Some("verification"));
+        }
+        assert_eq!(
+            page_phase(
+                &json!({"page_kind":"chatgpt", "title":"Just a moment...", "composer":true})
+            ),
+            PagePhase::Ready,
+            "a conversation title alone must not block a working composer"
+        );
+        assert_eq!(
+            page_phase(&json!({"page_kind":"authentication", "external":true})),
+            PagePhase::Authentication
+        );
+        assert_eq!(
+            page_phase(&json!({"page_kind":"initial_blank", "external":true, "transient":true})),
+            PagePhase::Navigation
+        );
+        assert_eq!(
+            page_phase(&json!({"page_kind":"navigation", "transient":true})),
+            PagePhase::Navigation
+        );
+        assert_eq!(
+            page_phase(&json!({"page_kind":"chatgpt", "composer":false, "login":false})),
+            PagePhase::Unavailable,
+            "a missing composer is not proof of logout"
+        );
+        assert_eq!(
+            page_phase(&json!({"page_kind":"external_other", "external":true})),
+            PagePhase::Unavailable,
+            "an unfamiliar external URL is not evidence of verification"
+        );
+        assert_eq!(
+            page_phase(&json!({"page_kind":"chatgpt", "challenge":true, "composer":true})),
+            PagePhase::Verification,
+            "a visible challenge takes priority over an editor"
+        );
+    }
+
     #[test]
     fn ui_adapter_discovers_editable_textboxes_and_requires_visible_controls() {
         let expression = ui_expression("return !!findEditor() && !!findSendButton();");
         assert!(expression.contains("[role='textbox'][contenteditable='true']"));
-        assert!(expression.contains("getBoundingClientRect()"));
-        assert!(expression.contains("el.disabled || el.readOnly"));
-        assert!(expression.contains("aria-disabled"));
-        assert!(expression.contains("findSendButton()"));
-    }
-    #[tokio::test]
-    async fn subagent_send_uses_cdp_text_and_physical_send_button() {
-        // A local, disposable CDP websocket stub proves the command sequence
-        // without contacting ChatGPT, using a real Chrome profile or sending data.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind local CDP fixture");
-        let port = listener.local_addr().expect("fixture address").port();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("fixture client");
-            let mut socket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("fixture websocket");
-            let mut inserted = false;
-            let mut pressed = false;
-            let mut released = false;
-            let mut console_logged = false;
-            let mut reply_logged = false;
-            let mut state_polls = 0;
-            while let Some(Ok(Message::Text(raw))) = socket.next().await {
-                let request: Value = serde_json::from_str(&raw).expect("CDP request");
-                let method = request["method"].as_str().expect("CDP method");
-                let result = match method {
-                    "Runtime.enable" => json!({}),
-                    "Page.bringToFront" => json!({}),
-                    "Runtime.evaluate" => {
-                        let expression = request["params"]["expression"]
-                            .as_str()
-                            .expect("expression");
-                        if expression.contains("console.log(")
-                            && expression.contains("[NovaGPT/browser]")
-                        {
-                            console_logged = true;
-                            if expression.contains("reply_completed") {
-                                reply_logged = true;
-                            }
-                        }
-                        let value = if expression.contains("document.visibilityState") {
-                            json!(true)
-                        } else if expression.contains("assistant_count:assistants.length") {
-                            state_polls += 1;
-                            if state_polls <= 2 {
-                                json!({
-                                    "external":true,
-                                    "transient":true,
-                                    "page_kind":"initial_blank"
-                                })
-                            } else {
-                                json!({
-                                    "url":"https://chatgpt.com/c/mock",
-                                    "page_kind":"chatgpt",
-                                    "composer":true,"challenge":false,"login":false,
-                                    "assistant_count":if released { 1 } else { 0 },
-                                    "last_text":if released { "Fixture answer" } else { "" },
-                                    "complete":true
-                                })
-                            }
-                        } else if expression.contains("document.activeElement === el") {
-                            json!(true)
-                        } else if expression.contains("return editorText(findEditor())") {
-                            json!(if inserted { "Fixture prompt" } else { "" })
-                        } else if expression.contains("rect.left + rect.width/2") {
-                            json!({"x": 100.0,"y": 40.0})
-                        } else {
-                            Value::Null
-                        };
-                        if expression.contains("assistant_count:assistants.length")
-                            && (3..=4).contains(&state_polls)
-                        {
-                            json!({"exceptionDetails":{"text":"navigation context replaced"}})
-                        } else {
-                            json!({"result":{"value":value}})
-                        }
-                    }
-                    "Input.insertText" => {
-                        inserted = request["params"]["text"] == "Fixture prompt";
-                        json!({})
-                    }
-                    "Input.dispatchMouseEvent" => {
-                        if request["params"]["type"] == "mousePressed" {
-                            pressed = true;
-                        } else if request["params"]["type"] == "mouseReleased" {
-                            released = pressed;
-                        }
-                        json!({})
-                    }
-                    "Input.dispatchKeyEvent" => panic!("send button available; Enter not needed"),
-                    _ => panic!("unexpected CDP method: {method}"),
-                };
-                socket
-                    .send(Message::Text(
-                        json!({"id":request["id"],"result":result})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .expect("CDP fixture response");
-                if released && reply_logged {
-                    return inserted && pressed && released && console_logged;
-                }
-            }
-            false
-        });
-        let executable = tempfile::NamedTempFile::new().expect("fixture executable");
-        let profile = tempfile::tempdir().expect("fixture profile");
-        let browser = ChatGptBrowser::new(executable.path(), profile.path().join("owned"))
-            .expect("fixture browser");
-        let driver_page = browser
-            .inner
-            .driver
-            .connect_fixture(&format!("ws://127.0.0.1:{port}/"), "abcdef")
-            .await
-            .expect("fixture driver page");
-        browser.inner.pages.lock().await.insert(
-            "agent-test123".into(),
-            Arc::new(Page {
-                transport: driver_page,
-                cancelled: AtomicBool::new(false),
-                send_lock: Mutex::new(()),
-                pending_before: Mutex::new(None),
-                manual: Mutex::new(None),
-                recent_events: Mutex::new(VecDeque::new()),
-                previous_state: Mutex::new(None),
-                console: Mutex::new(VecDeque::new()),
-                reporter: None,
-            }),
-        );
-        let reply = timeout(
-            Duration::from_secs(8),
-            browser.send("agent-test123", "Fixture prompt"),
-        )
-        .await
-        .expect("mock send timeout")
-        .expect("mock send result");
-        assert_eq!(reply.content, "Fixture answer");
-        assert_eq!(
-            reply.conversation_url.as_deref(),
-            Some("https://chatgpt.com/c/mock")
-        );
-        let diagnostics = browser.diagnostics(Some("agent-test123")).await;
-        assert_eq!(diagnostics.last_step.as_deref(), Some("reply_completed"));
-        assert!(
-            diagnostics
-                .recent_events
-                .iter()
-                .any(|step| step.contains("page_kind=initial_blank"))
-        );
-        assert!(
-            diagnostics
-                .recent_events
-                .iter()
-                .any(|step| step.contains("page_kind=chatgpt"))
-        );
-        assert!(
-            diagnostics
-                .recent_events
-                .iter()
-                .any(|step| step == "composer_ready")
-        );
-        assert!(
-            diagnostics
-                .recent_events
-                .iter()
-                .any(|step| step == "text_verified")
-        );
-        assert!(
-            diagnostics
-                .recent_events
-                .iter()
-                .any(|step| step == "send_mouse_dispatched")
-        );
-        assert!(diagnostics.recent_events.len() <= MAX_DIAGNOSTIC_EVENTS);
-        let serialized = serde_json::to_string(&diagnostics).expect("diagnostic json");
-        assert!(!serialized.contains("Fixture prompt"));
-        assert!(!serialized.contains("Fixture answer"));
-        assert!(!serialized.contains("https://chatgpt.com/c/mock"));
-        assert!(
-            timeout(Duration::from_secs(2), server)
-                .await
-                .expect("fixture completion")
-                .expect("fixture join")
-        );
+        assert!(expression.contains("isContentEditable"));
+        assert!(expression.contains("data-testid") && expression.contains("send-button"));
+        assert!(expression.contains("rect.width <= 0"));
     }
 
     #[test]
@@ -1503,11 +1552,16 @@ mod tests {
             assert!(public_https_url(denied).is_err(), "{denied}");
         }
     }
-    #[test]
-    fn loopback_navigation_is_available_by_default_and_other_local_hosts_are_denied() {
+
+    fn public_browser() -> ChatGptBrowser {
         let executable = tempfile::NamedTempFile::new().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let browser = ChatGptBrowser::new(executable.path(), root.path().join("profile")).unwrap();
+        ChatGptBrowser::new(executable.path(), root.path().join("profile")).unwrap()
+    }
+
+    #[test]
+    fn loopback_navigation_is_available_by_default_and_other_local_hosts_are_denied() {
+        let browser = public_browser();
         for allowed in [
             "https://example.org/app",
             "http://localhost:5173/",
@@ -1541,9 +1595,7 @@ mod tests {
 
     #[test]
     fn optional_dev_origin_restricts_to_exact_scheme_host_and_port() {
-        let executable = tempfile::NamedTempFile::new().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let browser = ChatGptBrowser::new(executable.path(), root.path().join("profile")).unwrap();
+        let browser = public_browser();
         for invalid in [
             "http://192.168.1.5:3000",
             "http://localhost",
@@ -1581,148 +1633,431 @@ mod tests {
     }
 
     #[test]
-    fn console_entries_are_bounded_and_do_not_record_request_urls() {
-        let secret_url = "https://example.org/api?token=sensitive";
-        let entry = browser_event(&json!({
-            "method":"Network.responseReceived",
-            "params":{"response":{"status":404,"url":secret_url},"type":"XHR"}
+    fn console_entries_are_bounded_and_redact_urls() {
+        let entry = browser_log_entry(&json!({
+            "level":"SEVERE",
+            "message":"https://example.org/api?token=sensitive fixture failure"
         }))
         .unwrap();
-        assert_eq!(entry.kind, "http_error");
-        assert_eq!(entry.message, "HTTP 404 (XHR)");
-        assert!(!entry.message.contains(secret_url));
+        assert_eq!(entry.kind, "SEVERE");
+        assert!(entry.message.contains("fixture failure"));
+        assert!(!entry.message.contains("token=sensitive"));
+        assert!(!entry.message.contains("https://"));
         let long = "x".repeat(1000);
-        let entry = browser_event(&json!({
-            "method":"Runtime.consoleAPICalled",
-            "params":{"type":"error","args":[{"value":long}]}
-        }))
-        .unwrap();
-        assert_eq!(entry.kind, "error");
+        let entry = browser_log_entry(&json!({"level":"INFO","message":long})).unwrap();
         assert_eq!(entry.message.len(), 300);
-        assert!(browser_event(&json!({"method":"Network.requestWillBeSent"})).is_none());
+        assert!(browser_log_entry(&json!({"level":"INFO"})).is_none());
+        assert!(browser_log_entry(&json!({"level":"INFO","message":""})).is_none());
+    }
+
+    #[test]
+    fn id_validation_is_safe() {
+        assert!(safe_id("agent-abcdef01"));
+        assert!(!safe_id("../secret"));
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        handles: Vec<String>,
+        current: String,
+        next_handle: usize,
+        polls: usize,
+        initial_blank: usize,
+        verified: bool,
+        reply_ready: bool,
+        inserted: usize,
+        inserted_text: String,
+        pressed: bool,
+        released: bool,
+        clicks: usize,
+        url: String,
+        logs: Vec<Value>,
+        cdp: Vec<String>,
+    }
+
+    async fn spawn_mock() -> (u16, Arc<Mutex<MockState>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(Mutex::new(MockState {
+            handles: vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()],
+            current: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            url: "about:blank".into(),
+            ..Default::default()
+        }));
+        let shared = state.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let state = shared.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = socket.into_split();
+                    let mut reader = BufReader::new(read);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let mut parts = line.split_whitespace();
+                        let method = parts.next().unwrap_or("").to_owned();
+                        let path = parts.next().unwrap_or("").to_owned();
+                        let mut content_length = 0_usize;
+                        loop {
+                            let mut header = String::new();
+                            if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if header == "\r\n" || header == "\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = header.split_once(':')
+                                && name.eq_ignore_ascii_case("content-length")
+                            {
+                                content_length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0_u8; content_length.min(1024 * 1024)];
+                        if content_length > 0 {
+                            let _ = reader.read_exact(&mut body).await;
+                        }
+                        let (status, value) = route(&method, &path, &body, &state).await;
+                        let mut encoded = serde_json::to_vec(&value).unwrap_or_default();
+                        encoded.push(b'\n');
+                        let head = format!(
+                            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            encoded.len()
+                        );
+                        if write.write_all(head.as_bytes()).await.is_err()
+                            || write.write_all(&encoded).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, state, task)
+    }
+
+    async fn route(
+        method: &str,
+        path: &str,
+        body: &[u8],
+        state: &Arc<Mutex<MockState>>,
+    ) -> (u16, Value) {
+        let mut state = state.lock().await;
+        let session = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        if method == "POST" && path == "/session" {
+            return (
+                200,
+                json!({"value":{"sessionId":session,"capabilities":{}}}),
+            );
+        }
+        if method == "GET" && path.ends_with("/window/handles") {
+            return (200, json!({"value":state.handles.clone()}));
+        }
+        if method == "POST" && path.ends_with("/window/new") {
+            state.next_handle += 1;
+            let handle = format!("{:032x}", state.next_handle + 0xaa);
+            state.handles.push(handle.clone());
+            state.current = handle;
+            return (200, json!({"value":{"handle":state.current,"type":"tab"}}));
+        }
+        if method == "POST" && path.ends_with("/window") {
+            let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let Some(handle) = parsed["handle"].as_str() else {
+                return (400, json!({"value":{"error":"invalid argument"}}));
+            };
+            if !state.handles.iter().any(|known| known == handle) {
+                return (404, json!({"value":{"error":"no such window"}}));
+            }
+            state.current = handle.to_owned();
+            return (200, json!({"value":null}));
+        }
+        if method == "GET" && path.ends_with("/window") {
+            return (200, json!({"value":state.current}));
+        }
+        if method == "GET" && path.ends_with("/url") {
+            return (200, json!({"value":state.url}));
+        }
+        if method == "POST" && path.ends_with("/url") {
+            let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            state.url = parsed["url"].as_str().unwrap_or("about:blank").to_owned();
+            return (200, json!({"value":null}));
+        }
+        if method == "POST" && path.ends_with("/timeouts") {
+            return (200, json!({"value":null}));
+        }
+        if method == "POST" && path.ends_with("/execute/sync") {
+            let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let script = parsed["script"].as_str().unwrap_or("");
+            let value = if script.contains("assistant_count:assistants.length") {
+                state.polls += 1;
+                if state.polls <= state.initial_blank {
+                    json!({"external":true,"transient":true,"page_kind":"initial_blank"})
+                } else if !state.verified {
+                    json!({"page_kind":"chatgpt","title":"Just a moment...",
+                        "composer":false,"challenge":false,"login":false})
+                } else if state.reply_ready {
+                    json!({"url":"https://chatgpt.com/c/mock","page_kind":"chatgpt",
+                        "composer":true,"challenge":false,"login":false,
+                        "assistant_count":1,"last_text":"Fixture answer","complete":true})
+                } else {
+                    json!({"url":"https://chatgpt.com/","page_kind":"chatgpt",
+                        "composer":true,"challenge":false,"login":false,
+                        "assistant_count":0,"last_text":"","complete":true})
+                }
+            } else if script.contains("document.activeElement === el") {
+                json!(true)
+            } else if script.contains("return editorText(findEditor())") {
+                json!(state.inserted_text)
+            } else if script.contains("rect.left + rect.width/2") {
+                json!({"x":100.0,"y":40.0})
+            } else if script.contains("document.visibilityState") {
+                json!(true)
+            } else if script.contains("ready:document.readyState") {
+                json!({"url":state.url,"ready":"complete"})
+            } else if script.contains("document.body?.innerText") {
+                json!({"url":"http://localhost:5173/","title":"Ace Blocker",
+                    "text":"Configure once. Hold the line."})
+            } else if script.contains("broken_images:") {
+                json!({"url":"http://localhost:5173/","title":"Fixture",
+                    "viewport_width":800,"viewport_height":600,
+                    "document_width":801,"broken_images":1,
+                    "headings":["Fixture heading"],
+                    "controls":[{"tag":"button","label":"Save","selector":"#save"}]})
+            } else if script.contains("url:location.href,width:innerWidth") {
+                json!({"url":state.url,"width":800,"height":600})
+            } else if script.contains("elementFromPoint") {
+                json!({"x":55.0,"y":30.0,"href":null})
+            } else if script.contains("location.href") {
+                json!(state.url)
+            } else {
+                Value::Null
+            };
+            return (200, json!({"value":value}));
+        }
+        if method == "POST" && path.ends_with("/goog/cdp/execute") {
+            let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let command = parsed["cmd"].as_str().unwrap_or("");
+            state.cdp.push(command.to_owned());
+            let params = &parsed["params"];
+            return match command {
+                "Input.insertText" => {
+                    state.inserted += 1;
+                    state.inserted_text = params["text"].as_str().unwrap_or("").to_owned();
+                    (200, json!({"value":{}}))
+                }
+                "Input.dispatchMouseEvent" => {
+                    if params["type"] == "mousePressed" {
+                        state.pressed = true;
+                    } else if params["type"] == "mouseReleased" {
+                        state.released = state.pressed;
+                        state.reply_ready = state.released;
+                    }
+                    state.clicks += 1;
+                    (200, json!({"value":{}}))
+                }
+                "Input.dispatchKeyEvent" => {
+                    (200, json!({"value":{"error":"unexpected key fallback"}}))
+                }
+                "Page.navigate" => {
+                    state.url = params["url"].as_str().unwrap_or("about:blank").to_owned();
+                    (200, json!({"value":{}}))
+                }
+                "Page.captureScreenshot" => (
+                    200,
+                    json!({"value":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XvCuXwAAAABJRU5ErkJggg=="}}),
+                ),
+                "Page.enable"
+                | "Log.enable"
+                | "Network.enable"
+                | "Emulation.setDeviceMetricsOverride" => (200, json!({"value":{}})),
+                "Runtime.evaluate" => (200, json!({"value":{"result":{"value":Value::Null}}})),
+                _ => (404, json!({"value":{"error":"unknown command"}})),
+            };
+        }
+        if method == "POST" && path.ends_with("/se/log") {
+            return (200, json!({"value":state.logs.clone()}));
+        }
+        if method == "GET" && path.ends_with("/screenshot") {
+            return (
+                200,
+                json!({"value":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XvCuXwAAAABJRU5ErkJggg=="}),
+            );
+        }
+        if method == "DELETE" && path.ends_with("/window") {
+            let current = state.current.clone();
+            state.handles.retain(|handle| handle != &current);
+            return (200, json!({"value":null}));
+        }
+        if method == "DELETE" && path.starts_with("/session/") {
+            return (200, json!({"value":null}));
+        }
+        (404, json!({"value":{"error":"unknown command"}}))
+    }
+
+    async fn test_session(port: u16) -> WebDriverSession {
+        let client = WebDriverClient::new(port).expect("client");
+        WebDriverSession::create(client, json!({"browserName":"chrome"}))
+            .await
+            .expect("session")
     }
 
     #[tokio::test]
-    async fn browsing_tools_use_cdp_and_return_viewable_image_without_real_chrome() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let fixture = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let mut screenshot_requested = false;
-            let mut typed = false;
-            let mut clicked = 0;
-            let mut navigated = false;
-            while let Some(Ok(Message::Text(raw))) = socket.next().await {
-                let request: Value = serde_json::from_str(&raw).unwrap();
-                let method = request["method"].as_str().unwrap();
-                let result = match method {
-                    "Runtime.enable" => json!({}),
-                    "Page.bringToFront" => json!({}),
-                    "Runtime.evaluate" => {
-                        let expr = request["params"]["expression"].as_str().unwrap();
-                        let value = if expr.contains("document.visibilityState") {
-                            json!(true)
-                        } else if expr.contains("ready:document.readyState") {
-                            json!({"url":if navigated { "http://localhost:5173/" } else { "about:blank" },
-                                "ready":"complete"})
-                        } else if expr.contains("document.body?.innerText") {
-                            json!({"url":"http://localhost:5173/","title":"Ace Blocker",
-                                "text":"Configure once. Hold the line."})
-                        } else if expr.contains("broken_images:") {
-                            json!({"url":"http://localhost:5173/","title":"Fixture",
-                                "viewport_width":800,"viewport_height":600,
-                                "document_width":801,"broken_images":1,
-                                "headings":["Fixture heading"],
-                                "controls":[{"tag":"button","label":"Save","selector":"#save"}]})
-                        } else if expr.contains("url:location.href,width:innerWidth") {
-                            json!({"url":"http://localhost:5173/","width":800,"height":600})
-                        } else if expr.contains("elementFromPoint") {
-                            json!({"x":55.0,"y":30.0,"href":null})
-                        } else if expr.contains("document.activeElement === el") {
-                            json!(true)
-                        } else {
-                            json!(if navigated {
-                                "http://localhost:5173/"
-                            } else {
-                                "about:blank"
-                            })
-                        };
-                        if expr == "location.href" {
-                            socket.send(Message::Text(json!({
-                                "method":"Runtime.consoleAPICalled",
-                                "params":{"type":"warning","args":[{"value":"fixture warning"}]}
-                            }).to_string().into())).await.unwrap();
-                        }
-                        json!({"result":{"value":value}})
-                    }
-                    "Page.navigate" => {
-                        assert_eq!(request["params"]["url"], "http://localhost:5173/");
-                        navigated = true;
-                        json!({})
-                    }
-                    "Page.captureScreenshot" => {
-                        assert_eq!(request["params"]["captureBeyondViewport"], false);
-                        screenshot_requested = true;
-                        json!({"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XvCuXwAAAABJRU5ErkJggg=="})
-                    }
-                    "Emulation.setDeviceMetricsOverride" => {
-                        assert_eq!(request["params"]["width"], 800);
-                        json!({})
-                    }
-                    "Input.insertText" => {
-                        typed = request["params"]["text"] == "fixture text";
-                        json!({})
-                    }
-                    "Input.dispatchMouseEvent" => {
-                        clicked += 1;
-                        json!({})
-                    }
-                    "Page.enable" => json!({}),
-                    other => panic!("unexpected CDP method: {other}"),
-                };
-                socket
-                    .send(Message::Text(
-                        json!({
-                            "id":request["id"],"result":result
-                        })
-                        .to_string()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
-            }
-            (screenshot_requested, typed, clicked)
-        });
-        let executable = tempfile::NamedTempFile::new().unwrap();
-        let profile = tempfile::tempdir().unwrap();
-        let browser =
-            ChatGptBrowser::new(executable.path(), profile.path().join("profile")).unwrap();
-        let driver_page = browser
-            .inner
-            .driver
-            .connect_fixture(&format!("ws://{address}/"), "abcdef")
-            .await
-            .expect("fixture driver page");
+    async fn subagent_send_uses_native_state_and_cdp_input() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut state = state.lock().await;
+            state.initial_blank = 2;
+            state.verified = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-test123").await.expect("open");
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-test123", "Fixture prompt"),
+        )
+        .await
+        .expect("send timeout")
+        .expect("send result");
+        assert_eq!(reply.content, "Fixture answer");
+        assert_eq!(
+            reply.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/mock")
+        );
+        let diagnostics = browser.diagnostics(Some("agent-test123")).await;
+        assert_eq!(diagnostics.last_step.as_deref(), Some("reply_completed"));
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|e| e == "composer_ready")
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|e| e == "text_verified")
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|e| e == "send_mouse_dispatched")
+        );
+        let serialized = serde_json::to_string(&diagnostics).expect("json");
+        assert!(!serialized.contains("Fixture prompt"));
+        assert!(!serialized.contains("Fixture answer"));
+        assert!(!serialized.contains("https://chatgpt.com/c/mock"));
+        let state = state.lock().await;
+        assert_eq!(state.inserted, 1);
+        assert!(state.released);
+        assert!(state.cdp.iter().any(|cmd| cmd == "Input.insertText"));
+        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.dispatchKeyEvent"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn interstitial_waits_for_manual_verification_then_resumes_same_unsent_prompt() {
+        let (port, state, server) = spawn_mock().await;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-verified").await.expect("open");
+        let first = timeout(
+            Duration::from_secs(3),
+            browser.send("agent-verified", "Retained fixture prompt"),
+        )
+        .await
+        .expect("first probe")
+        .expect_err("manual verification");
+        assert!(matches!(first, BrowserError::Manual("verification")));
+        assert_eq!(
+            browser
+                .diagnostics(Some("agent-verified"))
+                .await
+                .manual_check,
+            Some("verification".to_owned())
+        );
+        {
+            let mut state = state.lock().await;
+            state.verified = true;
+            state.inserted = 0;
+        }
+        let reply = timeout(
+            Duration::from_secs(6),
+            browser.send("agent-verified", "Retained fixture prompt"),
+        )
+        .await
+        .expect("resume")
+        .expect("reply");
+        assert_eq!(reply.content, "Fixture answer");
+        assert_eq!(state.lock().await.inserted, 1);
+        assert!(
+            browser
+                .diagnostics(Some("agent-verified"))
+                .await
+                .manual_check
+                .is_none()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stale_submitted_tab_cannot_silently_replay_a_prompt() {
+        let (port, state, server) = spawn_mock().await;
+        let session = test_session(port).await;
+        let tab = session.first_tab().await.expect("tab");
+        let browser = ChatGptBrowser::with_test_session(session.clone());
         browser.inner.pages.lock().await.insert(
-            BROWSE_TAB.into(),
+            "agent-crashed".into(),
             Arc::new(Page {
-                transport: driver_page,
+                transport: tab,
                 cancelled: AtomicBool::new(false),
+                submission_attempted: AtomicBool::new(true),
                 send_lock: Mutex::new(()),
-                pending_before: Mutex::new(None),
+                pending_before: Mutex::new(Some(0)),
                 manual: Mutex::new(None),
                 recent_events: Mutex::new(VecDeque::new()),
                 previous_state: Mutex::new(None),
                 console: Mutex::new(VecDeque::new()),
+                console_seen: Mutex::new(VecDeque::new()),
                 reporter: None,
             }),
         );
+        session.close().await.expect("close session");
+        assert!(matches!(
+            browser.send("agent-crashed", "Never replay").await,
+            Err(BrowserError::AmbiguousSubmission)
+        ));
+        let diagnostic = browser.diagnostics(Some("agent-crashed")).await;
+        assert!(
+            diagnostic
+                .recent_events
+                .iter()
+                .any(|event| event == "recovery_blocked_after_send")
+        );
+        assert_eq!(diagnostic.page_count, 1);
+        assert_eq!(state.lock().await.inserted, 0);
+        server.abort();
+    }
 
+    #[tokio::test]
+    async fn browsing_tools_use_webdriver_cdp_and_return_viewable_image() {
+        let (port, state, server) = spawn_mock().await;
+        state.lock().await.logs = vec![json!({
+            "level":"WARNING",
+            "message":"https://secret.example/path fixture warning"
+        })];
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.browse_open().await.expect("browse open");
         let page = browser
             .browse_navigate("http://localhost:5173/")
             .await
-            .unwrap();
+            .expect("navigate");
         assert_eq!(page.title, "Ace Blocker");
         assert!(page.text.contains("Configure once."));
         assert!(matches!(
@@ -1737,43 +2072,53 @@ mod tests {
             browser.browse_viewport(800, 600, f64::NAN).await,
             Err(BrowserError::InvalidControl)
         ));
-        let viewport = browser.browse_viewport(800, 600, 2.0).await.unwrap();
-        assert_eq!(viewport.width, 800);
-        let inspection = browser.browse_inspect().await.unwrap();
+        assert_eq!(
+            browser
+                .browse_viewport(800, 600, 2.0)
+                .await
+                .expect("viewport")
+                .width,
+            800
+        );
+        let inspection = browser.browse_inspect().await.expect("inspect");
         assert_eq!(inspection.broken_images, 1);
         assert_eq!(inspection.controls[0].selector.as_deref(), Some("#save"));
         assert_eq!(inspection.document_width, 801);
-
-        assert!(browser.browse_click("#save").await.unwrap());
+        assert!(browser.browse_click("#save").await.expect("click"));
         assert!(
             browser
                 .browse_type("#search", "fixture text")
                 .await
-                .unwrap()
+                .expect("type")
         );
-        let screenshot = browser.browse_screenshot().await.unwrap();
+        let screenshot = browser.browse_screenshot().await.expect("screenshot");
         assert!(screenshot.png_base64.starts_with("iVBORw0KGgo"));
         assert_eq!(screenshot.width, 800);
         assert_eq!(screenshot.url, "http://localhost:5173/");
-        let console = browser.browse_console().await.unwrap();
+        let console = browser.browse_console().await.expect("console");
         assert!(
             console
                 .entries
                 .iter()
-                .any(|entry| entry.message == "fixture warning")
+                .any(|entry| entry.message.contains("fixture warning"))
         );
-        drop(browser);
-        let (captured, inserted, clicks) = tokio::time::timeout(Duration::from_secs(3), fixture)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(captured && inserted);
-        assert_eq!(clicks, 2);
-    }
-
-    #[test]
-    fn id_validation_is_safe() {
-        assert!(safe_id("agent-abcdef01"));
-        assert!(!safe_id("../secret"));
+        assert!(
+            console
+                .entries
+                .iter()
+                .all(|entry| !entry.message.contains("secret.example"))
+        );
+        browser.browse_close().await.expect("browse close");
+        let state = state.lock().await;
+        assert_eq!(state.inserted, 1);
+        assert!(state.released);
+        assert!(state.cdp.iter().any(|cmd| cmd == "Page.captureScreenshot"));
+        assert!(
+            state
+                .cdp
+                .iter()
+                .any(|cmd| cmd == "Emulation.setDeviceMetricsOverride")
+        );
+        server.abort();
     }
 }

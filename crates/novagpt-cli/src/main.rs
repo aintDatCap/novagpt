@@ -2,6 +2,7 @@
 mod chrome;
 mod clipboard;
 mod connection;
+mod driver;
 mod i18n;
 mod logging;
 mod ngrok_install;
@@ -123,6 +124,11 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Manage NovaGPT's native Chrome and ChromeDriver runtime.
+    ChromeDriver {
+        #[command(subcommand)]
+        action: DriverCommand,
+    },
     /// Manage the shared per-user MCP HTTP token.
     Token {
         #[command(subcommand)]
@@ -143,6 +149,23 @@ enum Command {
         cpus: u8,
         #[arg(long, default_value_t = 4096)]
         memory_mb: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum DriverCommand {
+    /// Report the installed ChromeDriver without downloading anything.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download, verify and patch a ChromeDriver matching the installed Chrome.
+    Install {
+        /// Optional Chrome milestone (for example 156); defaults to the installed Chrome.
+        #[arg(long)]
+        milestone: Option<u32>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -204,6 +227,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // A user-wide token can be managed from any directory without loading
     // workspace configuration or requiring a valid --root.
+    if let Some(Command::ChromeDriver { action }) = &cli.command {
+        let action = match action {
+            DriverCommand::Status { json } => driver::DriverAction::Status { json: *json },
+            DriverCommand::Install { milestone, json } => driver::DriverAction::Install {
+                milestone: *milestone,
+                json: *json,
+            },
+        };
+        return driver::run(action, cli.chatgpt_chrome.as_deref()).await;
+    }
     if let Some(Command::Token { action }) = &cli.command {
         match action {
             TokenCommand::Show => {
@@ -582,7 +615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.bytes
             );
         }
-        Some(Command::Token { .. } | Command::Logs { .. }) => {
+        Some(Command::Token { .. } | Command::Logs { .. } | Command::ChromeDriver { .. }) => {
             unreachable!("local commands handled above")
         }
         Some(

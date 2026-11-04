@@ -144,7 +144,19 @@ fn response_status(port: u16, token: Option<&str>) -> String {
         net::TcpStream,
         time::Duration,
     };
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to local server");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(error) if std::time::Instant::now() < deadline => {
+                // Another parallel test may briefly race on a released port
+                // while the real server is still binding.
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("connect to local server: {error:?}"),
+        }
+    };
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();

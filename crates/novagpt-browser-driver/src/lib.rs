@@ -1,14 +1,9 @@
-//! Rust-native CDP browser automation for one dedicated, persistent Chrome profile.
+//! Rust-native browser automation for one dedicated, persistent Chrome profile.
 //!
-//! Owns browser lifecycle and general page operations, not ChatGPT selectors,
-//! conversations, credentials or identity-provider policy.
-mod cdp;
-mod config;
-mod error;
-mod lifecycle;
-mod profile;
+//! Chrome process ownership, ChromeDriver installation/patching, the W3C
+//! WebDriver session, tabs, and input all live in `undetected`. The ChatGPT
+//! adapter in `novagpt-browser` is the only consumer; this crate contains no
+//! provider selectors, credentials, or conversation policy.
+pub mod undetected;
 
-pub use cdp::{DriverPage, InputLease, Locator, WaitState};
-pub use config::{DriverConfig, discover_chrome};
-pub use error::DriverError;
-pub use lifecycle::{BrowserDriver, TargetInfo};
+pub use undetected::discover_chrome;

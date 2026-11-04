@@ -156,6 +156,25 @@ To use an **MCP client that starts a local subprocess**:
 novagpt --root /absolute/path/to/your-project stdio
 ```
 
+## Managed ChromeDriver (optional)
+
+The optional ChromeDriver compatibility backend uses a separate, versioned
+driver store:
+
+```bash
+novagpt chrome-driver status
+novagpt chrome-driver install              # match the installed Chrome milestone
+novagpt chrome-driver install --milestone 156
+```
+
+`status` never downloads. `install` downloads only ChromeDriver from Chrome
+for Testing (or the legacy ≤114 layout), verifies/patches it, and reuses it
+later without network access. Set `NOVAGPT_CHROMEDRIVER_HOME` to an absolute
+directory to choose a different store. These commands do not launch a browser
+or open a profile. The ChatGPT adapter uses this managed ChromeDriver transport
+on first use, installing the matching driver if it is missing. See
+[undetected-chromedriver-parity.md](undetected-chromedriver-parity.md).
+
 ## Troubleshooting
 
 - **ngrok command not found:** restart your terminal to refresh PATH, or install ngrok from its official download page. Supported TUI installation may prompt when you start a tunnel.
