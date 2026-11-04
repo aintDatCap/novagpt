@@ -1,4 +1,4 @@
-//! NovaGPT command-line entrypoint; never modifies a CodexPro installation.
+//! Independent NovaGPT command-line entrypoint.
 mod chrome;
 mod connection;
 mod i18n;
@@ -35,9 +35,6 @@ struct Cli {
     /// Launch interactive Ratatui setup for the selected workspace.
     #[arg(long)]
     setup: bool,
-    /// Read-only directory containing CodexPro profiles for optional import.
-    #[arg(long)]
-    codexpro_home: Option<PathBuf>,
     /// Optional read-only NovaGPT workspace folder to import connection settings from.
     #[arg(long)]
     novagpt_source: Option<PathBuf>,
@@ -50,7 +47,7 @@ struct Cli {
     /// Dedicated Chrome executable; otherwise detect Google Chrome automatically.
     #[arg(long)]
     chatgpt_chrome: Option<PathBuf>,
-    /// Dedicated browser profile path; never reuse a personal or CodexPro profile.
+    /// Dedicated browser profile path; never reuse a personal browser profile.
     #[arg(long)]
     chatgpt_profile: Option<PathBuf>,
     /// Opt in to an already-running, separate local Chrome CDP endpoint; never uses the ChatGPT subagent Chrome.
@@ -315,7 +312,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "browser_configured": local.browser_enabled ||
                         (cli.chatgpt_chrome.is_some() && cli.chatgpt_profile.is_some()),
                     "http_listen_address": "127.0.0.1",
-                    "codexpro_installation_modified": false,
                     "verified_remote_mcp": false,
                     "feature_parity": "INITIAL",
                 });
@@ -368,8 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if cli.setup || cli.command.is_none() {
-        let home = cli.codexpro_home.unwrap_or_else(settings::codexpro_home);
-        let mut profiles = settings::discover_codexpro_profiles(&home)?;
+        let mut profiles = Vec::new();
         if let Some(folder) = cli.novagpt_source.as_deref() {
             let imported = settings::discover_novagpt_workspace(folder)?;
             profiles.push(imported);

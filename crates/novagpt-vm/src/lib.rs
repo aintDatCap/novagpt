@@ -1,4 +1,4 @@
-//! Opt-in disposable VM management. Never touches CodexPro VM state.
+//! Opt-in disposable VM management. Never touches other application VM state.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -173,7 +173,7 @@ impl VmManager {
             }
         } else {
             // Refuse to initialize a nonempty foreign directory (especially
-            // CodexPro's own VM storage) without a NovaGPT ownership marker.
+            // another application's VM storage) without a NovaGPT ownership marker.
             if fs::read_dir(&root)?.next().is_some() {
                 return Err(VmError::NotOwned);
             }

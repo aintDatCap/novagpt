@@ -257,7 +257,7 @@ mod tests {
     fn import_port_ngrok_and_only_after_approval() {
         let dir = tempfile::tempdir().unwrap();
         let profile = ImportProfile {
-            source: "CodexPro",
+            source: "NovaGPT",
             origin: PathBuf::from("fixture.json"),
             root_label: "sample".into(),
             port: Some(9393),
@@ -436,7 +436,7 @@ mod tests {
         let token = "T".repeat(40);
         let link = format!(
             "https://example.ngrok-free.app/mcp?{}={token}",
-            "codexpro_token"
+            "novagpt_token"
         );
         a.on_event(OperationEvent::ConnectorUrlReady(Ok(link.clone())));
         assert!(matches!(a.modal, Some(Modal::ConnectorUrl(_))));

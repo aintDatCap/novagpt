@@ -1,5 +1,5 @@
 //! Bounded workspace-scoped handoff artifacts. Creation never starts an agent.
-//! Handoff IDs are explicit, new files only; no CodexPro state/profile access.
+//! Handoff IDs are explicit, new files only; no access to unrelated application state or profiles.
 use crate::{FileDocument, NovaError, NovaResult, WorkspaceRegistry};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

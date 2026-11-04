@@ -103,7 +103,7 @@ impl WorkspaceRegistry {
                 fs::create_dir_all(parent)?;
             }
             // Windows-compatible bounded write. Replacement atomicity is not
-            // yet at CodexPro parity: track as pending, never claim otherwise.
+            // fully verified: track as pending, never claim otherwise.
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create(true)

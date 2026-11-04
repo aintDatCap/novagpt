@@ -201,7 +201,7 @@ pub fn connector_url(endpoint: &str, token: &str) -> Result<String, &'static str
     {
         return Err("Invalid endpoint or shared HTTP token");
     }
-    url.query_pairs_mut().append_pair("codexpro_token", token);
+    url.query_pairs_mut().append_pair("novagpt_token", token);
     Ok(url.to_string())
 }
 

@@ -1299,7 +1299,9 @@ fn authorize_reason(token: &str, request: &Request) -> AuthResult {
     let mut query_present = false;
     let mut query_valid = false;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        if key == "codexpro_token" {
+        // Accept the previous query key only to keep existing private connectors
+        // working while users transition to novagpt_token. Never advertise it.
+        if key == "novagpt_token" || key == "codexpro_token" {
             if query_present {
                 return AuthResult::DuplicateQuery;
             }

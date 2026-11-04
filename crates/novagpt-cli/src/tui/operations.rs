@@ -383,7 +383,7 @@ impl Controller {
                     let tx_check = tx.clone();
                     let probe_token = token.clone();
                     let probe = tokio::spawn(async move {
-                        // An unrelated listener (e.g. CodexPro) must never mark NovaGPT ready.
+                        // An unrelated listener must never mark NovaGPT ready.
                         for _ in 0..120 {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             if connection::probe(address.port(), &probe_token).await.is_ok() {

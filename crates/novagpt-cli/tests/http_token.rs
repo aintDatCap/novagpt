@@ -398,7 +398,7 @@ fn multiple_legacy_tokens_are_discarded_for_one_new_token() {
         "{}",
         String::from_utf8_lossy(&shown.stderr)
     );
-    assert!(String::from_utf8_lossy(&shown.stderr).contains("ATTENZIONE"));
+    assert!(String::from_utf8_lossy(&shown.stderr).contains("WARNING"));
     let current = String::from_utf8(shown.stdout).unwrap().trim().to_owned();
     assert_eq!(current.len(), 64);
     assert_ne!(current, a);

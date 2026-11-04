@@ -122,7 +122,7 @@ async fn separate_http_sessions_share_files_and_conflicts() {
 
     // "No authentication" client: token is provided only in the query URL.
     let base = format!("http://127.0.0.1:{port}/mcp");
-    let key = "codexpro_token";
+    let key = "novagpt_token";
     let query_url = format!("{base}?{key}={token}");
     let unauth = client
         .post(&base)

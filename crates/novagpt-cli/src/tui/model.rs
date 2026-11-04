@@ -34,7 +34,7 @@ pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
         3 => i18n::Messages::chrome_executable(lang),
         4 => i18n::Messages::add_authorized_directory(lang),
         5 => i18n::Messages::remove_authorized_directory(lang),
-        6 => i18n::Messages::choose_codexpro_novagpt_profile(lang),
+        6 => i18n::Messages::choose_novagpt_profile(lang),
         7 => i18n::Messages::import_profile_preview(lang),
         8 => i18n::Messages::save_settings(lang),
         9 => i18n::Messages::discard_changes(lang),

@@ -29,7 +29,7 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const HOME: &str = "https://chatgpt.com/";
 const BROWSE_TAB: &str = "browse-main";
 const MAX_BROWSE_TEXT: usize = 20_000;
-// Match CodexPro's textbox-first discovery, but require a real visible,
+// Match textbox-first discovery, but require a real visible,
 // editable element before typing. A matching wrapper is not a composer.
 const COMPOSER_SELECTORS: &[&str] = &[
     "#prompt-textarea",
@@ -687,7 +687,7 @@ impl ChatGptBrowser {
             let state = match self.dom_state(&page).await {
                 Ok(state) => state,
                 // CDP may switch execution contexts while the newly created
-                // tab navigates. Keep the same bounded wait as CodexPro.
+                // tab navigates. Keep the same bounded wait as the original adapter.
                 Err(BrowserError::Protocol) if Instant::now() < ready_deadline => {
                     if !navigation_retry_logged {
                         page.diagnostic("navigation_context_retry", "").await;
@@ -777,7 +777,7 @@ impl ChatGptBrowser {
             }
             page.diagnostic("text_verified", "").await;
             // Native CDP mouse events, rather than DOM .click(), match the
-            // physical input that CodexPro's Playwright locator.click uses.
+            // physical input that a browser automation click uses.
             // Retry briefly for React to enable the button after typing.
             let mut button = Value::Null;
             for _ in 0..8 {
@@ -811,7 +811,7 @@ impl ChatGptBrowser {
                 page.diagnostic("send_button_missing_enter_fallback", "")
                     .await;
                 // The send button is absent in some ChatGPT layouts; Enter is
-                // CodexPro's fallback after filling the editor.
+                // the fallback after filling the editor.
                 page.command(
                     "Input.dispatchKeyEvent",
                     json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}),
@@ -993,7 +993,7 @@ fn manual_reason(state: &Value) -> Option<&'static str> {
         return Some("verification");
     }
     // An optional login control can coexist with a functioning textbox.
-    // CodexPro accepts the visible composer as evidence the user can type.
+    // This implementation accepts the visible composer as evidence the user can type.
     if state["composer"] != true {
         return Some("authentication");
     }

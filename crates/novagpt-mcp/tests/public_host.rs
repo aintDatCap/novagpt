@@ -34,7 +34,7 @@ async fn explicitly_approved_public_host_can_initialize_but_other_hosts_cannot()
         "protocolVersion":"2025-11-25","capabilities":{},
         "clientInfo":{"name":"host-regression","version":"1"}
     }});
-    let url = format!("http://127.0.0.1:{port}/mcp?codexpro_token={token}");
+    let url = format!("http://127.0.0.1:{port}/mcp?novagpt_token={token}");
     let initialize = |host: &str| {
         client
             .post(&url)

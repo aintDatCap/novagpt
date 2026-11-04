@@ -212,7 +212,7 @@ messages! {
         ngrok_tunnel_not_ready_yet: { en: "ngrok tunnel not ready yet", it: "Tunnel ngrok non ancora disponibile" },
         ngrok_tunnel_startup_requested: { en: "ngrok tunnel startup requested...", it: "Avvio del tunnel ngrok richiesto..." },
         enter_a_value_and_press_enter_2: { en: "Enter a value and press Enter:", it: "Inserisci il valore e premi Invio:" },
-        choose_codexpro_novagpt_profile: { en: "Choose CodexPro / NovaGPT profile", it: "Scegli profilo CodexPro / NovaGPT" },
+        choose_novagpt_profile: { en: "Choose NovaGPT profile", it: "Scegli profilo NovaGPT" },
         maximum_16_authorized_directories: { en: "Maximum 16 authorized directories.", it: "Massimo 16 directory autorizzate." },
         maximum_16_additional_directories: { en: "Maximum 16 additional directories.", it: "Massimo 16 directory aggiuntive." },
         no_tui_server_to_stop: { en: "No TUI server to stop.", it: "Nessun server TUI da arrestare." },

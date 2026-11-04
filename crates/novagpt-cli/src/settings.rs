@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -223,71 +222,6 @@ pub struct ImportProfile {
     pub tunnel: Option<String>,
     pub ngrok_domain: Option<String>,
 }
-/// Reads only selected public configuration fields from CodexPro workspace profiles.
-pub fn discover_codexpro_profiles(home: &Path) -> io::Result<Vec<ImportProfile>> {
-    let dir = home.join("profiles");
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    real_dir(&dir)?;
-    let mut found = Vec::new();
-    for entry in fs::read_dir(&dir)?.take(64) {
-        let path = entry?.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let Ok(bytes) = read_limited(&path) else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        let Some(root) = v.get("root").and_then(Value::as_str) else {
-            continue;
-        };
-        if root.len() > 1024 || root.chars().any(|ch| ch.is_control()) {
-            continue;
-        }
-        let port = v
-            .get("port")
-            .and_then(|v| match v {
-                Value::String(s) => s.parse::<u16>().ok(),
-                Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
-                _ => None,
-            })
-            .filter(|p| *p > 0);
-        // Allowlist only the public connection settings; never import
-        // token, ngrokConfig, allowedRoots, browser or guest state.
-        let tunnel = v
-            .get("tunnel")
-            .and_then(Value::as_str)
-            .filter(|s| {
-                matches!(
-                    *s,
-                    "ngrok" | "none" | "cloudflare" | "cloudflare-named" | "tailscale"
-                )
-            })
-            .map(str::to_owned);
-        let ngrok_domain = if tunnel.as_deref() == Some("ngrok") {
-            v.get("hostname")
-                .and_then(Value::as_str)
-                .filter(|host| crate::tunnel::valid_domain(host))
-                .map(str::to_owned)
-        } else {
-            None
-        };
-        found.push(ImportProfile {
-            source: "CodexPro",
-            origin: path,
-            root_label: root.to_string(),
-            port,
-            tunnel,
-            ngrok_domain,
-        });
-    }
-    found.sort_by(|a, b| a.root_label.cmp(&b.root_label));
-    Ok(found)
-}
 /// Read public settings from another NovaGPT workspace without loading its
 /// token, permissions, browser or VM state. The source must be a real directory.
 pub fn discover_novagpt_workspace(source: &Path) -> io::Result<ImportProfile> {
@@ -333,15 +267,6 @@ pub fn discover_novagpt_workspace(source: &Path) -> io::Result<ImportProfile> {
     })
 }
 
-pub fn codexpro_home() -> PathBuf {
-    if let Some(home) = std::env::var_os("CODEXPRO_HOME") {
-        return PathBuf::from(home);
-    }
-    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codexpro")
-}
 /// Never imports secrets, ngrok configuration file contents, granted roots,
 /// private browser profiles, or VM state. Called only after TUI confirmation.
 pub fn import_supported(settings: &mut LocalSettings, profile: &ImportProfile) {
@@ -350,16 +275,8 @@ pub fn import_supported(settings: &mut LocalSettings, profile: &ImportProfile) {
     }
     if let Some(ref tunnel) = profile.tunnel {
         if tunnel == "ngrok" {
-            if profile.source == "NovaGPT" {
-                // NovaGPT permits on-demand ngrok domains. Preserve its tunnel
-                // preference even without a fixed hostname.
-                settings.ngrok_enabled = true;
-                settings.ngrok_domain = profile.ngrok_domain.clone();
-            } else if let Some(ref domain) = profile.ngrok_domain {
-                // CodexPro imports still require a validated static hostname.
-                settings.ngrok_enabled = true;
-                settings.ngrok_domain = Some(domain.clone());
-            }
+            settings.ngrok_enabled = true;
+            settings.ngrok_domain = profile.ngrok_domain.clone();
         } else {
             settings.ngrok_enabled = false;
             settings.ngrok_domain = None;
@@ -399,87 +316,6 @@ mod tests {
         cfg.port = 9989;
         save_to(&cfg, dir.path()).unwrap();
         assert_eq!(load_from(dir.path()).unwrap(), cfg);
-    }
-    #[test]
-    fn explicit_import_only_copies_safe_public_connection_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir(home.path().join("profiles")).unwrap();
-        fs::write(
-            home.path().join("profiles").join("one.json"),
-            serde_json::json!({"root":"C:/example","port":"9091","allowedRoots":["C:/other"],
-                "tunnel":"ngrok","hostname":"project.ngrok-free.dev",
-                "ngrokConfig":"C:/private/custom-ngrok.yml",
-                "token":"[REDACTED_SECRET]","chatgptBrowserProfile":"not-used"})
-            .to_string(),
-        )
-        .unwrap();
-        let profiles = discover_codexpro_profiles(home.path()).unwrap();
-        let mut cfg = LocalSettings::default();
-        assert_eq!(cfg.port, 8787);
-        import_supported(&mut cfg, &profiles[0]);
-        assert_eq!(cfg.port, 9091);
-        assert!(cfg.ngrok_enabled);
-        assert_eq!(cfg.ngrok_domain.as_deref(), Some("project.ngrok-free.dev"));
-        assert!(cfg.allowed_roots.is_empty());
-        save_to(&cfg, dir.path()).unwrap();
-        let saved = fs::read_to_string(dir.path().join("config.json")).unwrap();
-        for excluded in [
-            "not-used",
-            "REDACTED_SECRET",
-            "custom-ngrok.yml",
-            "C:/other",
-        ] {
-            assert!(!saved.contains(excluded), "unexpected imported field");
-        }
-        assert_eq!(load_from(dir.path()).unwrap(), cfg);
-    }
-    #[test]
-    fn invalid_or_unrelated_profile_tunnels_never_enable_ngrok() {
-        let home = tempfile::tempdir().unwrap();
-        fs::create_dir(home.path().join("profiles")).unwrap();
-        fs::write(
-            home.path().join("profiles").join("bad.json"),
-            serde_json::json!({"root":"A","port":9020,"tunnel":"ngrok",
-                "hostname":"https://unsafe.example/path","token":"[REDACTED_SECRET]"})
-            .to_string(),
-        )
-        .unwrap();
-        fs::write(
-            home.path().join("profiles").join("other.json"),
-            serde_json::json!({"root":"B","tunnel":"cloudflare","hostname":"wrong.example"})
-                .to_string(),
-        )
-        .unwrap();
-        let profiles = discover_codexpro_profiles(home.path()).unwrap();
-        assert_eq!(profiles.len(), 2);
-        let mut settings = LocalSettings {
-            ngrok_enabled: true,
-            ngrok_domain: Some("prior.ngrok-free.dev".into()),
-            ..LocalSettings::default()
-        };
-        import_supported(&mut settings, &profiles[0]);
-        assert_eq!(settings.port, 9020);
-        assert_eq!(
-            settings.ngrok_domain.as_deref(),
-            Some("prior.ngrok-free.dev")
-        );
-        import_supported(&mut settings, &profiles[1]);
-        assert!(!settings.ngrok_enabled);
-        assert_eq!(settings.ngrok_domain, None);
-        assert!(
-            LocalSettings {
-                ngrok_domain: Some("https://host.example".into()),
-                ..LocalSettings::default()
-            }
-            .validate()
-            .is_err()
-        );
     }
     #[test]
     fn imports_only_connection_settings_from_other_novagpt_directory() {

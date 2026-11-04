@@ -8,12 +8,9 @@ use std::{
 #[test]
 fn setup_requires_interactive_terminal_and_never_writes_unattended() {
     let workspace = tempfile::tempdir().expect("workspace");
-    let source = tempfile::tempdir().expect("codex profile home");
     let output = Command::new(env!("CARGO_BIN_EXE_novagpt"))
         .arg("--root")
         .arg(workspace.path())
-        .arg("--codexpro-home")
-        .arg(source.path())
         .arg("--setup")
         .stdin(Stdio::null())
         .output()

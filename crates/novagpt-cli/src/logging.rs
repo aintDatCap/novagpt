@@ -1,4 +1,4 @@
-//! Per-workspace audit storage outside the repository and CodexPro profiles.
+//! Per-workspace audit storage outside the repository and other applications.
 //! Keeps a separate canonical-root digest regardless of the shared HTTP token.
 //! Log-only operations never read or create credentials.
 use crate::token;

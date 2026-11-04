@@ -50,7 +50,7 @@ fn windows_candidates(mut get: impl FnMut(&str) -> Option<std::ffi::OsString>) -
         .collect()
 }
 
-/// Explicit Chrome path, then CodexPro-compatible standard locations.
+/// Explicit Chrome path, then common operating system locations.
 pub fn discover(explicit: Option<&Path>) -> io::Result<PathBuf> {
     let missing = || {
         io::Error::new(
@@ -115,7 +115,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_lookup_matches_codexpro_standard_installations_in_order() {
+    fn windows_lookup_matches_standard_installations_in_order() {
         let temp = tempfile::tempdir().unwrap();
         let candidates = windows_candidates(|name| match name {
             "ProgramFiles" => Some(temp.path().join("programs").into_os_string()),
