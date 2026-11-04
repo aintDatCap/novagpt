@@ -5,9 +5,7 @@ Read the more specific documents linked below when the task touches their area.
 
 ## Mission and non-negotiable behavior
 
-NovaGPT is a **separate Rust rewrite** of CodexPro, not an in-place replacement.
-**Never modify, move, overwrite, reset, or deploy the CodexPro repository, launcher, profiles, or user data as part of a NovaGPT task.**
-CodexPro TypeScript is a temporary behavioral oracle; parity is tracked in [docs/PARITY.md](docs/PARITY.md).
+NovaGPT is an **independent Rust MCP coding server** with its own product, protocol, UX, and release decisions. Do not describe it as a clone or promise compatibility with another product. Never modify other repositories, launchers, profiles, or user data as part of a NovaGPT task.
 
 The core product contract is **one server, many concurrent ChatGPT conversations, the same explicitly allowed real filesystem/Git tree**. An MCP transport session, token, IP, tab, or browser profile must never be treated as a ChatGPT conversation identity. Basic tools must not require client IDs, leases, dedicated copies, or worktrees. An omitted `workspace_id` always addresses the configured default root; operations on other roots must target them explicitly.
 
@@ -18,9 +16,9 @@ Optimize for correctness, safety, clarity, small reviewable changes, and maintai
 1. **Orient:** read the task, relevant module, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/ENGINEERING_STANDARDS.md](docs/ENGINEERING_STANDARDS.md), and relevant tests; inspect Git status. Preserve unrelated edits from other agents.
 2. **Define a small slice:** state the owning crate/module, invariants, public contract, likely failure modes, and test plan. Keep responsibilities in the correct layer.
 3. **Implement only the slice:** change the smallest set of files that completes an observable behavior; use typed requests/results and domain errors. Avoid cross-crate refactors unless separately justified.
-4. **Prove behavior:** add focused unit/integration tests including denial, conflict, cancellation or resource limits when applicable. Compare CodexPro fixtures when changing MCP/CLI compatibility.
+4. **Prove behavior:** add focused unit/integration tests including denial, conflict, cancellation or resource limits when applicable. Test observable MCP/CLI contracts, including compatibility changes to NovaGPT itself.
 5. **Verify:** run the relevant commands below; report exactly which passed, failed, were skipped or were unavailable. Never fabricate test output or treat existing test files as evidence of passes.
-6. **Review and hand off:** check diff for secrets, scope creep, added dependencies, changed API/schema, concurrency hazards and outdated docs. Update [docs/PARITY.md](docs/PARITY.md) only with actual evidence; name known limitations.
+6. **Review and hand off:** check diff for secrets, scope creep, added dependencies, changed API/schema, concurrency hazards and outdated docs. Update relevant tests and user/developer documentation with actual evidence; name known limitations.
 
 If several agents work simultaneously, assign **nonoverlapping files or modules**. Communicate public API assumptions in advance, use separate branches/worktrees when helpful, and coordinate changes to shared Cargo manifests, schemas, Git index and release files. Do not assume independent writes are conflict-free.
 
@@ -32,6 +30,13 @@ If several agents work simultaneously, assign **nonoverlapping files or modules*
 - Optional VM, browser, subagent, handoff, widgets and history modules must be independently switchable; the core file/Git workflow cannot depend on them.
 
 The dependency graph is `cli -> mcp -> core` (with `cli -> core` also permitted), never the reverse. Begin with cohesive **modules within existing crates**; create a new crate only for a genuine ownership/deployment/dependency boundary backed by an ADR. Keep APIs narrow, types meaningful, modules cohesive and dependencies acyclic. See [docs/ENGINEERING_STANDARDS.md](docs/ENGINEERING_STANDARDS.md).
+
+## Language policy
+
+- **All logs, diagnostics, event records, error messages, and developer documentation must be written in English.** This includes TUI Activity logs regardless of the selected UI language.
+- **TUI labels, prompts, help and user-facing interactive content may be localized** via the typed localization catalog. Never localize audit logs or persisted diagnostics.
+- The default TUI language selection is Automatic (system locale), with English as fallback for unsupported/missing locales. Tests must cover missing preferences and fallback.
+- Keep the root README friendly and concise; move implementation details to developer documentation.
 
 ## Safety and runtime rules
 
@@ -56,7 +61,7 @@ cargo test --workspace
 
 Run protocol/security/concurrency integration tests and Windows-specific tests when changing the relevant area. A release or distribution change additionally requires the relevant release builds and the acceptance gates in [docs/QUALITY_GATES.md](docs/QUALITY_GATES.md). Documentation-only changes require link/path review and a diff inspection; do **not** invent a Rust test result for them.
 
-For each change report: summary, exact files, commands with real outcomes, compatibility impact, new dependencies, risks and follow-ups. Use small meaningful commits only when explicitly asked/authorized; never force-push or rewrite unrelated history. The migration remains incomplete while required entries in `docs/PARITY.md` are `INITIAL` or `NOT STARTED`.
+For each change report: summary, exact files, commands with real outcomes, compatibility impact, new dependencies, risks and follow-ups. Use small meaningful commits only when explicitly asked/authorized; never force-push or rewrite unrelated history. Do not mark functionality stable merely because it builds; verify real behavior.
 
 ## Where to look next
 
@@ -64,5 +69,5 @@ For each change report: summary, exact files, commands with real outcomes, compa
 - [Engineering standards](docs/ENGINEERING_STANDARDS.md): design, dependency, module, API and error conventions.
 - [Extension playbook](docs/EXTENSION_PLAYBOOK.md): how to add MCP tools, core features and optional subsystems.
 - [Quality gates](docs/QUALITY_GATES.md): testing matrix, review checklist and acceptance evidence.
-- [Parity ledger](docs/PARITY.md): tracked gaps to CodexPro and evidence, never a declaration based on intention.
+- [Quality gates](docs/QUALITY_GATES.md): acceptance criteria and release checks.
 - [Project agent skills](docs/AGENT_SKILLS.md): optional skills.sh guidance installed under `.agents/skills/`; load the relevant `SKILL.md` for Rust, structure, security, README or TUI tasks. These external skills never override this contract or grant permission to run exploits, code, or unrelated refactors.

@@ -382,12 +382,12 @@ mod tests {
         );
         a.on_event(OperationEvent::ConnectorUrlReady(Ok(link.clone())));
         assert!(matches!(a.modal, Some(Modal::ConnectorUrl(_))));
-        assert!(a.logs.iter().all(|entry| !entry.message.contains(&token)));
+        assert!(a.logs.iter().all(|entry| !entry.english.contains(&token)));
         assert!(a.key(key(KeyCode::Char('x'))).is_none());
         assert!(matches!(a.key(key(KeyCode::Char('c'))),
             Some(Effect::CopyConnectorUrl(value)) if value == link));
         a.on_event(OperationEvent::CopyFinished(Ok(())));
-        assert!(a.logs.iter().all(|entry| !entry.message.contains(&token)));
+        assert!(a.logs.iter().all(|entry| !entry.english.contains(&token)));
         a.key(key(KeyCode::Esc));
         assert!(a.modal.is_none());
     }
@@ -583,6 +583,8 @@ mod tests {
     fn interface_language_changes_live_and_auto_uses_system_locale() {
         use crate::i18n::{Language, LanguageChoice};
         let mut a = app();
+        a.system_language = Language::English;
+        assert_eq!(a.draft.language, LanguageChoice::Auto);
         assert_eq!(a.language(), Language::English);
         let mut terminal = Terminal::new(TestBackend::new(130, 35)).expect("terminal");
         terminal
@@ -601,6 +603,8 @@ mod tests {
 
         a.tab = 2;
         a.config = 15;
+        a.key(key(KeyCode::Enter));
+        assert_eq!(a.draft.language, LanguageChoice::English);
         a.key(key(KeyCode::Enter));
         assert_eq!(a.draft.language, LanguageChoice::Italian);
         assert_eq!(a.language(), Language::Italian);

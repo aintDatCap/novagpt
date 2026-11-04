@@ -1,14 +1,14 @@
 //! Localized TUI messages and system language detection.
-//! English is the product default, Italian is supported explicitly,
+//! Automatic system-language selection is the default; unsupported locales use English.
 //! and Auto resolves the platform UI language once per TUI session.
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LanguageChoice {
-    #[default]
     English,
     Italian,
+    #[default]
     Auto,
 }
 
@@ -393,10 +393,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_configuration_defaults_to_english_and_rejects_invalid_languages() {
+    fn missing_language_defaults_to_auto_and_rejects_invalid_languages() {
         let legacy: crate::settings::LocalSettings =
             serde_json::from_str(r#"{"version":1,"port":8787}"#).expect("legacy settings");
-        assert_eq!(legacy.language, LanguageChoice::English);
+        assert_eq!(legacy.language, LanguageChoice::Auto);
         let mut next = legacy;
         next.language = LanguageChoice::Auto;
         let json = serde_json::to_string(&next).expect("serialized settings");
@@ -436,7 +436,7 @@ mod tests {
     }
     #[test]
     fn language_selection_default_and_cycle() {
-        assert_eq!(LanguageChoice::default(), LanguageChoice::English);
+        assert_eq!(LanguageChoice::default(), LanguageChoice::Auto);
         assert_eq!(LanguageChoice::English.next(), LanguageChoice::Italian);
         assert_eq!(LanguageChoice::Italian.next(), LanguageChoice::Auto);
         assert_eq!(LanguageChoice::Auto.next(), LanguageChoice::English);

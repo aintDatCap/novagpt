@@ -78,17 +78,17 @@ pub(super) fn install_launcher(root: &Path) -> io::Result<String> {
         Err(e) => return Err(e),
     }
     Ok(format!(
-        "Launcher: {} (binario {}, script {}; file esistenti non sovrascritti)",
+        "Launcher: {} (binary {}, script {}; existing files preserved)",
         script.display(),
         if existing_binary {
-            "gia presente"
+            "already exists"
         } else {
-            "installato"
+            "installed"
         },
         if existing_script {
-            "gia presente"
+            "already exists"
         } else {
-            "installato"
+            "installed"
         }
     ))
 }

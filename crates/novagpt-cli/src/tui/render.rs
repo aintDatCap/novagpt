@@ -355,11 +355,7 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!(
                     "  {}  {}",
                     event.time.split_whitespace().next().unwrap_or(""),
-                    if app.language() == crate::i18n::Language::English {
-                        &event.english
-                    } else {
-                        &event.message
-                    }
+                    &event.english
                 ),
                 Style::default().fg(color),
             )));
@@ -429,8 +425,8 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .map(|entry| {
             let (label, color) = match entry.level {
                 Level::Info => ("INFO ", MUTED),
-                Level::Warn => ("AVVISO", WARN),
-                Level::Error => ("ERRORE", BAD),
+                Level::Warn => ("WARN ", WARN),
+                Level::Error => ("ERROR", BAD),
                 Level::Success => ("OK   ", OK),
             };
             ListItem::new(Line::from(vec![
@@ -439,11 +435,7 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     format!("{label}  "),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(if app.language() == crate::i18n::Language::English {
-                    &entry.english
-                } else {
-                    &entry.message
-                }),
+                Span::raw(&entry.english),
             ]))
         })
         .collect::<Vec<_>>();

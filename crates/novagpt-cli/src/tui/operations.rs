@@ -47,19 +47,18 @@ impl Controller {
                     let result: Result<String, String> = async {
                         let resolved = tokio::task::spawn_blocking(token::resolve)
                             .await
-                            .map_err(|_| "Token non disponibile".to_string())?
-                            .map_err(|_| "Token non disponibile".to_string())?;
+                            .map_err(|_| "HTTP token unavailable".to_string())?
+                            .map_err(|_| "HTTP token unavailable".to_string())?;
                         connection::probe(port, &resolved.value)
                             .await
                             .map_err(|_| {
-                                "Server MCP non raggiungibile o autenticazione non valida"
-                                    .to_string()
+                                "MCP server unreachable or authentication failed".to_string()
                             })?;
                         let endpoint = tunnel::NgrokTunnel::discover_endpoint(port, None)
                             .await
-                            .ok_or("Tunnel ngrok non ancora disponibile".to_string())?;
+                            .ok_or("ngrok tunnel not ready".to_string())?;
                         tunnel::connector_url(&endpoint, &resolved.value)
-                            .map_err(|_| "URL del tunnel non valido".to_string())
+                            .map_err(|_| "Invalid tunnel URL".to_string())
                     }
                     .await;
                     let _ = tx.send(OperationEvent::ConnectorUrlReady(result));
@@ -86,20 +85,20 @@ impl Controller {
                             .stderr(Stdio::null())
                             .spawn()
                             .map_err(|_| {
-                                "Clipboard non disponibile: seleziona manualmente l'URL".to_string()
+                                "Clipboard unavailable: select the URL manually".to_string()
                             })?;
                         process
                             .stdin
                             .take()
-                            .ok_or("Clipboard senza stdin".to_string())?
+                            .ok_or("Clipboard standard input unavailable".to_string())?
                             .write_all(url.as_bytes())
-                            .map_err(|_| "Scrittura clipboard fallita".to_string())?;
+                            .map_err(|_| "Clipboard write failed".to_string())?;
                         if !process
                             .wait()
-                            .map_err(|_| "Clipboard non riuscito".to_string())?
+                            .map_err(|_| "Clipboard operation failed".to_string())?
                             .success()
                         {
-                            return Err("Clipboard non riuscito".into());
+                            return Err("Clipboard operation failed".into());
                         }
                         Ok(())
                     })();
@@ -109,8 +108,10 @@ impl Controller {
             Effect::LoadNovaSource(source) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    let result = settings::discover_novagpt_workspace(&source)
-                        .map_err(|_| "Impossibile importare la cartella: verifica percorso e .novagpt/config.json.".to_string());
+                    let result = settings::discover_novagpt_workspace(&source).map_err(|_| {
+                        "Unable to import folder: check the path and .novagpt/config.json."
+                            .to_string()
+                    });
                     let _ = tx.send(OperationEvent::NovaSourceLoaded(result));
                 });
             }
@@ -172,9 +173,7 @@ impl Controller {
                         .and_then(|vm| vm.images().map_err(|e| e.to_string()));
                     let message = OperationEvent::VmInventory(match result {
                         Ok(images) => Ok(images.image_count),
-                        Err(_) => Err(
-                            "Impossibile leggere inventario VM; controlla lo store locale.".into(),
-                        ),
+                        Err(_) => Err("Unable to list VM images; check the local store.".into()),
                     });
                     let _ = tx.send(message);
                 });
@@ -185,22 +184,22 @@ impl Controller {
                     let location = settings::config_path();
                     let result = novagpt_core::WorkspaceRegistry::new(&root, &config.allowed_roots);
                     let msg = format!(
-                        "Diagnostica: workspace {}; config {}; VM {}; browser {}.",
-                        if result.is_ok() { "OK" } else { "NON VALIDO" },
+                        "Diagnostics: workspace {}; settings {}; VM {}; browser {}.",
+                        if result.is_ok() { "OK" } else { "INVALID" },
                         if location.as_ref().is_ok_and(|path| path.is_file()) {
-                            "salvata"
+                            "saved"
                         } else {
-                            "non salvata"
+                            "not saved"
                         },
                         if config.vm_enabled {
-                            "abilitata"
+                            "enabled"
                         } else {
-                            "disabilitata"
+                            "disabled"
                         },
                         if config.browser_enabled {
-                            "abilitato"
+                            "enabled"
                         } else {
-                            "disabilitato"
+                            "disabled"
                         },
                     );
                     let level = if result.is_ok() {
@@ -232,7 +231,7 @@ impl Controller {
                                 ))
                             }
                         })
-                        .map_err(|_| "Directory non valida o non accessibile.".to_string());
+                        .map_err(|_| "Invalid or inaccessible directory.".to_string());
                     let _ = tx.send(OperationEvent::RootAdded(result));
                 });
             }
@@ -241,7 +240,7 @@ impl Controller {
                 self.runtime.spawn_blocking(move || {
                     let result = token::resolve()
                         .map(|value| value.description())
-                        .map_err(|err| format!("Impossibile preparare il token HTTP: {err}"));
+                        .map_err(|err| format!("Unable to prepare HTTP token: {err}"));
                     let _ = tx.send(OperationEvent::TokenReady(result));
                 });
             }
@@ -250,13 +249,11 @@ impl Controller {
                 self.runtime.spawn_blocking(move || {
                     let outcome = match settings.save() {
                         Ok(path) => {
-                            let mut report = format!("Configurazione salvata: {}.", path.display());
+                            let mut report = format!("Settings saved: {}.", path.display());
                             if setup {
                                 match install_launcher(&root) {
                                     Ok(message) => report.push_str(&format!(" {message}")),
-                                    Err(_) => {
-                                        report.push_str(" ATTENZIONE: launcher non installato.")
-                                    }
+                                    Err(_) => report.push_str(" WARNING: launcher not installed."),
                                 }
                                 match token::resolve() {
                                     Ok(resolved) => {
@@ -266,13 +263,13 @@ impl Controller {
                                         report.push_str(&format!(" {message}"));
                                     }
                                     Err(err) => report.push_str(&format!(
-                                        " ATTENZIONE: token HTTP non creato: {err}"
+                                        " WARNING: HTTP token could not be created: {err}"
                                     )),
                                 }
                             }
                             Ok(report)
                         }
-                        Err(err) => Err(format!("Salvataggio rifiutato: {err}")),
+                        Err(err) => Err(format!("Settings save rejected: {err}")),
                     };
                     let _ = tx.send(OperationEvent::Saved { settings, outcome });
                 });
@@ -282,7 +279,7 @@ impl Controller {
     }
     fn start(&mut self, root: PathBuf, config: LocalSettings, ngrok: bool) {
         if self.server.as_ref().is_some_and(|h| !h.is_finished()) {
-            self.report(Level::Warn, "Un server HTTP e' gia avviato.");
+            self.report(Level::Warn, "An HTTP server is already running.");
             return;
         }
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
@@ -293,33 +290,33 @@ impl Controller {
             let setup = tokio::task::spawn_blocking(move || -> Result<_, String> {
                 config
                     .validate()
-                    .map_err(|_| "Configurazione non valida.".to_string())?;
+                    .map_err(|_| "Invalid configuration.".to_string())?;
                 let workspaces = novagpt_core::WorkspaceRegistry::new(&root, &config.allowed_roots)
-                    .map_err(|_| "Workspace non valido.".to_string())?;
+                    .map_err(|_| "Invalid workspace.".to_string())?;
                 let vm = if config.vm_enabled {
                     Some(
                         novagpt_vm::VmManager::new(
                             settings::global_dir()
-                                .map_err(|_| "Percorso VM globale non disponibile".to_string())?
+                                .map_err(|_| "Global VM directory unavailable".to_string())?
                                 .join("vms"),
                         )
-                        .map_err(|_| "Impossibile inizializzare VM.".to_string())?,
+                        .map_err(|_| "Unable to initialize VM.".to_string())?,
                     )
                 } else {
                     None
                 };
                 let browser = if config.browser_enabled {
                     let chrome = crate::chrome::discover(config.chrome_executable.as_deref())
-                        .map_err(|_| "Chrome non disponibile.")?;
+                        .map_err(|_| "Chrome is unavailable.")?;
                     let browser_tx = tx_info.clone();
                     Some(
                         novagpt_browser::ChatGptBrowser::new(
                             chrome,
                             settings::global_dir()
-                                .map_err(|_| "Percorso browser globale non disponibile".to_string())?
+                                .map_err(|_| "Global browser directory unavailable".to_string())?
                                 .join("browser"),
                         )
-                        .map_err(|_| "Browser non inizializzabile.".to_string())?
+                        .map_err(|_| "Unable to initialize browser.".to_string())?
                         .with_diagnostic_reporter(move |event| {
                             let _ = browser_tx.send(OperationEvent::Log(
                                 Level::Info,
@@ -337,7 +334,7 @@ impl Controller {
                     )
                 });
                 let resolved = token::resolve()
-                    .map_err(|err| format!("Token HTTP non disponibile: {err}"))?;
+                    .map_err(|err| format!("HTTP token unavailable: {err}"))?;
                 let _ = tx_info.send(OperationEvent::TokenPresent(resolved.description()));
                 Ok((
                     workspaces,
@@ -350,9 +347,9 @@ impl Controller {
                         http_public_hostname: None,
                         audit: novagpt_mcp::AuditTrail::persistent(
                             crate::logging::audit_directory(&root)
-                                .map_err(|_| "Percorso audit non valido.".to_string())?,
+                                .map_err(|_| "Invalid audit directory.".to_string())?,
                         )
-                        .map_err(|_| "Archivio audit non disponibile o non sicuro.".to_string())?,
+                        .map_err(|_| "Audit storage unavailable or unsafe.".to_string())?,
                     },
                     resolved.value,
                 ))
@@ -370,7 +367,7 @@ impl Controller {
                                 let _ = tx_check.send(OperationEvent::Server(ServerState::Running));
                                 let _ = tx_check.send(OperationEvent::Log(
                                     Level::Success,
-                                    "Server NovaGPT MCP autenticato e pronto sulla porta locale.".into(),
+                                    "Authenticated NovaGPT MCP server ready on loopback.".into(),
                                 ));
                                 break;
                             }
@@ -397,12 +394,12 @@ impl Controller {
                                                 tokio::select! {
                                                     output = &mut server => {
                                                         tunnel.stop().await;
-                                                        break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
+                                                        break if output { Ok(()) } else { Err("MCP server stopped".into()) };
                                                     }
                                                     output = tunnel.child.wait() => {
                                                         let _ = output;
                                                         audit.record("http_tunnel_stopped", true);
-                                                        break Err("Il tunnel ngrok si è chiuso".into());
+                                                        break Err("The ngrok tunnel closed".into());
                                                     }
                                                     () = tokio::time::sleep(Duration::from_millis(450)) => {
                                                         if !published && tunnel.endpoint().await.is_some() {
@@ -419,20 +416,20 @@ impl Controller {
                                             audit.record("http_tunnel_discovery_failed", true);
                                             tunnel.stop().await;
                                             audit.flush().await;
-                                            Err("Il dominio ngrok della porta MCP non e' stato verificato".into())
+                                            Err("The ngrok hostname for the MCP port could not be verified".into())
                                         }
                                     }
                                     Err(_) => {
                                         audit.record("http_tunnel_start_failed", true);
                                         audit.flush().await;
-                                        Err("ngrok non disponibile o configurazione account non valida".into())
+                                        Err("ngrok unavailable or account configuration invalid".into())
                                     }
                                 }
                             }
                             Err(_) => {
                                 audit.record("http_bind_failed", true);
                                 audit.flush().await;
-                                Err("Porta HTTP occupata: tunnel NON avviato per evitare di esporre un altro server".into())
+                                Err("HTTP port occupied: refused to expose another server through ngrok".into())
                             }
                         }
                     } else {
@@ -443,14 +440,14 @@ impl Controller {
                         let _ = tx.send(OperationEvent::Server(ServerState::Failed));
                         let _ = tx.send(OperationEvent::Log(
                             Level::Error,
-                            "HTTP terminato: verifica porta occupata, token e configurazione."
+                            "HTTP stopped: check port, token and settings."
                                 .into(),
                         ));
                     } else {
                         let _ = tx.send(OperationEvent::Server(ServerState::Stopped));
                         let _ = tx.send(OperationEvent::Log(
                             Level::Info,
-                            "Server HTTP terminato.".into(),
+                            "HTTP server stopped.".into(),
                         ));
                     }
                 }
@@ -462,7 +459,7 @@ impl Controller {
                     let _ = tx.send(OperationEvent::Server(ServerState::Failed));
                     let _ = tx.send(OperationEvent::Log(
                         Level::Error,
-                        "Avvio fallito: configurazione o sottosistemi non disponibili.".into(),
+                        "Startup failed: settings or subsystems unavailable.".into(),
                     ));
                 }
             }
@@ -472,7 +469,7 @@ impl Controller {
     fn stop(&mut self) {
         if let Some(task) = self.server.take() {
             task.abort();
-            self.report(Level::Info, "Arresto HTTP richiesto (task cancellato).");
+            self.report(Level::Info, "HTTP stop requested (task cancelled).");
         }
         let _ = self.tx.send(OperationEvent::Server(ServerState::Stopped));
     }

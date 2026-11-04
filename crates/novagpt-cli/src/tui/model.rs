@@ -59,7 +59,6 @@ pub(super) enum Level {
 pub(super) struct LogEntry {
     pub time: String,
     pub level: Level,
-    pub message: String,
     pub english: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,9 +212,9 @@ impl App {
             browser_login_running: false,
             logs: VecDeque::new(),
             log_offset: 0,
-            status: "Pronto".into(),
+            status: "Ready".into(),
         };
-        app.log(Level::Info, "NovaGPT avviato. ? apre l'aiuto.");
+        app.log(Level::Info, "NovaGPT started. Press ? for help.");
         app
     }
     pub fn language(&self) -> Language {
@@ -273,7 +272,6 @@ impl App {
             time,
             level,
             english: message.clone(),
-            message: message.clone(),
         });
         if self.logs.len() > LOG_CAP {
             self.logs.pop_front();
@@ -282,24 +280,16 @@ impl App {
         self.status = message;
     }
     fn log_localized(&mut self, level: Level, message: fn(Language) -> &'static str) {
-        self.log(level, message(Language::Italian));
-        if let Some(entry) = self.logs.back_mut() {
-            entry.english = message(Language::English).to_string();
-        }
+        self.log(level, message(Language::English));
         self.status = message(self.language()).to_string();
     }
 
     fn log_localized_dynamic(&mut self, level: Level, english: String, italian: String) {
-        self.log(level, italian);
-        if let Some(entry) = self.logs.back_mut() {
-            entry.english = english.clone();
-        }
+        self.log(level, english.clone());
         self.status = if self.language() == Language::English {
             english
         } else {
-            self.logs
-                .back()
-                .map_or(String::new(), |entry| entry.message.clone())
+            italian
         };
     }
 
@@ -436,7 +426,7 @@ impl App {
                 match outcome {
                     Ok(text) => {
                         self.persisted = settings;
-                        let level = if text.contains("ATTENZIONE") {
+                        let level = if text.contains("WARNING") {
                             Level::Warn
                         } else {
                             Level::Success
@@ -510,10 +500,7 @@ impl App {
                     self.running_config = Some(self.persisted.clone());
                     self.log(
                         Level::Info,
-                        format!(
-                            "Avvio HTTP richiesto sulla porta {}...",
-                            self.persisted.port
-                        ),
+                        format!("HTTP startup requested on port {}...", self.persisted.port),
                     );
                     Some(if self.persisted.ngrok_enabled {
                         Effect::StartNgrok(self.persisted.clone())
@@ -623,7 +610,7 @@ impl App {
         });
     }
     fn confirm(&mut self, action: Confirm) {
-        self.yes = false; // Default sicuro: No.
+        self.yes = false; // Safe default: No.
         self.modal = Some(Modal::Confirm(action));
     }
     fn start_edit(&mut self, field: Field) {
@@ -648,13 +635,13 @@ impl App {
             Field::Port => match value.parse::<u16>() {
                 Ok(port) if port != 0 => self.draft.port = port,
                 _ => {
-                    self.input_error = Some("Usa una porta tra 1 e 65535.".into());
+                    self.input_error = Some("Use a port between 1 and 65535.".into());
                     return None;
                 }
             },
             Field::Chrome => {
                 if !value.is_empty() && !PathBuf::from(value).is_absolute() {
-                    self.input_error = Some("Serve un percorso assoluto.".into());
+                    self.input_error = Some("An absolute path is required.".into());
                     return None;
                 }
                 let path = (!value.is_empty()).then(|| PathBuf::from(value));
@@ -667,7 +654,7 @@ impl App {
             Field::NgrokDomain => {
                 if !value.is_empty() && !crate::tunnel::valid_domain(value) {
                     self.input_error =
-                        Some("Inserisci un hostname valido, senza schema o percorso.".into());
+                        Some("Enter a valid hostname without scheme or path.".into());
                     return None;
                 }
                 self.draft.ngrok_domain = (!value.is_empty()).then(|| value.to_string());
@@ -675,8 +662,7 @@ impl App {
             Field::NovaSource => {
                 let folder = PathBuf::from(value);
                 if !folder.is_absolute() {
-                    self.input_error =
-                        Some("Indica un percorso assoluto della cartella NovaGPT.".into());
+                    self.input_error = Some("Enter an absolute NovaGPT directory path.".into());
                     return None;
                 }
                 self.modal = None;
@@ -686,11 +672,11 @@ impl App {
             }
             Field::Root => {
                 if value.is_empty() {
-                    self.input_error = Some("Inserisci una directory.".into());
+                    self.input_error = Some("Enter a directory.".into());
                     return None;
                 }
                 if self.draft.allowed_roots.len() >= 16 {
-                    self.input_error = Some("Massimo 16 directory autorizzate.".into());
+                    self.input_error = Some("Maximum 16 authorized directories.".into());
                     return None;
                 }
                 let path = PathBuf::from(value);

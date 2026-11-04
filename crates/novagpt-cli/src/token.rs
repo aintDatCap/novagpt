@@ -36,30 +36,25 @@ pub struct Resolved {
 impl Resolved {
     pub fn rotation_warning(&self) -> Option<&'static str> {
         (self.migration == Migration::Rotated).then_some(
-            "ATTENZIONE: trovati piu' vecchi token. E' stato creato un token condiviso nuovo: riavvia i server HTTP NovaGPT e aggiorna i connettori ChatGPT.",
+            "WARNING: multiple old tokens were detected. A new shared token was created; restart HTTP servers and update ChatGPT connections.",
         )
     }
 
     pub fn description(&self) -> String {
         let summary = match &self.origin {
             Origin::Environment => {
-                "Token HTTP condiviso: uso NOVAGPT_HTTP_TOKEN dall'ambiente (valore nascosto)."
-                    .into()
+                "Shared HTTP token: using NOVAGPT_HTTP_TOKEN from environment (hidden).".into()
             }
             Origin::Stored { path, created } => format!(
-                "Token HTTP condiviso {}: {} (valore nascosto). Per visualizzarlo: novagpt token show",
-                if *created {
-                    "generato"
-                } else {
-                    "gia' esistente"
-                },
+                "Shared HTTP token {}: {} (hidden). Reveal explicitly with: novagpt token show",
+                if *created { "generated" } else { "existing" },
                 path.display()
             ),
         };
         if let Some(warning) = self.rotation_warning() {
             format!("{summary} {warning}")
         } else if self.migration == Migration::Preserved {
-            format!("{summary} Il precedente token e' stato conservato per tutti i workspace.")
+            format!("{summary} The previous token was preserved for all workspaces.")
         } else {
             summary
         }

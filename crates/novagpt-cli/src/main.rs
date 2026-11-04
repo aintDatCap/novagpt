@@ -219,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 token::set(&value, *replace)?;
                 println!(
-                    "Token condiviso salvato (valore nascosto). Riavvia tutti i server HTTP NovaGPT e aggiorna i connettori se il token e' cambiato."
+                    "Shared token saved (hidden). Restart all NovaGPT HTTP servers and update connections if the token changed."
                 );
                 if std::env::var_os("NOVAGPT_HTTP_TOKEN").is_some() {
                     eprintln!("Warning: NOVAGPT_HTTP_TOKEN overrides the stored token.");
@@ -288,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connection::probe(port, &resolved.value).await?;
                 let endpoint = tunnel::NgrokTunnel::discover_endpoint(port, None)
                     .await
-                    .ok_or("Nessun tunnel ngrok attivo per questa porta")?;
+                    .ok_or("No ngrok tunnel active on this port")?;
                 // Secret revealed only by an explicit user command. No clipboard automation.
                 println!("{}", tunnel::connector_url(&endpoint, &resolved.value)?);
                 return Ok(());
