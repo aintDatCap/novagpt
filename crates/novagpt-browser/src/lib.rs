@@ -647,6 +647,11 @@ impl ChatGptBrowser {
     pub async fn browse_click(&self, selector: &str) -> Result<bool, BrowserError> {
         validate_selector(selector)?;
         let page = self.page(BROWSE_TAB).await?;
+        let _input = page
+            .transport
+            .acquire_input()
+            .await
+            .map_err(BrowserError::from)?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
         let expression = format!(
@@ -691,6 +696,11 @@ impl ChatGptBrowser {
             return Err(BrowserError::InvalidControl);
         }
         let page = self.page(BROWSE_TAB).await?;
+        let _input = page
+            .transport
+            .acquire_input()
+            .await
+            .map_err(BrowserError::from)?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
         let expression = format!(
@@ -855,6 +865,11 @@ impl ChatGptBrowser {
             before
         } else {
             let before = state["assistant_count"].as_u64().unwrap_or(0) as usize;
+            let _input = page
+                .transport
+                .acquire_input()
+                .await
+                .map_err(BrowserError::from)?;
             // Select the actual visible, editable textbox (not its wrapper).
             // Replacing a selection via CDP generates browser input events,
             // unlike writing directly to the DOM or dispatching fake events.
@@ -1301,6 +1316,7 @@ mod tests {
                 let method = request["method"].as_str().expect("CDP method");
                 let result = match method {
                     "Runtime.enable" => json!({}),
+                    "Page.bringToFront" => json!({}),
                     "Runtime.evaluate" => {
                         let expression = request["params"]["expression"]
                             .as_str()
@@ -1313,7 +1329,9 @@ mod tests {
                                 reply_logged = true;
                             }
                         }
-                        let value = if expression.contains("assistant_count:assistants.length") {
+                        let value = if expression.contains("document.visibilityState") {
+                            json!(true)
+                        } else if expression.contains("assistant_count:assistants.length") {
                             state_polls += 1;
                             if state_polls <= 2 {
                                 json!({
@@ -1600,9 +1618,12 @@ mod tests {
                 let method = request["method"].as_str().unwrap();
                 let result = match method {
                     "Runtime.enable" => json!({}),
+                    "Page.bringToFront" => json!({}),
                     "Runtime.evaluate" => {
                         let expr = request["params"]["expression"].as_str().unwrap();
-                        let value = if expr.contains("ready:document.readyState") {
+                        let value = if expr.contains("document.visibilityState") {
+                            json!(true)
+                        } else if expr.contains("ready:document.readyState") {
                             json!({"url":if navigated { "http://localhost:5173/" } else { "about:blank" },
                                 "ready":"complete"})
                         } else if expr.contains("document.body?.innerText") {

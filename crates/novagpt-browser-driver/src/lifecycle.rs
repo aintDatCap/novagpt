@@ -14,7 +14,7 @@ use std::{
 use tokio::{
     fs,
     process::{Child, Command},
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
     time::{Duration, Instant, sleep, timeout},
 };
 
@@ -26,6 +26,7 @@ struct Inner {
     lease: Mutex<Option<ProfileLease>>,
     startup: Mutex<()>,
     creation: Mutex<()>,
+    input: Arc<Mutex<()>>,
     last_creation: Mutex<Option<Instant>>,
     epoch: AtomicU64,
 }
@@ -61,10 +62,15 @@ impl BrowserDriver {
                 lease: Mutex::new(None),
                 startup: Mutex::new(()),
                 creation: Mutex::new(()),
+                input: Arc::new(Mutex::new(())),
                 last_creation: Mutex::new(None),
                 epoch: AtomicU64::new(1),
             }),
         })
+    }
+
+    pub(crate) async fn input_lock(&self) -> OwnedMutexGuard<()> {
+        self.inner.input.clone().lock_owned().await
     }
 
     pub fn config(&self) -> &DriverConfig {
@@ -96,7 +102,11 @@ impl BrowserDriver {
     /// its existing dedicated profile. No tab or prompt is replayed on restart.
     pub async fn ensure_started(&self) -> Result<u16, DriverError> {
         let _startup = self.inner.startup.lock().await;
-        if let Some(port) = *self.inner.port.lock().await {
+        // Copy the port out of its mutex before entering the recovery path.
+        // An if-let temporary guard would otherwise live through invalidate()
+        // and deadlock when it tries to take the same lock.
+        let current_port = *self.inner.port.lock().await;
+        if let Some(port) = current_port {
             let alive = self
                 .inner
                 .process
@@ -190,6 +200,20 @@ impl BrowserDriver {
         self.inner.last_creation.lock().await.take();
     }
 
+    /// Test-only crash injection: terminate only the child owned by this
+    /// driver, leaving stale port/lease state for the recovery path to detect.
+    #[cfg(feature = "test-support")]
+    pub async fn simulate_owned_chrome_crash(&self) -> Result<(), DriverError> {
+        let mut child = self.inner.process.lock().await;
+        let child = child.as_mut().ok_or(DriverError::NotRunning)?;
+        child.start_kill().map_err(|_| DriverError::NotRunning)?;
+        timeout(Duration::from_secs(5), child.wait())
+            .await
+            .map_err(|_| DriverError::Timeout)?
+            .map_err(|_| DriverError::NotRunning)?;
+        Ok(())
+    }
+
     /// Shut down only Chrome launched by this driver, not another user process.
     /// Old tab handles remain invalidated after shutdown.
     pub async fn shutdown(&self) {
@@ -259,7 +283,9 @@ impl BrowserDriver {
             .send()
             .await
             .map_err(|_| DriverError::NotRunning)?;
-        if !response.status().is_success() {
+        // Chrome returns 404 if the user has already closed this tab. Treat
+        // that as idempotent cleanup; do not close another target or Chrome.
+        if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
             return Err(DriverError::Protocol);
         }
         Ok(())

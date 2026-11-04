@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
     time::{Instant, sleep, timeout},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -40,6 +40,13 @@ struct PageInner {
 #[derive(Clone)]
 pub struct DriverPage {
     inner: Arc<PageInner>,
+}
+
+/// Short-lived ownership of the active browser tab during native input.
+/// Never hold this while waiting for a ChatGPT response.
+#[must_use = "keep this guard alive until the native input sequence completes"]
+pub struct InputLease {
+    _guard: OwnedMutexGuard<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +121,35 @@ impl DriverPage {
         self.inner.closed.load(Ordering::Acquire) || self.inner.epoch != self.inner.driver.epoch()
     }
 
+    /// Bring the tab to the foreground under the shared input lock.
+    /// Real Chrome can discard mouse events sent to hidden tabs; only input
+    /// sequences are serialized. DOM reads and response waits remain parallel.
+    pub async fn acquire_input(&self) -> Result<InputLease, DriverError> {
+        let guard = self.inner.driver.input_lock().await;
+        if self.is_stale() {
+            return Err(DriverError::StalePage);
+        }
+        self.command("Page.bringToFront", json!({})).await?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if self.is_stale() {
+                return Err(DriverError::StalePage);
+            }
+            if self
+                .evaluate_trusted("document.visibilityState === 'visible'")
+                .await?
+                == true
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok(InputLease { _guard: guard })
+    }
+
     /// Send one preapproved CDP method; payloads and protocol errors are never
     /// logged. Only a narrow browser-automation command set is accepted.
     pub async fn command(&self, method: &str, params: Value) -> Result<Value, DriverError> {
@@ -126,6 +162,7 @@ impl DriverPage {
                 | "Runtime.evaluate"
                 | "Page.enable"
                 | "Page.navigate"
+                | "Page.bringToFront"
                 | "Page.captureScreenshot"
                 | "Input.insertText"
                 | "Input.dispatchMouseEvent"
@@ -341,6 +378,7 @@ impl Locator {
     }
 
     pub async fn click(&self) -> Result<(), DriverError> {
+        let _input = self.page.acquire_input().await?;
         let expression = format!(
             r#"(() => {{
             const el = document.querySelector({});
@@ -378,6 +416,7 @@ impl Locator {
         if text.len() > 80_000 {
             return Err(DriverError::TooLarge);
         }
+        let _input = self.page.acquire_input().await?;
         let expression = format!(
             r#"(() => {{
             const el = document.querySelector({});
@@ -410,6 +449,7 @@ impl Locator {
 
     /// Limited keyboard actions for a currently focused locator.
     pub async fn press(&self, key: &str) -> Result<(), DriverError> {
+        let _input = self.page.acquire_input().await?;
         let (code, key_code) = match key {
             "Enter" => ("Enter", 13),
             "Tab" => ("Tab", 9),
@@ -465,6 +505,8 @@ mod tests {
                         let script = request["params"]["expression"].as_str().unwrap_or("");
                         if script.contains("document.readyState") {
                             json!({"url":"https://example.org/","ready":"complete"})
+                        } else if script.contains("document.visibilityState") {
+                            json!(true)
                         } else if script.contains("document.elementFromPoint") {
                             json!({"x":25.0,"y":25.0})
                         } else if script.contains("document.querySelector") {

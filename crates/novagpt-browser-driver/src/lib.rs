@@ -8,7 +8,7 @@ mod error;
 mod lifecycle;
 mod profile;
 
-pub use cdp::{DriverPage, Locator, WaitState};
+pub use cdp::{DriverPage, InputLease, Locator, WaitState};
 pub use config::{DriverConfig, discover_chrome};
 pub use error::DriverError;
 pub use lifecycle::{BrowserDriver, TargetInfo};
