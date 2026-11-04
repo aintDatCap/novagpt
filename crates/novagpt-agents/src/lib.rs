@@ -1261,4 +1261,147 @@ mod tests {
             Err(AgentError::Cancelled)
         ));
     }
+    /// Each delegated worker independently parks on its own response gate.
+    /// Releasing them out of spawn order must never swap their page/result ID.
+    struct OrderedWorkers {
+        entered: tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>,
+        cancelled: Mutex<Vec<String>>,
+        closed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for OrderedWorkers {
+        fn name(&self) -> &'static str {
+            "ordered-workers"
+        }
+        fn model(&self) -> &'static str {
+            "chatgpt-web-fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            id: &str,
+            _prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            let (release, waiting) = tokio::sync::oneshot::channel();
+            self.entered
+                .send((id.to_owned(), release))
+                .map_err(|_| BackendFailure::Unavailable)?;
+            waiting.await.map_err(|_| BackendFailure::Unavailable)?;
+            Ok((
+                format!("response for {id}"),
+                Some(format!("https://chatgpt.com/c/{id}")),
+            ))
+        }
+        async fn cancel(&self, id: &str) {
+            self.cancelled.lock().await.push(id.to_owned());
+        }
+        async fn close(&self, id: &str) {
+            self.closed.lock().await.push(id.to_owned());
+        }
+        async fn diagnostics(&self, id: &str) -> serde_json::Value {
+            serde_json::json!({"agent_id":id})
+        }
+    }
+
+    #[tokio::test]
+    async fn four_concurrent_workers_out_of_order_with_isolated_cancellation() {
+        use std::collections::{HashMap, HashSet};
+        use tokio::sync::mpsc;
+        let root = tempfile::tempdir().expect("owned test workspace");
+        let sentinel = root.path().join("source.rs");
+        std::fs::write(&sentinel, "user-owned source is unchanged").expect("fixture source");
+        let (entered, mut received) = mpsc::unbounded_channel();
+        let backend = Arc::new(OrderedWorkers {
+            entered,
+            cancelled: Mutex::new(Vec::new()),
+            closed: Mutex::new(Vec::new()),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(root.path(), &[]).expect("workspace"),
+            backend.clone(),
+        );
+        let mut ids = Vec::new();
+        for role in [
+            AgentRole::Explorer,
+            AgentRole::Reviewer,
+            AgentRole::Tester,
+            AgentRole::Implementer,
+        ] {
+            let info = manager
+                .spawn(SpawnAgent {
+                    workspace_id: None,
+                    task: format!("independent task for {role:?}"),
+                    role,
+                    paths: vec![],
+                    context: None,
+                })
+                .await
+                .expect("spawn");
+            assert_eq!(info.state, AgentState::Running);
+            ids.push(info.id);
+        }
+        let mut gates = HashMap::new();
+        for _ in 0..4 {
+            let (id, release) = tokio::time::timeout(Duration::from_secs(3), received.recv())
+                .await
+                .expect("all sessions started")
+                .expect("channel open");
+            assert!(gates.insert(id, release).is_none());
+        }
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 4);
+        let cancelled_id = ids[1].clone();
+        manager
+            .cancel(&cancelled_id)
+            .await
+            .expect("cancel one agent");
+        assert_eq!(
+            manager
+                .result(&cancelled_id)
+                .await
+                .expect("cancel snapshot")
+                .state,
+            AgentState::Cancelled
+        );
+        // Complete the other three in reverse registration order.
+        for id in ids.iter().rev().filter(|id| *id != &cancelled_id) {
+            gates
+                .remove(id)
+                .expect("owned response gate")
+                .send(())
+                .expect("worker still waiting");
+            let output = manager.wait(id, 3).await.expect("worker completed");
+            assert!(!output.timed_out);
+            assert_eq!(output.agent.state, AgentState::Completed);
+            assert_eq!(
+                output.agent.external_conversation.as_deref(),
+                Some(format!("https://chatgpt.com/c/{id}").as_str())
+            );
+            let result = output.agent.result.expect("untrusted response");
+            assert_eq!(result.raw_response, format!("response for {id}"));
+            assert!(result.untrusted);
+            assert!(!result.applied_to_workspace);
+        }
+        // A cancelled worker returning late must never overwrite its state.
+        gates
+            .remove(&cancelled_id)
+            .expect("cancelled response gate")
+            .send(())
+            .expect("cancelled worker remains test parked");
+        tokio::task::yield_now().await;
+        let cancelled = manager.wait(&cancelled_id, 2).await.expect("cancelled");
+        assert_eq!(cancelled.agent.state, AgentState::Cancelled);
+        assert!(cancelled.agent.result.is_none());
+        assert_eq!(
+            backend.cancelled.lock().await.as_slice(),
+            std::slice::from_ref(&cancelled_id)
+        );
+        assert_eq!(backend.closed.lock().await.as_slice(), &[cancelled_id]);
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("source"),
+            "user-owned source is unchanged"
+        );
+    }
 }
