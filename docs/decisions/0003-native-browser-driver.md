@@ -1,7 +1,7 @@
 # ADR 0003 — Rust-native persistent browser driver
 
 **Date:** 2026-11-04
-**Status:** Accepted for incremental implementation; real ChatGPT verification pending.
+**Status:** Accepted; Rust driver and adapter migration implemented. Real ChatGPT verification pending.
 
 ## Context and evidence
 
@@ -95,11 +95,21 @@ user-managed Chrome endpoint with a different trust model.
   another application's profile.
 - Automatically applying subagent edits to the shared Git tree.
 
+## Implementation evidence (2026-11-04)
+
+The migration now uses `novagpt-browser-driver` for the single owned Chrome process, profile lease, CDP sessions and native tab actions. `novagpt-browser` retains ChatGPT-specific policy, manual-authentication detection, safe browsing origins, mock UI tests and existing MCP-visible types; `novagpt-agents` retains task state and bounded worker coordination. One short-lived foreground input lock serializes `Page.bringToFront` and native input sequences, not response waits. This was required by a real Chrome finding: hidden tabs accepted CDP requests but did not dispatch physical mouse clicks. Recovery also copies the current CDP port out of its mutex before invalidation to avoid a deadlock after process exit.
+
+**Verified:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace`, `cargo test --workspace` (one opt-in Chrome test ignored by default) and a separately executed `cargo test -p novagpt-browser-driver --features test-support --test real_chrome -- --ignored --nocapture`. The live test passed against a disposable loopback HTML fixture on Linux, Chrome 156.0.8078.47, with four tabs, text input, clicks, PNG screenshots, isolated close, owned profile contention and simulated process crash/restart. A separate fake backend validates four out-of-order agent results with one isolated cancellation.
+
+**Not verified:** live ChatGPT account sign-in, Cloudflare behavior, real ChatGPT completion and session retention across independent server processes, Windows/macOS Chrome execution or guarantees against provider detection. No Node.js or Patchright runtime is embedded; the existing `fs2`, Tokio, reqwest, tungstenite and JSON dependencies are reused. The authorized browsing and MCP tool contract is unchanged.
+
 ## Migration and acceptance
 
-Ship in reviewable stages: ADR; crate API; process/profile lifecycle; page
+Migration stages implemented: ADR; crate API; process/profile lifecycle; page
 primitives; replacement of duplicate CDP plumbing in `novagpt-browser`;
-agent concurrency regression tests; real-Chrome/MCP checks; documentation.
+agent concurrency regression tests; disposable real-Chrome smoke and workspace/MCP
+regressions; documentation. Further live ChatGPT account and cross-platform checks
+are outstanding.
 Preserve manual login, a single shared browser, existing MCP method names,
 and the independent review/approval workflow. If the real Chrome binary,
 account or service is unavailable, record an explicitly untested gate;

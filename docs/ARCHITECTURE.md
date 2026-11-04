@@ -8,7 +8,7 @@ NovaGPT is an independent Rust MCP coding server. Product design, protocol suppo
 novagpt-cli
   ├─ novagpt-mcp ── novagpt-core
   │    ├─ novagpt-vm
-  │    └─ novagpt-agents ── novagpt-browser
+  │    └─ novagpt-agents ── novagpt-browser ── novagpt-browser-driver
   ├─ novagpt-vm, novagpt-agents, novagpt-browser
   └─ novagpt-core
 ```
@@ -17,7 +17,8 @@ novagpt-cli
 - **novagpt-mcp:** tools, schemas, protocol dispatch, stdio and HTTP transport, and request authentication through the official Rust MCP SDK (`rmcp`).
 - **novagpt-cli:** argument parsing, shared private per-user configuration and token, terminal UI, process ownership, ngrok tunnel management, and optional integrations.
 - **novagpt-vm:** optional approved VM images and platform-specific VM controls; real guest execution support is incomplete.
-- **novagpt-agents** and **novagpt-browser:** optional bounded subagent management and a dedicated visible Chrome/CDP integration.
+- **novagpt-agents** and **novagpt-browser:** optional bounded ChatGPT Web subagent management, manual-login handling, visible UI inspection and protected browser navigation.
+- **novagpt-browser-driver:** optional Rust-native owner of the dedicated Chrome process/profile, CDP target sessions, short-lived foreground input lock, DOM/input/screenshot primitives, and crash invalidation. No Node.js, Patchright runtime or shared personal browser profile.
 
 ## Workspace and security model
 
@@ -39,6 +40,8 @@ The saved `auto_start_mcp` preference is disabled by default. If enabled, normal
 
 Graceful HTTP shutdown handles Ctrl+C and SIGTERM on Unix and flushes audit events. CLI-owned ngrok is stopped and reaped on normal termination. Forced process termination, power failures and all in-flight requests are not guaranteed to be recoverable.
 
+The native driver boundary follows [ADR 0003](decisions/0003-native-browser-driver.md); the preceding opt-in architecture remains described in [ADR 0002](decisions/0002-optional-vm-and-browser-agents.md). Live ChatGPT account compatibility is outside the disposable browser fixture's coverage.
+
 For local Rust iteration, `script/dev.py` watches source and manifests, builds without stopping the last working server, then restarts its owned server and tunnel on successful compilation. It attempts rollback if a new binary fails readiness. Each successful restart briefly interrupts active MCP sessions and may change a dynamically assigned ngrok hostname.
 
 ## Known limitations
@@ -46,7 +49,7 @@ For local Rust iteration, `script/dev.py` watches source and manifests, builds w
 - The full live public ChatGPT-to-ngrok integration has not been independently verified on every supported platform.
 - TUI shutdown currently aborts some async server tasks; complete graceful resource cleanup needs an end-to-end audit.
 - Shell commands run with host permissions; subprocess-tree cleanup and full sandboxing are not guaranteed.
-- VM guest control, browser automation, and some optional integrations require live testing and are not equivalent to a fully managed cloud environment.
+- VM guest control and some optional integrations require live testing. The browser driver passed a disposable four-tab Chrome/CDP smoke test on Linux, including real input and crash recovery, but live ChatGPT authentication, challenge handling, and response completion remain unverified; it is not a fully managed cloud environment.
 - Some filesystem writes are not crash-atomic on all platforms; path-swap defenses and adversarial concurrency require further review.
 - Public MCP transport session TTL, reconnect and load boundaries need additional integration tests.
 
