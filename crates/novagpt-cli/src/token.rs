@@ -6,8 +6,6 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 use uuid::Uuid;
 
@@ -252,66 +250,58 @@ fn set_at(file: &Path, value: &str, replace: bool) -> io::Result<()> {
     outcome
 }
 
+/// Atomically publish a fully written secret. A create_new() call on the final
+/// path exposes an empty file before write_all() completes; another initializer
+/// can otherwise mistake that transient state for a corrupted saved token.
 fn ensure_at(file: &Path) -> io::Result<Resolved> {
     ensure_token_directory(file)?;
     let generated = generate();
-    let create = {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options.open(file)
-    };
-    match create {
-        Ok(mut handle) => {
-            // The destination is create_new: never replace or rotate a pre-existing token.
-            handle.write_all(generated.as_bytes())?;
-            handle.sync_all()?;
-            Ok(Resolved {
-                value: generated,
-                origin: Origin::Stored {
-                    path: file.into(),
-                    created: true,
-                },
-                migration: Migration::None,
-            })
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            // Another concurrent process may still be writing the newly-created file.
-            for _ in 0..20 {
-                match read_token(file) {
-                    Ok(value) => {
-                        return Ok(Resolved {
-                            value,
-                            origin: Origin::Stored {
-                                path: file.into(),
-                                created: false,
-                            },
-                            migration: Migration::None,
-                        });
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                        private_file(file)?; // fail immediately for symlink, permissions or unexpected type
-                        let meta = fs::metadata(file)?;
-                        // create_new publishes the empty file before its contents are
-                        // written. A short read can therefore be an in-flight write,
-                        // not necessarily a corrupted persisted token.
-                        // A full-length malformed token must still fail closed.
-                        if meta.len() >= 64 {
-                            return Err(err);
-                        }
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
-            Err(invalid("token file creation did not finish"))
-        }
-        Err(error) => Err(error),
+    let directory = file
+        .parent()
+        .ok_or_else(|| invalid("missing token parent directory"))?;
+    let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4().simple()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut handle = options.open(&temporary)?;
+    let write = handle
+        .write_all(generated.as_bytes())
+        .and_then(|_| handle.sync_all());
+    drop(handle);
+    if let Err(error) = write {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    // hard_link() atomically creates the final name only when it does not
+    // already exist, unlike rename() which can replace an existing token.
+    // The source is in the same private directory and is already complete.
+    let published = fs::hard_link(&temporary, file);
+    let cleanup = fs::remove_file(&temporary);
+    let created = match published {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error),
+    };
+    cleanup?;
+    let value = if created {
+        generated
+    } else {
+        // Existing secrets are never overwritten or silently repaired.
+        read_token(file)?
+    };
+    Ok(Resolved {
+        value,
+        origin: Origin::Stored {
+            path: file.into(),
+            created,
+        },
+        migration: Migration::None,
+    })
 }
 /// Locking prevents concurrent NovaGPT processes from choosing different
 /// shared tokens during migration or replacement. The file is never unlinked:
@@ -514,6 +504,10 @@ pub fn resolve() -> io::Result<Resolved> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
     #[test]
     fn generated_token_is_stable_strong_and_not_in_workspace() {
         let temp = tempfile::tempdir().unwrap();
@@ -633,23 +627,38 @@ mod tests {
     }
     #[test]
     fn parallel_initializers_reuse_one_token() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp
-            .path()
-            .join("NovaGPT")
-            .join("tokens")
-            .join("fixture.token");
-        let workers = (0..10)
-            .map(|_| {
-                let file = file.clone();
-                thread::spawn(move || ensure_at(&file).unwrap().value)
-            })
-            .collect::<Vec<_>>();
-        let values = workers
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect::<Vec<_>>();
-        assert!(values.iter().all(|token| token == &values[0]));
+        // Repeated simultaneous first-use attempts must never see a partially
+        // published secret, even when different threads start at the same time.
+        for _ in 0..12 {
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp
+                .path()
+                .join("NovaGPT")
+                .join("tokens")
+                .join("fixture.token");
+            let barrier = Arc::new(Barrier::new(10));
+            let workers = (0..10)
+                .map(|_| {
+                    let file = file.clone();
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        ensure_at(&file).unwrap().value
+                    })
+                })
+                .collect::<Vec<_>>();
+            let values = workers
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(values.iter().all(|token| token == &values[0]));
+            assert_eq!(read_token(&file).unwrap(), values[0]);
+            assert_eq!(
+                fs::read_dir(file.parent().unwrap()).unwrap().count(),
+                1,
+                "temporary credentials must be cleaned up"
+            );
+        }
     }
     #[test]
     fn rejects_weak_tokens_and_controls() {
