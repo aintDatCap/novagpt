@@ -9,18 +9,16 @@ Download an archive from [NovaGPT Releases](https://github.com/aintDatCap/novagp
 **Linux / macOS** (requires Bash, curl, tar and SHA-256 utilities):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh -o novagpt-install.sh
-bash novagpt-install.sh
+curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh | bash
 ```
 
 **Windows x64** (PowerShell):
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1" -OutFile "novagpt-install.ps1"
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1"
+irm https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1 | iex
 ```
 
-The scripts download release binaries and check their SHA-256 hashes. They require a corresponding published release. Inspect downloaded scripts before executing them. Reopen the terminal after installation if `novagpt` is not found. See [installer details](../script/README.md) for platforms and installation paths.
+These commands pipe the remote installer directly into Bash or PowerShell without saving the installer script locally. They execute remote code immediately: review the [Bash script](../script/install.sh) or [PowerShell script](../script/install.ps1) beforehand, or download it separately if you want to inspect the exact bytes before execution. The installers download release binaries and verify their SHA-256 checksums; this does **not** authenticate the piped script itself. An accessible published release is required. Reopen the terminal after installation if `novagpt` is not found. See [installer details](../script/README.md) for platforms and installation paths.
 
 Alternatively, build the binary yourself with `cargo build --release -p novagpt-cli`; its path is `target/release/novagpt` (or `novagpt.exe` on Windows).
 

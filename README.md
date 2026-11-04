@@ -25,18 +25,16 @@ Download the latest release from [GitHub Releases](https://github.com/aintDatCap
 **Linux / macOS**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh -o novagpt-install.sh
-bash novagpt-install.sh
+curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh | bash
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1" -OutFile "novagpt-install.ps1"
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1"
+irm https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1 | iex
 ```
 
-Review downloaded installation scripts before running them. Open a new terminal after installation if the command is not yet on your PATH.
+These one-liners execute the latest remote installer immediately without saving the script locally. Review the [Bash installer](script/install.sh) or [PowerShell installer](script/install.ps1) before running them, or download and inspect a script first if you prefer. Open a new terminal after installation if the command is not yet on your PATH.
 
 ### 2. Open your project
 
