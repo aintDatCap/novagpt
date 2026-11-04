@@ -181,32 +181,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn helper_receives_private_url_on_stdin_without_logging_it() {
-        use std::{fs, os::unix::fs::PermissionsExt};
+        use std::fs;
         let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("fake-clipboard");
         let output = temp.path().join("clipboard-result");
-        // No environment mutation, remote clipboard, or graphical session.
-        fs::write(
-            &script,
-            format!("#!/bin/sh\ncat > '{}'\n", output.display()),
+        // Execute a fixed shell command instead of writing and immediately
+        // executing a temporary script (which can fail with ETXTBSY on CI).
+        // Only the output path is in argv; the credential travels via stdin.
+        let private_url = "https://example.org/mcp?novagpt_token=fake-private-test-value";
+        run_command(
+            OsStr::new("/bin/sh"),
+            &["-c", "cat > \"$1\"", "sh", output.to_str().unwrap()],
+            private_url,
         )
         .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let private_url = "https://example.org/mcp?novagpt_token=fake-private-test-value";
-        run_command(script.as_os_str(), &[], private_url).unwrap();
         assert_eq!(fs::read_to_string(&output).unwrap(), private_url);
     }
 
     #[cfg(unix)]
     #[test]
     fn failing_helper_returns_error_without_secret() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("failing-clipboard");
-        fs::write(&script, "#!/bin/sh\ncat >/dev/null\nexit 1\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         let secret = "do-not-log-this-credential";
-        let error = run_command(script.as_os_str(), &[], secret).unwrap_err();
+        // Simulate a failing helper without creating a transient executable.
+        let error = run_command(
+            OsStr::new("/bin/sh"),
+            &["-c", "cat >/dev/null; exit 1"],
+            secret,
+        )
+        .unwrap_err();
         assert!(!error.to_string().contains(secret));
     }
 }
