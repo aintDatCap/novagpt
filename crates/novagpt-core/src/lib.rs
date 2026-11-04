@@ -23,7 +23,7 @@ pub use handoff_status::HandoffStatus;
 pub use image_ops::ImageDocument;
 pub use import_ops::{AttachmentRef, ImportRequest, ImportResult};
 pub use inspect_ops::WorkspaceInspection;
-pub use patch_ops::PatchResult;
+pub use patch_ops::{PatchResult, patch_target};
 pub use pro_context::ProContextReceipt;
 pub use workspace::{NovaError, NovaResult, Workspace, WorkspaceRegistry};
 pub use worktree_ops::OwnedWorktree;

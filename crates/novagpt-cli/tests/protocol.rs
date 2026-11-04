@@ -136,6 +136,18 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
                     "id":"agent-unknown","code":"ABC123","result":"should be rejected"
                 }
             }}),
+            json!({"jsonrpc":"2.0","id":15,"method":"tools/call","params":{
+                "name":"subagent_apply_patch","arguments":{
+                    "id":"agent-unknown","code":"ABC123",
+                    "patch":"--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-test text\n+changed\n"
+                }
+            }}),
+            json!({"jsonrpc":"2.0","id":16,"method":"tools/call","params":{
+                "name":"subagent_create_file","arguments":{
+                    "id":"agent-unknown","code":"ABC123",
+                    "path":"new-file.txt","content":"must not create"
+                }
+            }}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
                 "name":"view_image","arguments":{"path":"image.png"}
             }}),
@@ -232,6 +244,8 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "subagent_status",
         "subagent_wait",
         "subagent_finished",
+        "subagent_apply_patch",
+        "subagent_create_file",
         "subagent_result",
         "subagent_cancel",
     ] {
@@ -240,7 +254,14 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 51);
+    assert_eq!(listed.len(), 53);
+    assert_eq!(by_id(15)["result"]["isError"], true);
+    assert_eq!(by_id(16)["result"]["isError"], true);
+    assert!(!workspace.path().join("new-file.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("hello.txt")).unwrap(),
+        "test text"
+    );
     assert_eq!(by_id(13)["result"]["isError"], true);
     assert_eq!(by_id(14)["result"]["isError"], true);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");

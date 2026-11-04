@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use novagpt_browser::{BrowserError, ChatGptBrowser};
 use novagpt_core::WorkspaceRegistry;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::{Mutex, watch};
@@ -22,6 +22,9 @@ const MAX_WAIT_SECONDS: u64 = 25;
 // per-execution failure limits and the MCP transport's existing authentication.
 const COMPLETION_KEY_LEN: usize = 6;
 const MAX_COMPLETION_ATTEMPTS: u8 = 5;
+const MAX_PATCH_ATTEMPTS: u8 = 16;
+const MAX_CREATE_ATTEMPTS: u16 = 256;
+const MAX_AGENT_PATCH_BYTES: usize = 200_000;
 
 fn completion_code() -> String {
     URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes())[..COMPLETION_KEY_LEN].to_owned()
@@ -45,6 +48,12 @@ pub enum AgentError {
     Invalid,
     #[error("Subagent completion is not authorized or is no longer active")]
     CompletionDenied,
+    #[error("Subagent patch is not authorized for this execution or path")]
+    PatchDenied,
+    #[error("Subagent patch failed validation or does not apply cleanly")]
+    PatchRejected,
+    #[error("Subagent file creation was rejected; check path, size and conflicts")]
+    CreateRejected,
     #[error("Browser needs human {0}; complete it visibly, then call subagent_resume")]
     Manual(&'static str),
     #[error("Subagent backend is unavailable or failed")]
@@ -90,6 +99,10 @@ pub struct AgentInfo {
     pub error: Option<String>,
     pub external_conversation: Option<String>,
     pub untrusted: bool,
+    pub patches_applied: usize,
+    pub patched_paths: Vec<String>,
+    pub files_created: usize,
+    pub created_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +131,25 @@ pub struct AgentWait {
 pub struct AgentCompletionAck {
     pub id: String,
     pub state: AgentState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentCreateReceipt {
+    pub id: String,
+    pub workspace_id: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: usize,
+    pub files_created: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentPatchReceipt {
+    pub id: String,
+    pub workspace_id: String,
+    pub paths: Vec<String>,
+    pub bytes: u64,
+    pub patches_applied: usize,
 }
 
 #[derive(Debug, Error)]
@@ -201,6 +233,10 @@ struct Entry {
     completion_code: String,
     completion_failures: u8,
     completion_claimed: bool,
+    patch_attempts: u8,
+    create_attempts: u16,
+    allowed_paths: Vec<PathBuf>,
+    patch_gate: Arc<Mutex<()>>,
     epoch: u64,
     ready: bool,
     updates: watch::Sender<AgentInfo>,
@@ -245,11 +281,16 @@ impl AgentManager {
         // Paths are validated, but no private file contents are automatically
         // uploaded to a third-party browser/account. Only explicit user context
         // and names of selected safe paths are sent.
+        let mut allowed_paths = Vec::with_capacity(request.paths.len());
         for path in &request.paths {
-            self.inner
+            let resolved = self
+                .inner
                 .workspaces
                 .resolve(Some(&workspace.workspace_id), path, false)
                 .map_err(|_| AgentError::Invalid)?;
+            if !allowed_paths.contains(&resolved) {
+                allowed_paths.push(resolved);
+            }
         }
         let id = format!("agent-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let code = completion_code();
@@ -264,7 +305,7 @@ impl AgentManager {
                 "Read-only tester: propose tests; do not claim tests ran without actual results."
             }
             AgentRole::Implementer => {
-                "Implementer: propose a complete Git unified diff in your answer. No patch is automatically applied; parent must validate and apply it separately."
+                "Implementer: use the NovaGPT MCP subagent_apply_patch tool to change selected existing files and subagent_create_file to CREATE new files at ANY safe path inside the assigned workspace, even if no paths were selected at spawn. Both tools require your private code. New files may have nested parent directories and must never overwrite existing files. Only a successful tool receipt proves an applied change. Never claim files were written without a receipt; if tools are unavailable, return proposed diffs clearly labelled NOT APPLIED. The parent verifies the real workspace."
             }
         };
         let prompt = format!(
@@ -285,6 +326,10 @@ impl AgentManager {
             error: None,
             external_conversation: None,
             untrusted: true,
+            patches_applied: 0,
+            patched_paths: Vec::new(),
+            files_created: 0,
+            created_paths: Vec::new(),
         };
         {
             let mut agents = self.inner.entries.lock().await;
@@ -306,6 +351,10 @@ impl AgentManager {
                     completion_code: code,
                     completion_failures: 0,
                     completion_claimed: false,
+                    patch_attempts: 0,
+                    create_attempts: 0,
+                    allowed_paths,
+                    patch_gate: Arc::new(Mutex::new(())),
                     epoch: 1,
                     ready: false,
                     updates,
@@ -331,6 +380,11 @@ impl AgentManager {
                 manager.inner.backend.send(&id, &prompt).await
             }
             .await;
+            // Serialize completion with an in-flight file patch for this agent.
+            let Ok(patch_gate) = manager.patch_gate(&id).await else {
+                return;
+            };
+            let _patch_guard = patch_gate.lock().await;
             let mut agents = manager.inner.entries.lock().await;
             if let Some(entry) = agents.get_mut(&id) {
                 // An authenticated subagent callback may have already
@@ -353,7 +407,8 @@ impl AgentManager {
                             entry.info.result = Some(AgentOutput {
                                 raw_response: result,
                                 untrusted: true,
-                                applied_to_workspace: false,
+                                applied_to_workspace: entry.info.patches_applied > 0
+                                    || entry.info.files_created > 0,
                             });
                             entry.info.external_conversation = url;
                             entry.info.error = None;
@@ -394,6 +449,15 @@ impl AgentManager {
         }
     }
 
+    async fn patch_gate(&self, id: &str) -> AgentResult<Arc<Mutex<()>>> {
+        let agents = self.inner.entries.lock().await;
+        Ok(agents
+            .get(id)
+            .ok_or(AgentError::NotFound)?
+            .patch_gate
+            .clone())
+    }
+
     pub async fn message(&self, id: &str, message: &str) -> AgentResult<AgentInfo> {
         if message.trim().is_empty() || message.len() > MAX_MESSAGE {
             return Err(AgentError::Invalid);
@@ -414,6 +478,20 @@ impl AgentManager {
         new_prompt: Option<&str>,
         resume: bool,
     ) -> AgentResult<AgentInfo> {
+        // A completion callback may be awaiting browser cleanup while holding
+        // the patch gate. Report Busy immediately instead of blocking its caller.
+        {
+            let entries = self.inner.entries.lock().await;
+            if entries
+                .get(id)
+                .ok_or(AgentError::NotFound)?
+                .completion_claimed
+            {
+                return Err(AgentError::Busy);
+            }
+        }
+        let gate = self.patch_gate(id).await?;
+        let _patch_guard = gate.lock().await;
         let mut agents = self.inner.entries.lock().await;
         let entry = agents.get_mut(id).ok_or(AgentError::NotFound)?;
         if entry.completion_claimed {
@@ -440,10 +518,16 @@ impl AgentManager {
             entry.completion_code = code.clone();
             entry.completion_failures = 0;
             entry.completion_claimed = false;
-            format!(
+            entry.patch_attempts = 0;
+            entry.create_attempts = 0;
+            let mut next = format!(
                 "{}\n\nWHEN FINISHED: Call the NovaGPT MCP tool subagent_finished with id={id}, code={code}, and result=<your complete final report>. Do this once. Keep the six-character code private; do not include it in messages or logs.",
                 new_prompt.unwrap_or_default()
-            )
+            );
+            if entry.info.role == AgentRole::Implementer {
+                next.push_str("\n\nFor existing files call subagent_apply_patch with this id/code, one selected file per patch. For NEW files anywhere within the authorized workspace call subagent_create_file with id/code/path/content; paths need not be selected. Check the receipt before saying APPLIED; otherwise label changes NOT APPLIED.");
+            }
+            next
         };
         if prompt.is_empty() {
             return Err(AgentError::Invalid);
@@ -453,6 +537,12 @@ impl AgentManager {
         entry.info.state = AgentState::Running;
         entry.info.error = None;
         entry.info.result = None;
+        if !resume {
+            entry.info.patches_applied = 0;
+            entry.info.patched_paths.clear();
+            entry.info.files_created = 0;
+            entry.info.created_paths.clear();
+        }
         entry.pending_prompt = prompt.clone();
         entry.updates.send_replace(entry.info.clone());
         let created = !entry.ready;
@@ -463,6 +553,8 @@ impl AgentManager {
     }
 
     pub async fn cancel(&self, id: &str) -> AgentResult<AgentInfo> {
+        let gate = self.patch_gate(id).await?;
+        let _patch_guard = gate.lock().await;
         let info = {
             let mut agents = self.inner.entries.lock().await;
             let entry = agents.get_mut(id).ok_or(AgentError::NotFound)?;
@@ -507,6 +599,11 @@ impl AgentManager {
         if result.trim().is_empty() || result.len() > MAX_RESULT {
             return Err(AgentError::Invalid);
         }
+        let gate = self
+            .patch_gate(id)
+            .await
+            .map_err(|_| AgentError::CompletionDenied)?;
+        let _patch_guard = gate.lock().await;
         {
             let mut agents = self.inner.entries.lock().await;
             let entry = agents.get_mut(id).ok_or(AgentError::CompletionDenied)?;
@@ -536,7 +633,8 @@ impl AgentManager {
             entry.info.result = Some(AgentOutput {
                 raw_response: result.to_owned(),
                 untrusted: true,
-                applied_to_workspace: false,
+                applied_to_workspace: entry.info.patches_applied > 0
+                    || entry.info.files_created > 0,
             });
             entry.pending_prompt.clear();
             entry.completion_code.clear();
@@ -602,6 +700,181 @@ impl AgentManager {
                 })
             }
         }
+    }
+
+    /// Apply an explicitly requested, authenticated, single-file update in the
+    /// assigned real workspace. The blocking worker owns the per-agent gate
+    /// until Git exits, even if its async caller disconnects.
+    pub async fn apply_patch(
+        &self,
+        id: &str,
+        code: &str,
+        patch: &str,
+    ) -> AgentResult<AgentPatchReceipt> {
+        if patch.is_empty() || patch.len() > MAX_AGENT_PATCH_BYTES {
+            return Err(AgentError::PatchRejected);
+        }
+        let id = id.to_owned();
+        let code = code.to_owned();
+        let patch = patch.to_owned();
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let relative =
+                novagpt_core::patch_target(&patch).map_err(|_| AgentError::PatchRejected)?;
+            let gate = manager
+                .inner
+                .entries
+                .blocking_lock()
+                .get(&id)
+                .ok_or(AgentError::PatchDenied)?
+                .patch_gate
+                .clone();
+            let _gate = gate.blocking_lock();
+            let workspace_id = {
+                let mut entries = manager.inner.entries.blocking_lock();
+                let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
+                if !entry.ready
+                    || entry.info.role != AgentRole::Implementer
+                    || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
+                    || entry.completion_claimed
+                    || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
+                    || entry.patch_attempts >= MAX_PATCH_ATTEMPTS
+                {
+                    return Err(AgentError::PatchDenied);
+                }
+                let correct = code.len() == COMPLETION_KEY_LEN
+                    && entry
+                        .completion_code
+                        .as_bytes()
+                        .ct_eq(code.as_bytes())
+                        .unwrap_u8()
+                        == 1;
+                if !correct {
+                    entry.completion_failures = entry.completion_failures.saturating_add(1);
+                    return Err(AgentError::PatchDenied);
+                }
+                let workspace_id = entry.info.workspace_id.clone();
+                let target = manager
+                    .inner
+                    .workspaces
+                    .resolve(Some(&workspace_id), &relative, true)
+                    .map_err(|_| AgentError::PatchDenied)?;
+                // A file this run created is also an authorized edit target,
+                // even when its path was not known at spawn time.
+                if !entry.allowed_paths.contains(&target)
+                    && !entry.info.created_paths.contains(&relative)
+                {
+                    return Err(AgentError::PatchDenied);
+                }
+                entry.patch_attempts += 1;
+                workspace_id
+            };
+            let receipt = manager
+                .inner
+                .workspaces
+                .apply_unified_patch(Some(&workspace_id), &patch)
+                .map_err(|_| AgentError::PatchRejected)?;
+            let mut entries = manager.inner.entries.blocking_lock();
+            let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
+            entry.info.patches_applied += 1;
+            for path in &receipt.paths {
+                if !entry.info.patched_paths.contains(path) {
+                    entry.info.patched_paths.push(path.clone());
+                }
+            }
+            entry.updates.send_replace(entry.info.clone());
+            Ok(AgentPatchReceipt {
+                id,
+                workspace_id,
+                paths: receipt.paths,
+                bytes: receipt.bytes,
+                patches_applied: entry.info.patches_applied,
+            })
+        })
+        .await
+        .map_err(|_| AgentError::Backend)?
+    }
+
+    /// Create a new text file anywhere inside the agent's approved workspace.
+    /// Unlike updating existing files, creation needs no preselected path. The
+    /// exclusive core create operation never replaces another agent's work.
+    pub async fn create_file(
+        &self,
+        id: &str,
+        code: &str,
+        path: &str,
+        content: &str,
+    ) -> AgentResult<AgentCreateReceipt> {
+        // Bound incoming allocations before cloning work into spawn_blocking.
+        if path.trim().is_empty() || path.len() > 1024 || content.len() > 1_000_000 {
+            return Err(AgentError::CreateRejected);
+        }
+        let manager = self.clone();
+        let id = id.to_owned();
+        let code = code.to_owned();
+        let path = path.to_owned();
+        let content = content.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let gate = manager
+                .inner
+                .entries
+                .blocking_lock()
+                .get(&id)
+                .ok_or(AgentError::PatchDenied)?
+                .patch_gate
+                .clone();
+            // Holding the per-agent gate until the blocking write finishes
+            // prevents cancellation, completion and new runs from racing it.
+            let _guard = gate.blocking_lock();
+            let workspace_id = {
+                let mut entries = manager.inner.entries.blocking_lock();
+                let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
+                if !entry.ready
+                    || entry.info.role != AgentRole::Implementer
+                    || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
+                    || entry.completion_claimed
+                    || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
+                    || entry.create_attempts >= MAX_CREATE_ATTEMPTS
+                {
+                    return Err(AgentError::PatchDenied);
+                }
+                let correct = code.len() == COMPLETION_KEY_LEN
+                    && entry
+                        .completion_code
+                        .as_bytes()
+                        .ct_eq(code.as_bytes())
+                        .unwrap_u8()
+                        == 1;
+                if !correct {
+                    entry.completion_failures = entry.completion_failures.saturating_add(1);
+                    return Err(AgentError::PatchDenied);
+                }
+                entry.create_attempts += 1;
+                entry.info.workspace_id.clone()
+            };
+            let receipt = manager
+                .inner
+                .workspaces
+                .create_new_file(Some(&workspace_id), &path, &content)
+                .map_err(|_| AgentError::CreateRejected)?;
+            let mut entries = manager.inner.entries.blocking_lock();
+            let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
+            entry.info.files_created += 1;
+            if !entry.info.created_paths.contains(&receipt.path) {
+                entry.info.created_paths.push(receipt.path.clone());
+            }
+            entry.updates.send_replace(entry.info.clone());
+            Ok(AgentCreateReceipt {
+                id,
+                workspace_id,
+                path: receipt.path,
+                sha256: receipt.sha256,
+                bytes: receipt.bytes,
+                files_created: entry.info.files_created,
+            })
+        })
+        .await
+        .map_err(|_| AgentError::Backend)?
     }
 
     pub async fn result(&self, id: &str) -> AgentResult<AgentInfo> {
@@ -1002,6 +1275,435 @@ mod tests {
             result.result.expect("report").raw_response,
             "verified report"
         );
+    }
+
+    #[tokio::test]
+    async fn implementer_applies_only_assigned_files_with_verified_receipts() {
+        let dir = tempfile::tempdir().expect("fixture");
+        std::fs::write(dir.path().join("one.rs"), "before one\n").unwrap();
+        std::fs::write(dir.path().join("two.rs"), "before two\n").unwrap();
+        std::fs::write(dir.path().join("other.rs"), "private\n").unwrap();
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("workspace"),
+            backend.clone(),
+        );
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "edit assigned files".into(),
+                role: AgentRole::Implementer,
+                paths: vec!["one.rs".into(), "two.rs".into()],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        backend.entered.notified().await;
+        let code = manager.inner.entries.lock().await[&info.id]
+            .completion_code
+            .clone();
+        let first = "--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-before one\n+after one\n";
+        let second = "diff --git a/two.rs b/two.rs\n--- a/two.rs\n+++ b/two.rs\n@@ -1 +1 @@\n-before two\n+after two\n";
+        let forbidden = "--- a/other.rs\n+++ b/other.rs\n@@ -1 +1 @@\n-private\n+corrupted\n";
+        let wrong = if code == "AAAAAA" { "BBBBBB" } else { "AAAAAA" };
+        assert!(matches!(
+            manager.apply_patch(&info.id, wrong, first).await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert!(matches!(
+            manager.apply_patch(&info.id, &code, forbidden).await,
+            Err(AgentError::PatchDenied)
+        ));
+        let first_receipt = manager
+            .apply_patch(&info.id, &code, first)
+            .await
+            .expect("real first edit");
+        assert_eq!(first_receipt.paths, ["one.rs"]);
+        assert_eq!(first_receipt.patches_applied, 1);
+        let second_receipt = manager
+            .apply_patch(&info.id, &code, second)
+            .await
+            .expect("real second edit");
+        assert_eq!(second_receipt.paths, ["two.rs"]);
+        assert_eq!(second_receipt.patches_applied, 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("one.rs")).unwrap(),
+            "after one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("two.rs")).unwrap(),
+            "after two\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other.rs")).unwrap(),
+            "private\n"
+        );
+        assert!(matches!(
+            manager.apply_patch(&info.id, &code, first).await,
+            Err(AgentError::PatchRejected)
+        ));
+        let state = manager
+            .status(Some(&info.id))
+            .await
+            .unwrap()
+            .agents
+            .remove(0);
+        assert_eq!(state.patches_applied, 2);
+        assert_eq!(state.patched_paths, ["one.rs", "two.rs"]);
+        assert_eq!(state.state, AgentState::Running);
+        manager
+            .finished(&info.id, &code, "Verified receipts for both edits")
+            .await
+            .unwrap();
+        let done = manager.wait(&info.id, 2).await.unwrap();
+        assert!(done.agent.result.unwrap().applied_to_workspace);
+        assert!(matches!(
+            manager.apply_patch(&info.id, &code, second).await,
+            Err(AgentError::PatchDenied)
+        ));
+        backend.release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_read_only_roles_old_codes_and_cancelled_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.rs"), "old\n").unwrap();
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+            backend.clone(),
+        );
+        let patch = "--- a/source.rs\n+++ b/source.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let reviewer = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "inspect".into(),
+                role: AgentRole::Reviewer,
+                paths: vec!["source.rs".into()],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let review_code = manager.inner.entries.lock().await[&reviewer.id]
+            .completion_code
+            .clone();
+        assert!(matches!(
+            manager.apply_patch(&reviewer.id, &review_code, patch).await,
+            Err(AgentError::PatchDenied)
+        ));
+        manager.cancel(&reviewer.id).await.unwrap();
+        assert!(matches!(
+            manager.apply_patch(&reviewer.id, &review_code, patch).await,
+            Err(AgentError::PatchDenied)
+        ));
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "update".into(),
+                role: AgentRole::Implementer,
+                paths: vec!["source.rs".into()],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let first_code = manager.inner.entries.lock().await[&worker.id]
+            .completion_code
+            .clone();
+        assert!(matches!(
+            manager.apply_patch(&worker.id, &review_code, patch).await,
+            Err(AgentError::PatchDenied)
+        ));
+        manager
+            .finished(&worker.id, &first_code, "not applied")
+            .await
+            .unwrap();
+        manager.message(&worker.id, "next execution").await.unwrap();
+        backend.entered.notified().await;
+        let second_code = manager.inner.entries.lock().await[&worker.id]
+            .completion_code
+            .clone();
+        assert_ne!(first_code, second_code);
+        assert!(matches!(
+            manager.apply_patch(&worker.id, &first_code, patch).await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert_eq!(
+            manager
+                .apply_patch(&worker.id, &second_code, patch)
+                .await
+                .unwrap()
+                .patches_applied,
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("source.rs")).unwrap(),
+            "new\n"
+        );
+        manager.cancel(&worker.id).await.unwrap();
+        assert!(matches!(
+            manager.apply_patch(&worker.id, &second_code, patch).await,
+            Err(AgentError::PatchDenied)
+        ));
+        backend.release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn implementer_creates_and_then_edits_any_safe_new_file_without_preselection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.rs"), "keep\n").unwrap();
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+            backend.clone(),
+        );
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "create new source files".into(),
+                role: AgentRole::Implementer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let code = manager.inner.entries.lock().await[&worker.id]
+            .completion_code
+            .clone();
+        let wrong = if code == "AAAAAA" { "BBBBBB" } else { "AAAAAA" };
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, wrong, "src/new.rs", "created\n")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        let created = manager
+            .create_file(&worker.id, &code, "src/deep/generated.rs", "created\n")
+            .await
+            .unwrap();
+        assert_eq!(created.path, "src/deep/generated.rs");
+        assert_eq!(created.files_created, 1);
+        assert_eq!(created.bytes, "created\n".len());
+        assert_eq!(created.sha256.len(), 64);
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, &code, "src/deep/generated.rs", "overwrite\n")
+                .await,
+            Err(AgentError::CreateRejected)
+        ));
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, &code, ".env", "secret")
+                .await,
+            Err(AgentError::CreateRejected)
+        ));
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, &code, "../outside.txt", "escape")
+                .await,
+            Err(AgentError::CreateRejected)
+        ));
+        let change = "--- a/src/deep/generated.rs\n+++ b/src/deep/generated.rs\n@@ -1 +1 @@\n-created\n+updated\n";
+        assert_eq!(
+            manager
+                .apply_patch(&worker.id, &code, change)
+                .await
+                .unwrap()
+                .patches_applied,
+            1
+        );
+        let other = "--- a/existing.rs\n+++ b/existing.rs\n@@ -1 +1 @@\n-keep\n+destroyed\n";
+        assert!(matches!(
+            manager.apply_patch(&worker.id, &code, other).await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/deep/generated.rs")).unwrap(),
+            "updated\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("existing.rs")).unwrap(),
+            "keep\n"
+        );
+        let status = manager.status(Some(&worker.id)).await.unwrap();
+        assert_eq!(status.agents[0].files_created, 1);
+        assert_eq!(status.agents[0].created_paths, ["src/deep/generated.rs"]);
+        manager
+            .finished(&worker.id, &code, "Created and edited")
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .result(&worker.id)
+                .await
+                .unwrap()
+                .result
+                .unwrap()
+                .applied_to_workspace
+        );
+        backend.release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn file_creation_is_denied_for_other_roles_cancelled_and_old_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+            backend.clone(),
+        );
+        let reviewer = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "review".into(),
+                role: AgentRole::Reviewer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let reviewer_code = manager.inner.entries.lock().await[&reviewer.id]
+            .completion_code
+            .clone();
+        assert!(matches!(
+            manager
+                .create_file(&reviewer.id, &reviewer_code, "reviewer.txt", "no")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        manager.cancel(&reviewer.id).await.unwrap();
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "create".into(),
+                role: AgentRole::Implementer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let first_code = manager.inner.entries.lock().await[&worker.id]
+            .completion_code
+            .clone();
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, &reviewer_code, "cross-agent.txt", "no")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        manager
+            .finished(&worker.id, &first_code, "nothing created")
+            .await
+            .unwrap();
+        manager
+            .message(&worker.id, "create new file")
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let second_code = manager.inner.entries.lock().await[&worker.id]
+            .completion_code
+            .clone();
+        assert_ne!(first_code, second_code);
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, &first_code, "stale.txt", "no")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert_eq!(
+            manager
+                .create_file(&worker.id, &second_code, "new.txt", "yes")
+                .await
+                .unwrap()
+                .files_created,
+            1
+        );
+        manager.cancel(&worker.id).await.unwrap();
+        assert!(matches!(
+            manager
+                .create_file(&worker.id, &second_code, "after-cancel.txt", "no")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "yes"
+        );
+        for name in [
+            "reviewer.txt",
+            "cross-agent.txt",
+            "stale.txt",
+            "after-cancel.txt",
+        ] {
+            assert!(!dir.path().join(name).exists(), "unexpected file: {name}");
+        }
+        backend.release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn patch_attempts_are_bounded_even_when_git_rejects_every_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.rs"), "before\n").unwrap();
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+            backend.clone(),
+        );
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "bounded edits".into(),
+                role: AgentRole::Implementer,
+                paths: vec!["source.rs".into()],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.entered.notified().await;
+        let code = manager.inner.entries.lock().await[&worker.id]
+            .completion_code
+            .clone();
+        let conflict = "--- a/source.rs\n+++ b/source.rs\n@@ -1 +1 @@\n-nonexistent\n+after\n";
+        let valid = "--- a/source.rs\n+++ b/source.rs\n@@ -1 +1 @@\n-before\n+after\n";
+        for _ in 0..MAX_PATCH_ATTEMPTS {
+            assert!(matches!(
+                manager.apply_patch(&worker.id, &code, conflict).await,
+                Err(AgentError::PatchRejected)
+            ));
+        }
+        assert!(matches!(
+            manager.apply_patch(&worker.id, &code, valid).await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert_eq!(
+            manager.status(Some(&worker.id)).await.unwrap().agents[0].patches_applied,
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("source.rs")).unwrap(),
+            "before\n"
+        );
+        manager.cancel(&worker.id).await.unwrap();
+        backend.release.notify_one();
     }
 
     #[tokio::test]

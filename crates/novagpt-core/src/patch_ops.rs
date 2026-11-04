@@ -16,20 +16,40 @@ pub struct PatchResult {
     pub bytes: u64,
 }
 
-fn patch_target(patch: &str) -> NovaResult<String> {
+pub fn patch_target(patch: &str) -> NovaResult<String> {
     if patch.len() > MAX_PATCH_BYTES || patch.is_empty() {
         return Err(NovaError::InvalidInput("Patch missing or too large".into()));
     }
     let mut old = None;
     let mut new = None;
+    let mut git_header = None;
     let mut hunk = false;
     for line in patch.lines() {
-        if line.starts_with("diff --git ")
-            || line.starts_with("rename ")
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if git_header.is_some() {
+                return Err(NovaError::InvalidInput("Multiple patch targets".into()));
+            }
+            let mut fields = rest.split_whitespace();
+            let before = fields.next().and_then(|path| path.strip_prefix("a/"));
+            let after = fields.next().and_then(|path| path.strip_prefix("b/"));
+            match (before, after, fields.next()) {
+                (Some(before), Some(after), None) if before == after => {
+                    git_header = Some(before.to_owned());
+                }
+                _ => {
+                    return Err(NovaError::InvalidInput(
+                        "Unsupported Git patch header".into(),
+                    ));
+                }
+            }
+        } else if line.starts_with("rename ")
             || line.starts_with("copy ")
             || line.starts_with("GIT binary patch")
+            || line.starts_with("Binary files ")
             || line.starts_with("new file mode")
             || line.starts_with("deleted file mode")
+            || line.starts_with("old mode")
+            || line.starts_with("new mode")
         {
             return Err(NovaError::InvalidInput(
                 "Extended patches are not supported".into(),
@@ -59,7 +79,10 @@ fn patch_target(patch: &str) -> NovaResult<String> {
     }
     match (old, new, hunk) {
         (Some(before), Some(after), true)
-            if before == after && !before.is_empty() && !before.chars().any(|c| c.is_control()) =>
+            if before == after
+                && git_header.as_deref().is_none_or(|target| target == before)
+                && !before.is_empty()
+                && !before.chars().any(|c| c.is_control()) =>
         {
             Ok(before.to_string())
         }
@@ -148,6 +171,26 @@ mod tests {
             "after\n"
         );
         assert!(state.apply_unified_patch(None, patch).is_err());
+    }
+
+    #[test]
+    fn git_style_single_file_patch_is_guarded_like_plain_unified_diff() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let state = WorkspaceRegistry::new(temp.path(), &[]).expect("registry");
+        fs::write(temp.path().join("sample.txt"), "before\n").expect("fixture");
+        let patch = "diff --git a/sample.txt b/sample.txt\nindex 1234567..89abcde 100644\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-before\n+after\n";
+        assert_eq!(patch_target(patch).unwrap(), "sample.txt");
+        assert!(state.apply_unified_patch(None, patch).is_ok());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("sample.txt")).unwrap(),
+            "after\n"
+        );
+        let mismatched = "diff --git a/other.txt b/other.txt\n--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-before\n+after\n";
+        assert!(patch_target(mismatched).is_err());
+        let multiple = format!("{patch}{patch}");
+        assert!(patch_target(&multiple).is_err());
+        let create = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n";
+        assert!(patch_target(create).is_err());
     }
 
     #[test]

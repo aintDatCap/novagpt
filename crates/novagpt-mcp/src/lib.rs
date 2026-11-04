@@ -437,6 +437,26 @@ struct AgentFinishedArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentPatchArgs {
+    id: String,
+    /// Private code from the worker's current execution. Never include in logs.
+    code: String,
+    /// One ordinary Git unified diff for an existing assigned file.
+    patch: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentCreateFileArgs {
+    id: String,
+    /// Private code from the current worker prompt. Never record this code.
+    code: String,
+    /// New file path within this subagent's allowed real workspace.
+    path: String,
+    /// Bounded UTF-8 file contents. Existing files are never overwritten.
+    content: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentCancelArgs {
     id: String,
     #[serde(default)]
@@ -1219,7 +1239,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Spawn a persistent asynchronous untrusted subagent. Valid roles: explorer, reviewer, tester, implementer. The implementer proposes patches but never auto-applies them."
+        description = "Spawn a persistent asynchronous untrusted subagent. Valid roles: explorer, reviewer, tester, implementer. Implementers may explicitly apply guarded patches to assigned existing files using subagent_apply_patch; no text-only auto-apply."
     )]
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
         let response = async {
@@ -1324,6 +1344,40 @@ impl NovaMcp {
             None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_finished", response)
+    }
+
+    #[tool(
+        description = "For an implementer subagent only: apply one guarded Git unified diff to an explicitly assigned existing file in its real workspace. Requires the current private execution code. Returns a verified receipt; no implicit application from chat text."
+    )]
+    async fn subagent_apply_patch(
+        &self,
+        Parameters(args): Parameters<AgentPatchArgs>,
+    ) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => {
+                external_reply(manager.apply_patch(&args.id, &args.code, &args.patch).await)
+            }
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_apply_patch", response)
+    }
+
+    #[tool(
+        description = "For an authenticated implementer subagent: create a NEW UTF-8 file at any safe path inside its assigned real workspace, without selecting paths at spawn. Missing parent directories are created; existing files are never overwritten. Requires current private execution code."
+    )]
+    async fn subagent_create_file(
+        &self,
+        Parameters(args): Parameters<AgentCreateFileArgs>,
+    ) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => external_reply(
+                manager
+                    .create_file(&args.id, &args.code, &args.path, &args.content)
+                    .await,
+            ),
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_create_file", response)
     }
 
     #[tool(

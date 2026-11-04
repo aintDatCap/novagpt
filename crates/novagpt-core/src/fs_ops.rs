@@ -115,6 +115,42 @@ impl WorkspaceRegistry {
         })
     }
 
+    /// Create a new file inside an approved workspace without ever replacing
+    /// an existing entry. Missing parent directories may be created, but path
+    /// guards are checked again after acquiring the target lock and mkdir.
+    pub fn create_new_file(
+        &self,
+        workspace_id: Option<&str>,
+        relative: &str,
+        content: &str,
+    ) -> NovaResult<FileReceipt> {
+        if relative.trim().is_empty() || content.len() > self.max_write_bytes() {
+            return Err(if relative.trim().is_empty() {
+                NovaError::InvalidInput("New file path is required".into())
+            } else {
+                NovaError::TooLarge(self.max_write_bytes())
+            });
+        }
+        let target = self.resolve(workspace_id, relative, true)?;
+        self.with_write_lock(&target, || {
+            self.resolve(workspace_id, relative, true)?;
+            let parent = target
+                .parent()
+                .ok_or_else(|| NovaError::InvalidInput("Invalid file parent".into()))?;
+            fs::create_dir_all(parent)?;
+            self.resolve(workspace_id, relative, true)?;
+            // create_new uses exclusive creation, preventing overwrites even
+            // across independent NovaGPT processes or concurrent agents.
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            self.receipt(workspace_id, &target, content.as_bytes())
+        })
+    }
+
     pub fn edit_file(&self, request: EditRequest<'_>) -> NovaResult<FileReceipt> {
         if request.old_text.is_empty() {
             return Err(NovaError::InvalidInput("old_text must not be empty".into()));
@@ -230,6 +266,69 @@ impl WorkspaceRegistry {
             }
         }
         Ok(hits)
+    }
+}
+
+#[cfg(test)]
+mod create_new_tests {
+    use super::*;
+    #[test]
+    fn creates_nested_files_without_overwriting_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkspaceRegistry::new(dir.path(), &[]).unwrap();
+        let receipt = registry
+            .create_new_file(None, "generated/nested/hello.rs", "fn hello() {}\n")
+            .unwrap();
+        assert_eq!(receipt.path, "generated/nested/hello.rs");
+        assert_eq!(receipt.bytes, "fn hello() {}\n".len());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("generated/nested/hello.rs")).unwrap(),
+            "fn hello() {}\n"
+        );
+        assert!(
+            registry
+                .create_new_file(None, "generated/nested/hello.rs", "overwrite")
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("generated/nested/hello.rs")).unwrap(),
+            "fn hello() {}\n"
+        );
+    }
+
+    #[test]
+    fn create_new_file_denies_sensitive_and_outside_workspace_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = WorkspaceRegistry::new(dir.path(), &[]).unwrap();
+        assert!(matches!(
+            registry.create_new_file(None, "../escape.txt", "no"),
+            Err(NovaError::OutsideAllowedRoot)
+        ));
+        assert!(matches!(
+            registry.create_new_file(None, ".env", "no"),
+            Err(NovaError::BlockedPath)
+        ));
+        assert!(matches!(
+            registry.create_new_file(None, "generated/.git/config", "no"),
+            Err(NovaError::BlockedPath)
+        ));
+        assert!(!dir.path().join("generated").exists());
+        assert!(registry.create_new_file(None, "", "no").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_file_cannot_follow_a_directory_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        symlink(other.path(), dir.path().join("redirect")).unwrap();
+        let registry = WorkspaceRegistry::new(dir.path(), &[]).unwrap();
+        assert!(matches!(
+            registry.create_new_file(None, "redirect/private.txt", "no"),
+            Err(NovaError::OutsideAllowedRoot)
+        ));
+        assert!(!other.path().join("private.txt").exists());
     }
 }
 
