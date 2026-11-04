@@ -171,6 +171,28 @@ enum LogsCommand {
     },
 }
 
+/// Register shutdown before creating public tunnel resources. The same future
+/// is later moved into the HTTP service to avoid losing a signal at handoff.
+async fn http_stop_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -443,6 +465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let token = resolved.value;
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
             if ngrok {
+                let mut shutdown = Box::pin(http_stop_signal());
                 // Own the loopback socket BEFORE starting a public tunnel.
                 let audit = extras.audit.clone();
                 let listener = match tokio::net::TcpListener::bind(address).await {
@@ -456,7 +479,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 };
-                let mut tunnel = match tunnel::NgrokTunnel::start(port, ngrok_domain).await {
+                let mut tunnel = match tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        audit.flush().await;
+                        return Ok(());
+                    }
+                    result = tunnel::NgrokTunnel::start(port, ngrok_domain) => result,
+                } {
                     Ok(tunnel) => tunnel,
                     Err(_) => {
                         audit.record("http_tunnel_start_failed", true);
@@ -464,7 +494,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("Unable to start ngrok".into());
                     }
                 };
-                let hostname = match tunnel.public_hostname().await {
+                let hostname = match tokio::select! {
+                    biased;
+                    _ = &mut shutdown => {
+                        tunnel.stop().await;
+                        audit.flush().await;
+                        return Ok(());
+                    }
+                    hostname = tunnel.public_hostname() => hostname,
+                } {
                     Some(host) => host,
                     None => {
                         audit.record("http_tunnel_discovery_failed", true);
@@ -478,8 +516,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Trust only the hostname returned by the locally controlled ngrok
                 // agent for the exact loopback port, not a wildcard or forwarded header.
                 extras.http_public_hostname = Some(hostname);
-                let server =
-                    novagpt_mcp::run_http_on_listener_with(workspaces, listener, token, extras);
+                let server = novagpt_mcp::run_http_on_listener_with_shutdown(
+                    workspaces, listener, token, extras, shutdown,
+                );
                 tokio::pin!(server);
                 let mut published = false;
                 loop {

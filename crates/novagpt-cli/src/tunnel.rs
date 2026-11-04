@@ -208,6 +208,26 @@ pub fn connector_url(endpoint: &str, token: &str) -> Result<String, &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_owned_tunnel_kills_and_reaps_its_child() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("test subprocess");
+        let mut tunnel = NgrokTunnel {
+            child,
+            port: 8787,
+            configured_domain: None,
+        };
+        tunnel.stop().await;
+        assert!(
+            tunnel.child.try_wait().expect("reap owned child").is_some(),
+            "stop must reap the subprocess rather than leave a zombie"
+        );
+    }
     #[tokio::test]
     async fn tunnel_discovery_rejects_foreign_upstreams_and_unsafe_urls() {
         use tokio::{

@@ -30,7 +30,7 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{future::Future, net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone, Default)]
@@ -1381,6 +1381,29 @@ async fn authorize(
     response
 }
 
+/// Stop on an interactive interrupt or a supervisor's termination request.
+/// A supervisor can now ask the HTTP server to finish active requests and
+/// flush its audit before the owning CLI tears down a managed tunnel.
+async fn http_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 pub async fn run_http(
     workspaces: WorkspaceRegistry,
     address: SocketAddr,
@@ -1450,6 +1473,22 @@ pub async fn run_http_on_listener_with(
     token: String,
     extras: NovaExtras,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_http_on_listener_with_shutdown(workspaces, listener, token, extras, http_shutdown_signal())
+        .await
+}
+
+/// A caller owning startup resources (such as an ngrok child) can register its
+/// shutdown signal before spawning them, then hand the same signal to HTTP.
+pub async fn run_http_on_listener_with_shutdown<S>(
+    workspaces: WorkspaceRegistry,
+    listener: tokio::net::TcpListener,
+    token: String,
+    extras: NovaExtras,
+    shutdown: S,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     if token.len() < 24 || !listener.local_addr()?.ip().is_loopback() {
         return Err("MCP HTTP requires a loopback listener and a strong workspace token".into());
     }
@@ -1476,9 +1515,7 @@ pub async fn run_http_on_listener_with(
     let address = listener.local_addr()?;
     tracing::info!(%address, "NovaGPT MCP HTTP listening");
     let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown)
         .await;
     audit.record("http_server_stopped", result.is_err());
     audit.flush().await;

@@ -396,7 +396,7 @@ impl Controller {
                                             loop {
                                                 tokio::select! {
                                                     output = &mut server => {
-                                                        let _ = tunnel.child.start_kill();
+                                                        tunnel.stop().await;
                                                         break if output { Ok(()) } else { Err("Server MCP terminato".into()) };
                                                     }
                                                     output = tunnel.child.wait() => {
@@ -417,7 +417,7 @@ impl Controller {
                                             }
                                         } else {
                                             audit.record("http_tunnel_discovery_failed", true);
-                                            let _ = tunnel.child.start_kill();
+                                            tunnel.stop().await;
                                             audit.flush().await;
                                             Err("Il dominio ngrok della porta MCP non e' stato verificato".into())
                                         }
