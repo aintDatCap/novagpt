@@ -115,7 +115,9 @@ pub enum BrowserError {
     InvalidProfile,
     #[error("Dedicated NovaGPT Chrome profile is already in use")]
     ProfileBusy,
-    #[error("Browser navigation requires a public HTTPS URL with no credentials or custom port")]
+    #[error(
+        "Browser navigation requires public HTTPS or a loopback HTTP(S) URL without credentials"
+    )]
     UnsafeUrl,
     #[error("Browser control is invalid, hidden, disabled or unavailable")]
     InvalidControl,
@@ -393,8 +395,8 @@ impl ChatGptBrowser {
         })
     }
 
-    /// Opt in to one exact local HTTP origin for live web development.
-    /// This permission is never inferred from a page, prompt or redirect.
+    /// Optionally restrict local browsing to one exact HTTP development origin.
+    /// Without this setting, standard loopback hosts are available by default.
     pub fn with_dev_origin(mut self, origin: &str) -> Result<Self, BrowserError> {
         let approved = local_dev_origin(origin)?;
         let inner = Arc::get_mut(&mut self.inner).ok_or(BrowserError::Protocol)?;
@@ -406,23 +408,13 @@ impl ChatGptBrowser {
         if let Ok(url) = public_https_url(input) {
             return Ok(url);
         }
-        let url = reqwest::Url::parse(input).map_err(|_| BrowserError::UnsafeUrl)?;
-        if input.len() > 2048
-            || input.bytes().any(|b| b.is_ascii_control())
-            || !url.username().is_empty()
-            || url.password().is_some()
+        let url = loopback_url(input)?;
+        if let Some(origin) = &self.inner.dev_origin
+            && url.origin() != origin.origin()
         {
             return Err(BrowserError::UnsafeUrl);
         }
-        if self
-            .inner
-            .dev_origin
-            .as_ref()
-            .is_some_and(|origin| url.origin() == origin.origin())
-        {
-            return Ok(url);
-        }
-        Err(BrowserError::UnsafeUrl)
+        Ok(url)
     }
 
     /// Forward redacted browser lifecycle steps to an embedding UI (e.g. the
@@ -510,7 +502,9 @@ impl ChatGptBrowser {
                 "--new-window",
             ])
             .arg(format!("--user-data-dir={}", self.inner.profile.display()))
-            .arg(HOME)
+            // Do not open a sign-in page under CDP merely to browse a local
+            // website. Subagent tabs still navigate explicitly to ChatGPT.
+            .arg("about:blank")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -570,7 +564,12 @@ impl ChatGptBrowser {
             return Err(BrowserError::Unavailable);
         }
         // Chrome's remote debugging server permits target creation via PUT.
-        let url = format!("http://127.0.0.1:{port}/json/new?{HOME}");
+        let initial_url = if id == BROWSE_TAB {
+            "about:blank"
+        } else {
+            HOME
+        };
+        let url = format!("http://127.0.0.1:{port}/json/new?{initial_url}");
         let response: Value = self
             .inner
             .http
@@ -1275,26 +1274,39 @@ impl ChatGptBrowser {
         Ok(())
     }
 }
-/// Restrict automated browsing to ordinary public HTTPS hostnames. Avoid
-/// local services, raw IP addresses, embedded credentials and custom ports.
-/// DNS names still require network-layer restrictions against rebinding.
-/// A loopback origin requires an explicit startup opt-in, never a page-level
-/// request. Require its exact scheme/host/port; path and query are forbidden.
+/// Restrict optional development scopes to an exact loopback HTTP origin.
+/// Localhost, 127.0.0.1 and [::1] are otherwise supported by default;
+/// LAN/private IPs, aliases and other intranet addresses remain forbidden.
 fn local_dev_origin(input: &str) -> Result<reqwest::Url, BrowserError> {
     if input.len() > 200 || input.bytes().any(|b| b.is_ascii_control()) {
         return Err(BrowserError::InvalidDevOrigin);
     }
-    let url = reqwest::Url::parse(input).map_err(|_| BrowserError::InvalidDevOrigin)?;
+    let url = loopback_url(input).map_err(|_| BrowserError::InvalidDevOrigin)?;
     if url.scheme() != "http"
-        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
         || url.port().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(BrowserError::InvalidDevOrigin);
+    }
+    Ok(url)
+}
+
+/// Permit ordinary development servers bound to the local machine without a
+/// startup flag. Match only canonical loopback host spellings; never infer
+/// trust from private networks, DNS aliases or an unvalidated redirect.
+fn loopback_url(input: &str) -> Result<reqwest::Url, BrowserError> {
+    if input.len() > 2048 || input.bytes().any(|b| b.is_ascii_control()) {
+        return Err(BrowserError::UnsafeUrl);
+    }
+    let url = reqwest::Url::parse(input).map_err(|_| BrowserError::UnsafeUrl)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(BrowserError::UnsafeUrl);
     }
     Ok(url)
 }
@@ -1703,12 +1715,46 @@ mod tests {
         }
     }
     #[test]
-    fn explicit_local_dev_origin_is_exact_and_never_inferred() {
+    fn loopback_navigation_is_available_by_default_and_other_local_hosts_are_denied() {
         let executable = tempfile::NamedTempFile::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         let browser = ChatGptBrowser::new(executable.path(), root.path().join("profile")).unwrap();
-        assert!(browser.approved_url("https://example.org/app").is_ok());
-        assert!(browser.approved_url("http://127.0.0.1:3000/").is_err());
+        for allowed in [
+            "https://example.org/app",
+            "http://localhost:5173/",
+            "http://localhost:5173/dashboard?tab=1",
+            "http://127.0.0.1:3000/",
+            "http://[::1]:5173/",
+            "http://localhost/",
+            "https://localhost:8443/",
+            "https://[::1]:8443/",
+        ] {
+            assert!(browser.approved_url(allowed).is_ok(), "{allowed}");
+        }
+        for denied in [
+            "http://192.168.1.5:3000/",
+            "http://127.0.0.2:3000/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1:8080/",
+            "http://localhost.evil.example:5173/",
+            "http://dev.localhost:5173/",
+            "http://user:password@localhost:5173/",
+            "http://localhost:5173/\nheader",
+            "ftp://localhost:5173/",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "https://intranet/",
+            "https://private.local/",
+        ] {
+            assert!(browser.approved_url(denied).is_err(), "{denied}");
+        }
+    }
+
+    #[test]
+    fn optional_dev_origin_restricts_to_exact_scheme_host_and_port() {
+        let executable = tempfile::NamedTempFile::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let browser = ChatGptBrowser::new(executable.path(), root.path().join("profile")).unwrap();
         for invalid in [
             "http://192.168.1.5:3000",
             "http://localhost",
@@ -1722,6 +1768,7 @@ mod tests {
         }
         let browser = browser.with_dev_origin("http://127.0.0.1:3000").unwrap();
         for allowed in [
+            "https://example.org/",
             "http://127.0.0.1:3000/",
             "http://127.0.0.1:3000/dashboard?tab=1",
         ] {
@@ -1730,6 +1777,8 @@ mod tests {
         for denied in [
             "http://127.0.0.1:3001/",
             "http://localhost:3000/",
+            "https://127.0.0.1:3000/",
+            "http://[::1]:3000/",
             "http://127.0.0.2:3000/",
             "http://169.254.169.254:3000/",
             "http://user:secret@127.0.0.1:3000/",
@@ -1774,26 +1823,37 @@ mod tests {
             let mut screenshot_requested = false;
             let mut typed = false;
             let mut clicked = 0;
+            let mut navigated = false;
             while let Some(Ok(Message::Text(raw))) = socket.next().await {
                 let request: Value = serde_json::from_str(&raw).unwrap();
                 let method = request["method"].as_str().unwrap();
                 let result = match method {
                     "Runtime.evaluate" => {
                         let expr = request["params"]["expression"].as_str().unwrap();
-                        let value = if expr.contains("broken_images:") {
-                            json!({"url":"https://example.org/app","title":"Fixture",
+                        let value = if expr.contains("ready:document.readyState") {
+                            json!({"url":if navigated { "http://localhost:5173/" } else { "about:blank" },
+                                "ready":"complete"})
+                        } else if expr.contains("document.body?.innerText") {
+                            json!({"url":"http://localhost:5173/","title":"Ace Blocker",
+                                "text":"Configure once. Hold the line."})
+                        } else if expr.contains("broken_images:") {
+                            json!({"url":"http://localhost:5173/","title":"Fixture",
                                 "viewport_width":800,"viewport_height":600,
                                 "document_width":801,"broken_images":1,
                                 "headings":["Fixture heading"],
                                 "controls":[{"tag":"button","label":"Save","selector":"#save"}]})
                         } else if expr.contains("url:location.href,width:innerWidth") {
-                            json!({"url":"https://example.org/app","width":800,"height":600})
+                            json!({"url":"http://localhost:5173/","width":800,"height":600})
                         } else if expr.contains("elementFromPoint") {
                             json!({"x":55.0,"y":30.0,"href":null})
                         } else if expr.contains("document.activeElement === el") {
                             json!(true)
                         } else {
-                            json!("https://example.org/app")
+                            json!(if navigated {
+                                "http://localhost:5173/"
+                            } else {
+                                "about:blank"
+                            })
                         };
                         if expr == "location.href" {
                             socket.send(Message::Text(json!({
@@ -1802,6 +1862,11 @@ mod tests {
                             }).to_string().into())).await.unwrap();
                         }
                         json!({"result":{"value":value}})
+                    }
+                    "Page.navigate" => {
+                        assert_eq!(request["params"]["url"], "http://localhost:5173/");
+                        navigated = true;
+                        json!({})
                     }
                     "Page.captureScreenshot" => {
                         assert_eq!(request["params"]["captureBeyondViewport"], false);
@@ -1858,6 +1923,12 @@ mod tests {
             }),
         );
 
+        let page = browser
+            .browse_navigate("http://localhost:5173/")
+            .await
+            .unwrap();
+        assert_eq!(page.title, "Ace Blocker");
+        assert!(page.text.contains("Configure once."));
         assert!(matches!(
             browser.browse_viewport(100, 600, 1.0).await,
             Err(BrowserError::InvalidControl)
@@ -1887,7 +1958,7 @@ mod tests {
         let screenshot = browser.browse_screenshot().await.unwrap();
         assert!(screenshot.png_base64.starts_with("iVBORw0KGgo"));
         assert_eq!(screenshot.width, 800);
-        assert_eq!(screenshot.url, "https://example.org/app");
+        assert_eq!(screenshot.url, "http://localhost:5173/");
         let console = browser.browse_console().await.unwrap();
         assert!(
             console

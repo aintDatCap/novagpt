@@ -997,7 +997,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Navigate the dedicated NovaGPT Chrome browsing tab to an explicitly specified public HTTPS page. Call browser_open first; subagent tabs are unaffected."
+        description = "Navigate the dedicated browser tab to public HTTPS or an explicitly specified HTTP(S) loopback URL (localhost, 127.0.0.1, [::1], any port). Call browser_open first; LAN and internal hosts are denied."
     )]
     async fn browser_navigate(
         &self,
@@ -1013,7 +1013,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Read bounded visible page text, title and HTTPS URL from the dedicated Chrome browsing tab. No cookies, passwords, hidden DOM, or arbitrary JavaScript."
+        description = "Read bounded visible page text, title and approved URL (public HTTPS or loopback) from the dedicated Chrome browsing tab. No cookies, passwords, hidden DOM, or arbitrary JavaScript."
     )]
     async fn browser_read(&self) -> CallToolResult {
         let result = match &self.extras.browser {
@@ -1026,7 +1026,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Capture the visible viewport of the dedicated Chrome tab as an actual PNG image the agent can view. Requires browser_open; checks the public HTTPS origin and limits image size."
+        description = "Capture a real PNG of the dedicated browser tab's visible viewport. Requires an approved public HTTPS or loopback URL and enforces image size limits."
     )]
     async fn browser_screenshot(&self) -> CallToolResult {
         let result = match &self.extras.browser {

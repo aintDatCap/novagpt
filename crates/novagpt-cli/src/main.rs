@@ -51,8 +51,8 @@ struct Cli {
     /// Dedicated browser profile path; never reuse a personal browser profile.
     #[arg(long)]
     chatgpt_profile: Option<PathBuf>,
-    /// Optionally allow this exact loopback HTTP origin for local web development.
-    /// Example: http://127.0.0.1:3000 (not an arbitrary LAN/private host).
+    /// Optionally restrict local browser navigation to this exact HTTP origin.
+    /// Without it, localhost, 127.0.0.1 and [::1] work on any port.
     #[arg(long)]
     browser_dev_origin: Option<String>,
     /// Opt in to an already-running, separate local Chrome CDP endpoint; never uses the ChatGPT subagent Chrome.
