@@ -53,17 +53,25 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-      - uses: actions/cache@v6
+      # Include rustc, build flags and all manifests in the cache identity;
+      # save newly compiled dependencies instead of keeping a fixed lockfile key.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-release-check-${{ hashFiles('**/Cargo.lock') }}
+          cache-bin: "false"
+          cache-on-failure: "true"
+          key: release-verify
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo check --workspace --locked
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --timings
+      - name: Upload verification timing report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-verify-linux-x86_64
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 7
 
   build:
     name: Build ${{ matrix.platform }}
@@ -93,15 +101,31 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/cache@v6
+      # Use the Linux linker only where available; native macOS/Windows linking stays unchanged.
+      - name: Prefer LLVM lld on Linux when installed
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if command -v clang >/dev/null && command -v ld.lld >/dev/null; then
+            echo 'RUSTFLAGS=-C linker=clang -C link-arg=-fuse-ld=lld' >> "$GITHUB_ENV"
+            echo 'Using clang + lld for faster Linux linking.'
+          else
+            echo '::notice::clang/lld not present; using the default system linker.'
+          fi
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-release-build-${{ hashFiles('**/Cargo.lock') }}
+          cache-bin: "false"
+          cache-on-failure: "true"
+          key: ${{ matrix.platform }}
       - name: Build native release binary
-        run: cargo build --release --locked -p novagpt-cli
+        run: cargo build --release --locked -p novagpt-cli --timings
+      - name: Upload per-target Cargo timing report
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-${{ matrix.platform }}
+          path: target/cargo-timings/*.html
+          if-no-files-found: warn
+          retention-days: 7
       - name: Package executable and SHA-256
         shell: bash
         env:

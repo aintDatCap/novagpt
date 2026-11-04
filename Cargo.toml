@@ -30,3 +30,25 @@ tokio-tungstenite = "0.30"
 futures-util = "0.3"
 ratatui = "0.30"
 crossterm = "0.29"
+
+# Follow Cargo's build-performance guidance: smaller debug artifacts speed up
+# local builds, test linking and source-watch rebuilds on every supported OS.
+# Switch to --profile debugging when full dependency debug information is needed.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.debugging]
+inherits = "dev"
+debug = 2
+
+[profile.debugging.package."*"]
+debug = 2
+
+# Keep release opt-level=3 and the default non-LTO behavior; split codegen
+# across more units to reduce build latency on native release runners.
+# This may slightly change runtime performance and binary size.
+[profile.release]
+codegen-units = 32

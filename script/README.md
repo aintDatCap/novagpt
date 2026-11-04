@@ -2,6 +2,8 @@
 
 ## GitHub Actions
 
+All workflow variants use Rust-version-aware dependency caching; the five native release targets also upload Cargo timing reports. Linux release builds use Clang + LLVM LLD where installed, with a system-linker fallback. See [build performance and per-target settings](../docs/BUILD_PERFORMANCE.md) for commands, trade-offs, and measurement limits.
+
 - **PR testing** (`.github/workflows/test.yml`): every pull request runs `cargo fmt`, Clippy with warnings denied, `cargo check` and the workspace tests on Ubuntu x64, Windows x64 and macOS ARM64.
 - **Manual release** (`.github/workflows/release.yml`): from **Actions → Manual release → Run workflow** on **main**. The tag is derived from `[workspace.package].version` in root `Cargo.toml` (for example, `0.1.1` becomes `v0.1.1`). It runs the release checks, builds native `novagpt` binaries, uploads release archives and matching `.sha256` checksums, then creates a GitHub release with generated notes. An existing tag stops the workflow; bump the Cargo version before the next release.
 
