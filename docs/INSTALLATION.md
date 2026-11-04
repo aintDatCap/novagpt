@@ -1,178 +1,159 @@
-# Installing and configuring NovaGPT
+# Install and connect NovaGPT
 
-NovaGPT is an experimental Rust MCP coding server. It operates on an explicitly selected local workspace and is separate from CodexPro. This guide covers installation, initial setup, starting the MCP server, and optional remote access.
+NovaGPT runs locally and exposes MCP tools to explicitly authorized clients. The setup below is for people who want to connect their projects to ChatGPT.
 
-## 1. Install NovaGPT
+## Install NovaGPT
 
-The official installation scripts download the latest published [NovaGPT GitHub release](https://github.com/aintDatCap/novagpt/releases), validate the release archive's SHA-256 checksum, and install the binary for the current user. They do not require a repository clone or Rust toolchain, and they do not modify CodexPro.
+Download an archive from [NovaGPT Releases](https://github.com/aintDatCap/novagpt/releases) or use the installation scripts.
 
-### Linux and macOS
-
-Requirements: Bash, `curl`, `tar`, and either `sha256sum` or `shasum`; Linux/macOS on x86_64 or ARM64.
+**Linux / macOS** (requires Bash, curl, tar and SHA-256 utilities):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh -o novagpt-install.sh
 bash novagpt-install.sh
 ```
 
-The default destination is `~/.local/bin/novagpt`. The script adds the bin directory to the applicable shell profile if necessary.
-
-To install a specific published version or choose another absolute destination:
-
-```bash
-bash novagpt-install.sh --version v0.1.1
-bash novagpt-install.sh --install-dir "$HOME/.local/bin"
-```
-
-The version shown is an example; the corresponding GitHub release must exist.
-
-### Windows
-
-Requirements: Windows x64 and PowerShell. The current release matrix does not include a native Windows ARM64 package.
+**Windows x64** (PowerShell):
 
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1" -OutFile ".\novagpt-install.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1" -OutFile "novagpt-install.ps1"
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1"
 ```
 
-The default destination is `%LOCALAPPDATA%\Programs\NovaGPT\bin\novagpt.exe`. The script updates the **user** PATH, not the system PATH.
+The scripts download release binaries and check their SHA-256 hashes. They require a corresponding published release. Inspect downloaded scripts before executing them. Reopen the terminal after installation if `novagpt` is not found. See [installer details](../script/README.md) for platforms and installation paths.
 
-To select a specific published version or another destination:
+Alternatively, build the binary yourself with `cargo build --release -p novagpt-cli`; its path is `target/release/novagpt` (or `novagpt.exe` on Windows).
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1" -Version v0.1.1
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1" -InstallDir "$env:LOCALAPPDATA\Programs\NovaGPT\bin"
-```
+## First launch
 
-**Open a new terminal after installation** so it inherits the updated PATH. Because the installers are fetched from GitHub and executed locally, review the downloaded script if you want to inspect what it will do. Both scripts use the release archives rather than compiling from source.
-
-See [release assets and installer behavior](../script/README.md).
-
-## 2. Select a workspace and launch setup
-
-NovaGPT's default workspace is the current working directory. You can use any **existing** directory you are authorized to access; you do not need to run NovaGPT inside its own source repository.
-
-On Linux/macOS:
+In a terminal, open the folder you want ChatGPT to work with:
 
 ```bash
-cd /absolute/path/to/my-project
+cd /absolute/path/to/your-project
 novagpt --setup
 ```
 
-On Windows (PowerShell):
+Or run `novagpt --root /absolute/path/to/your-project --setup`. On Windows, use the corresponding absolute Windows path.
 
-```powershell
-novagpt --root "C:\Projects\my-project" --setup
-```
+Follow the guided setup, verify the selected workspace, and save. You can explicitly allow additional directories later in Settings. NovaGPT stores preferences per operating-system user, separately from the project folder; the default server port is `8787`.
 
-The `--root` argument is optional when your terminal is already in the intended workspace. Running `novagpt` without a subcommand opens the same three-tab Ratatui console (**Overview**, **Activity**, **Settings**).
+After setup, launch the **Overview / Activity / Settings** interface with `novagpt`. Navigation: arrows and Enter to select, Tab to switch pages, `s` to save preferences, `a` for advanced actions and `?` for help.
 
-## 3. Configure the TUI
+The default interface language is **Automatic**: Italian for Italian system locales, English otherwise. You can select English or Italian manually.
 
-1. **Workspace:** Confirm that the directory shown in the console is the workspace you intended to expose. Add other explicitly permitted directories in **Settings** only if needed.
-2. **Connection:** Keep the default HTTP port (`8787`) for a basic local setup, or change it. Leave automatic ngrok disabled unless remote ChatGPT access is required.
-3. **Optional services:** ChatGPT Browser and virtual machines are opt-in. If enabling ChatGPT Browser, install Google Chrome; leave its executable path blank to use auto-discovery or provide a valid absolute path. NovaGPT uses its own browser profile, never a personal or CodexPro profile.
-4. **Save:** In **Settings**, press `s` and confirm the save. The guided `--setup` flow also has an explicit final review/confirmation step. Unsaved changes do not become active server settings.
+### Optional automatic MCP startup
 
-Settings are written once per OS user to `%LOCALAPPDATA%\\NovaGPT\\config.json` on Windows or `$XDG_STATE_HOME/NovaGPT/config.json` (by default `~/.local/state/NovaGPT/config.json`) on Unix. Every workspace uses the same settings, including HTTP port, language, approved additional roots, VM and browser preferences. The workspace path still determines which project the server opens. Old `<workspace>/.novagpt/config.json` files are not loaded automatically or deleted. A per-workspace launcher may still be created under `<workspace>/.novagpt/` after explicit setup approval, without overwriting existing files.
+In **Settings → Connection**, enable **Start MCP automatically when NovaGPT opens**, then save. On your next normal `novagpt` launch, the TUI starts the local MCP server using the saved port and tunnel preferences. This is off by default; `novagpt --setup` does not start it.
 
-The default TUI language is English. In **Settings → General → Interface language**, select English, Italian, or Automatic.
+Do not start two servers on the same port. NovaGPT will not expose some other process through its ngrok tunnel.
 
-### HTTP authentication
+## Configure ngrok for ChatGPT access
 
-NovaGPT automatically creates a strong **single HTTP token per OS user** when needed. All NovaGPT workspaces for that user share it. It is stored in private user state **outside repositories**, not in `config.json`. Different OS users have different tokens.
+NovaGPT manages an ngrok tunnel for the local MCP server. You do not need to run `ngrok http` separately.
 
-You can display the token only when deliberately requested:
+### 1. Install ngrok
 
-```bash
-novagpt token show
-```
+Download ngrok from [ngrok's official download page](https://ngrok.com/download), or install it with your platform's package manager:
 
-Or display only the token file location:
+- macOS with Homebrew: `brew install ngrok`
+- Windows with WinGet: `winget install ngrok -s msstore`
+- Linux with Snap: `sudo snap install ngrok` (if Snap is available)
 
-```bash
-novagpt token path
-```
+If ngrok is absent when you select **Start MCP + ngrok**, NovaGPT displays an **installation confirmation**. After you approve, it can invoke Homebrew on macOS, WinGet on Windows, or Snap through `pkexec` on supported Linux machines. No installation command runs without approval. The package manager may require permissions or additional prompts. Where no supported manager exists, install manually from the official website.
 
-To enter a custom token securely, run `novagpt token set --replace` and follow the hidden input prompt. Token management does not require choosing a workspace. The shared file is `%LOCALAPPDATA%\\NovaGPT\\tokens\\http.token` on Windows or `$XDG_STATE_HOME/NovaGPT/tokens/http.token` (by default `~/.local/state/NovaGPT/tokens/http.token`) on Unix. On first use, one old workspace token is preserved, but if multiple old token files exist, NovaGPT creates a fresh shared token and removes those old files after validating them. Unsafe or malformed legacy files block migration rather than being deleted. When multiple old tokens are replaced, the CLI/TUI warns that saved ChatGPT connections require updating. The `NOVAGPT_HTTP_TOKEN` environment variable remains an explicit per-process override. Changing the active token requires restarting **all** NovaGPT HTTP servers and updating any connector URLs using the old token. Anyone holding the shared token can access all workspaces authorized to the server.
-
-**Never commit, paste into logs, or publicly share a token.**
-
-## 4. Start the MCP server
-
-### Local HTTP
-
-In the TUI, use the **Start MCP HTTP** action. Alternatively run:
+Confirm installation:
 
 ```bash
-novagpt --root /absolute/path/to/my-project http --port 8787
+ngrok version
 ```
 
-On Windows, use a Windows path instead, such as:
+### 2. Authenticate ngrok
 
-```powershell
-novagpt --root "C:\Projects\my-project" http --port 8787
-```
-
-The authenticated Streamable HTTP MCP endpoint is `http://127.0.0.1:8787/mcp`. In another terminal, verify that NovaGPT is responding:
+Create or sign in to your [ngrok account](https://dashboard.ngrok.com/), find your **authtoken** in the dashboard and configure it in your own terminal:
 
 ```bash
-novagpt --root /absolute/path/to/my-project connection-test --port 8787 --json
+ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
 ```
 
-If ngrok was enabled in the saved settings but you want a local-only server, run `novagpt --root /absolute/path/to/my-project http --no-ngrok`.
+Substitute your actual ngrok authtoken. **Do not paste the token into ChatGPT, tickets or repository files.** NovaGPT does not install or configure your ngrok account token on your behalf.
 
-### Local stdio client
+If you have an ngrok hostname assigned to your account, enter **only its hostname** (such as `my-project.ngrok-free.app`, without `https://`) in **Settings → ngrok hostname**. This is recommended if you want a stable ChatGPT connection URL after restarts.
 
-For a client that launches NovaGPT as a local MCP subprocess, use:
+### 3. Start NovaGPT and its tunnel
+
+In **Settings**, turn **Automatic ngrok** on and save. Then select **Start MCP HTTP** or **Start MCP + ngrok** on Overview. Wait for the authenticated local-server readiness check and tunnel readiness.
+
+Alternatively, from a terminal:
 
 ```bash
-novagpt --root /absolute/path/to/my-project stdio
+novagpt --root /absolute/path/to/your-project http --port 8787 --ngrok
 ```
 
-The stdio transport does not use the HTTP token. Your MCP client must be configured to launch this executable and pass the selected workspace path.
-
-## 5. Optional: connect ChatGPT through ngrok
-
-Remote access is optional and more sensitive than local-only use. A remote authenticated MCP client can invoke the host shell with NovaGPT's OS-user permissions. Shell execution is **not sandboxed**; do not expose the connector to untrusted people or workspaces.
-
-First, ensure ngrok is installed/configured for your account. Start a protected HTTP server with an explicitly owned ngrok tunnel:
+For a hostname assigned to your account:
 
 ```bash
-novagpt --root /absolute/path/to/my-project http --port 8787 --ngrok
+novagpt --root /absolute/path/to/your-project http --port 8787 --ngrok --ngrok-domain my-project.ngrok-free.app
 ```
 
-In a second terminal, request the connector URL:
+The CLI prints the public endpoint without exposing the secret. If you started HTTP from the CLI, run this command in a **second terminal** to reveal the full connector URL:
 
 ```bash
-novagpt --root /absolute/path/to/my-project connector-url --port 8787
+novagpt --root /absolute/path/to/your-project connector-url --port 8787
 ```
 
-You can instead enable automatic ngrok in the TUI, start MCP + ngrok, and choose **Show / copy ChatGPT URL** after the service is ready. For an assigned stable hostname, use `--ngrok-domain your-owned-domain.ngrok-free.app` together with `--ngrok`.
+If you started it from the TUI, select **Show / copy ChatGPT URL** instead and press **C** to copy. The private URL is never copied automatically.
 
-Paste the returned HTTPS URL into your ChatGPT MCP connector and select **No authentication**: the URL itself contains a secret token in its query string. Keep it private. Local connector readiness is checked, but end-to-end remote ChatGPT interoperability is **not yet fully verified**.
+### 4. Create a ChatGPT plugin
 
-For additional details on the TUI and its security boundaries, see [TUI setup details](TUI_SETUP.md) and [VM/browser/subagents](VM_AND_SUBAGENTS.md).
+The complete URL has this shape:
 
-## 6. Troubleshooting and alternatives
+```text
+https://my-project.ngrok-free.app/mcp?novagpt_token=YOUR_PRIVATE_TOKEN
+```
 
-- **No published release / download failed:** The scripts need an accessible GitHub release containing an archive for your OS and architecture. See [GitHub releases](https://github.com/aintDatCap/novagpt/releases) or build from source below.
-- **`novagpt` not found after installation:** Open a new terminal, or check that the install directory is on your PATH.
-- **Workspace error:** Pass an existing directory with `--root`; paths outside approved roots are guarded.
-- **Browser unavailable:** Chrome must be installed and ChatGPT Browser explicitly enabled. Use `novagpt --root /absolute/path/to/my-project browser-login` for a manual sign-in with the dedicated profile, then close the browser before starting browser agents.
-- **HTTP connection error:** Confirm the configured port, start the HTTP server, check the token source, and run `connection-test`. HTTP is bound to loopback by default.
-- **Diagnostics:** Run `novagpt --root /absolute/path/to/my-project doctor --json` and `novagpt --root /absolute/path/to/my-project logs tail --lines 50`.
+It is **not** the plain ngrok hostname: include `/mcp` and the complete `novagpt_token` query parameter produced by NovaGPT. The example token above is not a real credential.
 
-### Build from source
+1. Open ChatGPT **on the web** and go to **Plugins**.
+2. Click **+**, then **Add custom MCP server**.
+3. Name the connection **NovaGPT** (optionally add a description).
+4. Under **Connection**, paste the complete HTTPS URL copied from NovaGPT.
+5. Choose **No authentication**. The URL already embeds a private NovaGPT credential.
+6. Review and acknowledge the security warning, then choose **Create as a plugin**.
+7. Review the discovered tools, and select the resulting NovaGPT plugin in the ChatGPT conversation where you want to use it.
 
-For developers with Rust/Cargo installed:
+These actions depend on your ChatGPT plan and workspace permissions; the exact controls may change. See the [official ChatGPT MCP connection guide](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt) for requirements.
+
+If you later change the NovaGPT HTTP token, regenerate the URL and update the plugin connection. If your ngrok hostname changes, update the URL as well.
+
+### Security notes
+
+**Anyone who has your full connector URL can authenticate to the server.** The MCP `bash` tool runs commands on your computer under your normal OS account, without a shell sandbox. Do not share the URL, paste it in logs, screenshots, or commits, or grant access to untrusted clients. ngrok acts as a tunnel provider for the HTTP traffic.
+
+NovaGPT listens only on local loopback and connects outward through an owned ngrok process. It does not automatically make your whole machine secure or isolate shell commands. Configure only the workspaces and integrations you intend to use.
+
+## Other ways to start MCP
+
+To use **local HTTP without ngrok**:
 
 ```bash
-git clone https://github.com/aintDatCap/novagpt.git
-cd novagpt
-cargo build --release -p novagpt-cli
+novagpt --root /absolute/path/to/your-project http --no-ngrok
 ```
 
-The binary is written to `target/release/novagpt` (or `target/release/novagpt.exe` on Windows). Run it directly, or use `cargo run -p novagpt-cli -- --root /absolute/path/to/my-project --setup` to configure a different workspace.
+The local authenticated endpoint is `http://127.0.0.1:8787/mcp`. Check readiness locally with `novagpt --root /absolute/path/to/your-project connection-test --port 8787`.
 
-See the [main README](../README.md) for current implementation status, limitations, and developer-facing technical details.
+To use an **MCP client that starts a local subprocess**:
+
+```bash
+novagpt --root /absolute/path/to/your-project stdio
+```
+
+## Troubleshooting
+
+- **ngrok command not found:** restart your terminal to refresh PATH, or install ngrok from its official download page. Supported TUI installation may prompt when you start a tunnel.
+- **ngrok fails to start:** verify `ngrok version`, account setup and authtoken, and check any reserved hostname belongs to your ngrok account.
+- **Port already in use:** stop the other local process or choose a different port in Settings.
+- **ChatGPT cannot connect:** check MCP and tunnel readiness, confirm the full `/mcp?novagpt_token=...` URL, and use **No authentication**. Check plan/workspace permissions and refresh the plugin if its tools changed.
+- **Server errors:** run `novagpt doctor --json` and `novagpt logs tail --lines 50` locally. These diagnostics are in English and intentionally exclude credentials.
+- **Browser features unavailable:** enable ChatGPT Browser explicitly and install Chrome; browser login may require a separate manual step.
+
+For development and architecture, see [ARCHITECTURE.md](ARCHITECTURE.md) and [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md).
