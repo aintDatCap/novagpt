@@ -395,6 +395,10 @@ struct AgentSpawnArgs {
     workspace_id: Option<String>,
     task: String,
     role: String,
+    /// Exact display name of the connected NovaGPT app selected by this parent
+    /// ChatGPT conversation. MCP servers cannot read client-side aliases.
+    #[serde(default)]
+    connector_name: Option<String>,
     #[serde(default)]
     paths: Vec<String>,
     #[serde(default)]
@@ -428,6 +432,37 @@ struct AgentWaitArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentProgressArgs {
+    id: String,
+    /// Current worker's private completion credential. Never log it.
+    code: String,
+    /// One fixed English kind: working, reading, editing, testing, reviewing, blocked.
+    kind: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentActivityArgs {
+    id: String,
+    /// Return only events with a sequence strictly greater than this cursor.
+    #[serde(default)]
+    after_sequence: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AgentActivityWaitArgs {
+    id: String,
+    /// Last sequence seen by the caller; defaults to zero.
+    #[serde(default)]
+    after_sequence: Option<u64>,
+    /// Epoch from the previous snapshot. A different epoch wakes the wait.
+    #[serde(default)]
+    epoch: Option<u64>,
+    /// Defaults to 20 seconds; allowed range 1–25.
+    #[serde(default)]
+    max_wait_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentFinishedArgs {
     id: String,
     /// Private six-character code from the delegated prompt (never log this).
@@ -443,6 +478,9 @@ struct AgentPatchArgs {
     code: String,
     /// One ordinary Git unified diff for an existing assigned file.
     patch: String,
+    /// True checks this callback's availability without touching any file.
+    #[serde(default)]
+    probe: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -454,6 +492,9 @@ struct AgentCreateFileArgs {
     path: String,
     /// Bounded UTF-8 file contents. Existing files are never overwritten.
     content: String,
+    /// True checks this callback's availability without touching any file.
+    #[serde(default)]
+    probe: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1239,7 +1280,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Spawn a persistent asynchronous untrusted subagent. Valid roles: explorer, reviewer, tester, implementer. Implementers may explicitly apply guarded patches to assigned existing files using subagent_apply_patch; no text-only auto-apply."
+        description = "Spawn a persistent asynchronous untrusted subagent. Required connector_name is the EXACT display name of the NovaGPT connected app selected by this parent ChatGPT conversation; never guess from a tool namespace. Roles: explorer, reviewer, tester, implementer. An implementer coding task is withheld until the new worker completes authenticated no-write subagent_progress, subagent_apply_patch(probe=true), and subagent_create_file(probe=true) checks. If its connector is unavailable, the task is NOT sent and recovery diagnostics are returned; no text-only auto-apply."
     )]
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
         let response = async {
@@ -1257,15 +1298,28 @@ impl NovaMcp {
                     )));
                 }
             };
+            // ChatGPT's connector display alias lives on the client. The
+            // authenticated parent supplies the actual selected app name;
+            // guessing it from the MCP server's product name is incorrect.
+            if args
+                .connector_name
+                .as_deref()
+                .is_none_or(|name| name.trim().is_empty())
+            {
+                return external_reply::<(), _>(Err(novagpt_agents::AgentError::ConnectorMissing));
+            }
             external_reply(
                 manager
-                    .spawn(SpawnAgent {
-                        workspace_id: args.workspace_id,
-                        task: args.task,
-                        role,
-                        paths: args.paths,
-                        context: args.context,
-                    })
+                    .spawn_with_connector(
+                        SpawnAgent {
+                            workspace_id: args.workspace_id,
+                            task: args.task,
+                            role,
+                            paths: args.paths,
+                            context: args.context,
+                        },
+                        args.connector_name.as_deref(),
+                    )
                     .await,
             )
         }
@@ -1331,6 +1385,63 @@ impl NovaMcp {
     }
 
     #[tool(
+        description = "For a delegated worker only: report an authenticated activity kind while its current execution is running. Requires the current private completion code; no arbitrary details or tool calls are attributed. Accepted kinds: working, reading, editing, testing, reviewing, blocked."
+    )]
+    async fn subagent_progress(
+        &self,
+        Parameters(args): Parameters<AgentProgressArgs>,
+    ) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => {
+                external_reply(manager.progress(&args.id, &args.code, &args.kind).await)
+            }
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_progress", response)
+    }
+
+    #[tool(
+        description = "Read bounded safe activity metadata for one subagent, optionally after a monotonic sequence cursor. Includes epoch, state and dropped-before cursor; never includes the worker credential."
+    )]
+    async fn subagent_activity(
+        &self,
+        Parameters(args): Parameters<AgentActivityArgs>,
+    ) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => external_reply(
+                manager
+                    .activity_since(&args.id, args.after_sequence.unwrap_or(0))
+                    .await,
+            ),
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_activity", response)
+    }
+
+    #[tool(
+        description = "Wait 1–25 seconds for an activity event after a cursor, a changed epoch, or a non-running state. Does not cancel the worker or change subagent_wait lifecycle semantics."
+    )]
+    async fn subagent_activity_wait(
+        &self,
+        Parameters(args): Parameters<AgentActivityWaitArgs>,
+    ) -> CallToolResult {
+        let response = match &self.extras.agents {
+            Some(manager) => external_reply(
+                manager
+                    .wait_activity(
+                        &args.id,
+                        args.after_sequence.unwrap_or(0),
+                        args.epoch,
+                        args.max_wait_seconds.unwrap_or(20),
+                    )
+                    .await,
+            ),
+            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+        };
+        self.observed("subagent_activity_wait", response)
+    }
+
+    #[tool(
         description = "For a delegated subagent only: mark its current task completed using the private six-character code from its prompt. Call once after finishing with id, code, and full result. Code is per execution and is not returned by spawn/status/wait."
     )]
     async fn subagent_finished(
@@ -1347,13 +1458,18 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "For an implementer subagent only: apply one guarded Git unified diff to an explicitly assigned existing file in its real workspace. Requires the current private execution code. Returns a verified receipt; no implicit application from chat text."
+        description = "For an implementer subagent: apply a guarded one-file Git unified diff to an explicitly assigned existing file, requiring the current private code and returning a verified receipt. During capability preflight only, probe=true with empty patch checks authenticated tool access WITHOUT writing a file; never claim a real edit from a probe."
     )]
     async fn subagent_apply_patch(
         &self,
         Parameters(args): Parameters<AgentPatchArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
+            Some(manager) if args.probe => external_reply(
+                manager
+                    .probe_tool(&args.id, &args.code, "subagent_apply_patch")
+                    .await,
+            ),
             Some(manager) => {
                 external_reply(manager.apply_patch(&args.id, &args.code, &args.patch).await)
             }
@@ -1363,13 +1479,18 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "For an authenticated implementer subagent: create a NEW UTF-8 file at any safe path inside its assigned real workspace, without selecting paths at spawn. Missing parent directories are created; existing files are never overwritten. Requires current private execution code."
+        description = "For an authenticated implementer subagent: exclusively create a NEW UTF-8 file at a safe path inside its assigned workspace with current private code; never overwrite. During capability preflight only, probe=true with empty path/content checks authenticated tool access WITHOUT writing a file; never claim real creation from a probe."
     )]
     async fn subagent_create_file(
         &self,
         Parameters(args): Parameters<AgentCreateFileArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
+            Some(manager) if args.probe => external_reply(
+                manager
+                    .probe_tool(&args.id, &args.code, "subagent_create_file")
+                    .await,
+            ),
             Some(manager) => external_reply(
                 manager
                     .create_file(&args.id, &args.code, &args.path, &args.content)

@@ -148,6 +148,19 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
                     "path":"new-file.txt","content":"must not create"
                 }
             }}),
+            json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{
+                "name":"subagent_progress","arguments":{
+                    "id":"agent-unknown","code":"fixture","kind":"working"
+                }
+            }}),
+            json!({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{
+                "name":"subagent_activity","arguments":{"id":"agent-unknown"}
+            }}),
+            json!({"jsonrpc":"2.0","id":19,"method":"tools/call","params":{
+                "name":"subagent_activity_wait","arguments":{
+                    "id":"agent-unknown","after_sequence":0,"epoch":1,"max_wait_seconds":1
+                }
+            }}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{
                 "name":"view_image","arguments":{"path":"image.png"}
             }}),
@@ -244,6 +257,9 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "subagent_status",
         "subagent_wait",
         "subagent_finished",
+        "subagent_progress",
+        "subagent_activity",
+        "subagent_activity_wait",
         "subagent_apply_patch",
         "subagent_create_file",
         "subagent_result",
@@ -254,7 +270,28 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 53);
+    assert_eq!(listed.len(), 56);
+    // MCP server tool registration is distinct from the ChatGPT client's
+    // selected connector schema. Ensure new callers can discover the actual
+    // arguments needed for authenticated child preflight.
+    let tool = |name: &str| {
+        listed
+            .iter()
+            .find(|value| value["name"] == name)
+            .expect("registered tool")
+    };
+    assert!(tool("subagent_spawn")["inputSchema"]["properties"]["connector_name"].is_object());
+    assert!(tool("subagent_apply_patch")["inputSchema"]["properties"]["probe"].is_object());
+    assert!(tool("subagent_create_file")["inputSchema"]["properties"]["probe"].is_object());
+    assert!(
+        tool("subagent_spawn")["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("EXACT display name")
+    );
+    assert_eq!(by_id(17)["result"]["isError"], true);
+    assert_eq!(by_id(18)["result"]["isError"], true);
+    assert_eq!(by_id(19)["result"]["isError"], true);
     assert_eq!(by_id(15)["result"]["isError"], true);
     assert_eq!(by_id(16)["result"]["isError"], true);
     assert!(!workspace.path().join("new-file.txt").exists());

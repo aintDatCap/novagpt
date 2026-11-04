@@ -164,7 +164,6 @@ impl ChromeOptions {
             "--new-window".to_owned(),
             format!("--lang={language}"),
             "--window-size=1920,1080".to_owned(),
-            "--start-maximized".to_owned(),
             "--log-level=0".to_owned(),
         ];
         if self.headless {
@@ -343,6 +342,9 @@ mod tests {
         assert!(args.contains(&"--headless=new".to_owned()));
         assert!(!args.iter().any(|arg| arg == "--no-sandbox"));
         assert!(!args.iter().any(|arg| arg == "--enable-automation"));
+        assert!(!args.iter().any(|arg| arg == "--start-maximized"));
+        assert!(!args.iter().any(|arg| arg.contains("always-on-top")));
+        assert!(!args.iter().any(|arg| arg.contains("window-position")));
         assert!(
             options
                 .launch_arguments(Path::new("relative"), 4567, "en-US")

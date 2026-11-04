@@ -4,7 +4,12 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use novagpt_browser::{BrowserError, ChatGptBrowser};
 use novagpt_core::WorkspaceRegistry;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::{Mutex, watch};
@@ -13,6 +18,8 @@ use uuid::Uuid;
 
 const MAX_AGENTS: usize = 6;
 const MAX_RECORDS: usize = 64;
+const MAX_ACTIVITY_EVENTS: usize = 32;
+const MAX_ACTIVITY_REPORTS: u8 = 64;
 const MAX_TASK: usize = 50_000;
 const MAX_MESSAGE: usize = 50_000;
 const MAX_RESULT: usize = 180_000;
@@ -46,8 +53,18 @@ pub enum AgentError {
     NotWaiting,
     #[error("Subagent request is invalid")]
     Invalid,
+    #[error(
+        "The parent must supply the connector display name from its selected connected app; NovaGPT cannot infer ChatGPT's per-conversation plugin name"
+    )]
+    ConnectorMissing,
+    #[error(
+        "Subagent connector tools were not verified; refresh/reconnect the named app, or use the parent connector's guarded file tools to apply explicitly reviewed proposals"
+    )]
+    CapabilityUnavailable,
     #[error("Subagent completion is not authorized or is no longer active")]
     CompletionDenied,
+    #[error("Subagent activity callback is not authorized or is no longer active")]
+    ActivityDenied,
     #[error("Subagent patch is not authorized for this execution or path")]
     PatchDenied,
     #[error("Subagent patch failed validation or does not apply cleanly")]
@@ -95,6 +112,10 @@ pub struct AgentInfo {
     pub state: AgentState,
     pub backend: String,
     pub model: String,
+    /// Parent-selected connector display name, never inferred from the MCP namespace.
+    pub connector_name: Option<String>,
+    /// unchecked (legacy local API), probing, verified, unavailable, not_required.
+    pub capability_status: String,
     pub result: Option<AgentOutput>,
     pub error: Option<String>,
     pub external_conversation: Option<String>,
@@ -103,6 +124,38 @@ pub struct AgentInfo {
     pub patched_paths: Vec<String>,
     pub files_created: usize,
     pub created_paths: Vec<String>,
+    /// The backend execution epoch, rotated on follow-up/resume/cancel.
+    pub epoch: u64,
+    /// Last accepted activity cursor, monotonically increasing across runs.
+    pub activity_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityEvent {
+    pub id: String,
+    pub epoch: u64,
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub kind: String,
+    /// Fixed server-owned text, never free-form worker-supplied content.
+    pub description: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentActivity {
+    pub id: String,
+    pub epoch: u64,
+    pub state: AgentState,
+    pub cursor: u64,
+    /// Last discarded sequence (ring eviction or follow-up reset).
+    pub dropped_before: u64,
+    pub events: Vec<ActivityEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentActivityWait {
+    pub activity: AgentActivity,
+    pub timed_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +205,15 @@ pub struct AgentPatchReceipt {
     pub patches_applied: usize,
 }
 
+/// Proof that a specific authenticated callback is callable in this worker
+/// conversation. No file operation is attempted by a capability probe.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentToolProbe {
+    pub id: String,
+    pub capability: &'static str,
+    pub available: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum BackendFailure {
     #[error("Manual {0} required")]
@@ -160,6 +222,9 @@ pub enum BackendFailure {
     Blocked(&'static str),
     #[error("Backend unavailable")]
     Unavailable,
+    /// The page may still be responding; no replay or implicit cancellation.
+    #[error("Browser outcome uncertain after a possible submission")]
+    Uncertain(&'static str),
 }
 
 #[async_trait]
@@ -229,10 +294,12 @@ fn map_browser(error: BrowserError) -> BackendFailure {
         BrowserError::ComposerUnavailable => {
             BackendFailure::Blocked("ChatGPT composer unavailable; no prompt submitted")
         }
-        BrowserError::AmbiguousSubmission => BackendFailure::Blocked(
-            "Chrome disconnected after possible submission; prompt replay refused",
+        BrowserError::AmbiguousSubmission => BackendFailure::Uncertain(
+            "Chrome disconnected after possible submission; no prompt replay. Authenticated callbacks remain available",
         ),
-        BrowserError::Timeout => BackendFailure::Blocked("Browser action timed out"),
+        BrowserError::Timeout => BackendFailure::Uncertain(
+            "Browser response timed out; worker may still be running. No prompt replay. Authenticated callbacks remain available",
+        ),
         BrowserError::ProfileBusy => BackendFailure::Blocked("Dedicated Chrome profile is in use"),
         BrowserError::NotRunning => BackendFailure::Blocked("Dedicated Chrome is unavailable"),
         _ => BackendFailure::Unavailable,
@@ -248,11 +315,56 @@ struct Entry {
     completion_claimed: bool,
     patch_attempts: u8,
     create_attempts: u16,
+    activity_reports: u8,
+    activity_events: VecDeque<ActivityEvent>,
+    activity_dropped_before: u64,
     allowed_paths: Vec<PathBuf>,
     patch_gate: Arc<Mutex<()>>,
     epoch: u64,
     ready: bool,
+    probe_pending: bool,
+    probe_patch: bool,
+    probe_create: bool,
+    probe_progress: bool,
+    task_prompt: Option<String>,
+    waiting_manual: bool,
     updates: watch::Sender<AgentInfo>,
+}
+
+impl Entry {
+    /// Shared, per-execution authentication budget for all worker callbacks.
+    fn accept_code(&mut self, code: &str) -> bool {
+        if self.completion_failures >= MAX_COMPLETION_ATTEMPTS {
+            return false;
+        }
+        let correct = code.len() == COMPLETION_KEY_LEN
+            && self
+                .completion_code
+                .as_bytes()
+                .ct_eq(code.as_bytes())
+                .unwrap_u8()
+                == 1;
+        if !correct {
+            self.completion_failures = self.completion_failures.saturating_add(1);
+        }
+        correct
+    }
+
+    fn activity_since(&self, after_sequence: u64) -> AgentActivity {
+        AgentActivity {
+            id: self.info.id.clone(),
+            epoch: self.epoch,
+            state: self.info.state,
+            cursor: self.info.activity_sequence,
+            dropped_before: self.activity_dropped_before,
+            events: self
+                .activity_events
+                .iter()
+                .filter(|e| e.sequence > after_sequence)
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 struct Inner {
@@ -278,7 +390,41 @@ impl AgentManager {
         }
     }
 
+    /// Legacy trusted in-process interface for embedders and test fixtures.
+    /// MCP entrypoints must use spawn_with_connector to gate actual tasks.
     pub async fn spawn(&self, request: SpawnAgent) -> AgentResult<AgentInfo> {
+        self.spawn_internal(request, None).await
+    }
+
+    /// The authenticated parent passes the display name shown by its selected
+    /// connected app. MCP cannot discover a ChatGPT-side alias or namespace.
+    pub async fn spawn_with_connector(
+        &self,
+        request: SpawnAgent,
+        connector_name: Option<&str>,
+    ) -> AgentResult<AgentInfo> {
+        let name = connector_name.ok_or(AgentError::ConnectorMissing)?;
+        if name.trim().is_empty() {
+            return Err(AgentError::ConnectorMissing);
+        }
+        self.spawn_internal(request, Some(name)).await
+    }
+
+    async fn spawn_internal(
+        &self,
+        request: SpawnAgent,
+        connector_name: Option<&str>,
+    ) -> AgentResult<AgentInfo> {
+        let connector_name = connector_name.map(str::trim);
+        if connector_name.is_some_and(|name| {
+            name.is_empty()
+                || name.len() > 96
+                || name
+                    .chars()
+                    .any(|ch| ch.is_control() || ch == '`' || ch == '{' || ch == '}')
+        }) {
+            return Err(AgentError::Invalid);
+        }
         if request.task.trim().is_empty()
             || request.task.len() > MAX_TASK
             || request.paths.len() > 20
@@ -328,6 +474,26 @@ impl AgentManager {
             request.paths.join(", "),
             request.context.unwrap_or_default(),
         );
+        // A progress report is explicit and credential-bound; never infer it
+        // from an unrelated MCP call or browser tab/session.
+        let prompt = format!(
+            "{prompt}\n\nWhile actively working, optionally call subagent_progress with id={id}, code={code}, and kind chosen from working, reading, editing, testing, reviewing, blocked. Do not send free-text details, prompts, URLs or raw tool inputs/results."
+        );
+        let tool_instructions = connector_name.map(|name| format!(
+            "**NovaGPT workspace tools**\nYour coding workspace is managed by the NovaGPT connector named {}.\nYou MUST use this specific connected app/plugin to interact with the workspace whenever its tools are available. Discover the actual tool namespace and exposed capabilities before attempting file operations. Do not derive the namespace from the display name. For existing-file modifications use authenticated subagent_apply_patch; for new files use subagent_create_file; report activity through subagent_progress and completion through subagent_finished when exposed. Use the current private execution credential supplied by NovaGPT. Never print it, include it in reports, or expose it in logs. A successful server receipt is required before claiming a file was created or modified. If required tools are missing, disconnected, disabled, or inaccessible, report that explicitly; do not silently switch plugins or claim modifications.",
+            serde_json::to_string(name).unwrap_or_default(),
+        )).unwrap_or_else(|| "**NovaGPT workspace tools**\nParent connector display name was not provided; do not infer its name or tool namespace. Discover only actually exposed NovaGPT capabilities; report unavailable tools explicitly.".to_owned());
+        let task_prompt = format!("{tool_instructions}\n\n{prompt}");
+        let probe_pending = request.role == AgentRole::Implementer && connector_name.is_some();
+        // The coding task is deliberately not present in the initial probe
+        // message: absence of the child connector cannot authorize work.
+        let prompt = if probe_pending {
+            format!(
+                "{tool_instructions}\n\nCAPABILITY PREFLIGHT ONLY. Do NOT begin any coding task yet; NovaGPT will send the assignment after verifying live tools in this same conversation. Discover the actual connected tool namespace. Invoke subagent_progress with id={id}, code={code}, kind=working. Invoke subagent_apply_patch with id={id}, code={code}, patch=\"\", probe=true; invoke subagent_create_file with id={id}, code={code}, path=\"\", content=\"\", probe=true. These probes perform NO file writes and return server receipts. Do not call subagent_finished during preflight. After three successful receipts, end this turn with a short confirmation; do not reveal the code. If any tool is missing or denied, report it and STOP; do not claim any changes."
+            )
+        } else {
+            task_prompt.clone()
+        };
         let info = AgentInfo {
             id: id.clone(),
             workspace_id: workspace.workspace_id,
@@ -335,6 +501,15 @@ impl AgentManager {
             state: AgentState::Running,
             backend: self.inner.backend.name().into(),
             model: self.inner.backend.model().into(),
+            connector_name: connector_name.map(str::to_owned),
+            capability_status: if probe_pending {
+                "probing"
+            } else if connector_name.is_some() {
+                "not_required"
+            } else {
+                "unchecked"
+            }
+            .into(),
             result: None,
             error: None,
             external_conversation: None,
@@ -343,6 +518,8 @@ impl AgentManager {
             patched_paths: Vec::new(),
             files_created: 0,
             created_paths: Vec::new(),
+            epoch: 1,
+            activity_sequence: 0,
         };
         {
             let mut agents = self.inner.entries.lock().await;
@@ -366,10 +543,19 @@ impl AgentManager {
                     completion_claimed: false,
                     patch_attempts: 0,
                     create_attempts: 0,
+                    activity_reports: 0,
+                    activity_events: VecDeque::new(),
+                    activity_dropped_before: 0,
                     allowed_paths,
                     patch_gate: Arc::new(Mutex::new(())),
                     epoch: 1,
                     ready: false,
+                    probe_pending,
+                    probe_patch: false,
+                    probe_create: false,
+                    probe_progress: false,
+                    task_prompt: probe_pending.then_some(task_prompt),
+                    waiting_manual: false,
                     updates,
                 },
             );
@@ -398,6 +584,7 @@ impl AgentManager {
                 return;
             };
             let _patch_guard = patch_gate.lock().await;
+            let mut next_prompt = None;
             let mut agents = manager.inner.entries.lock().await;
             if let Some(entry) = agents.get_mut(&id) {
                 // An authenticated subagent callback may have already
@@ -410,6 +597,32 @@ impl AgentManager {
                     return;
                 }
                 match outcome {
+                    Ok((result, url)) if entry.probe_pending => {
+                        if entry.probe_patch && entry.probe_create && entry.probe_progress {
+                            entry.probe_pending = false;
+                            entry.info.capability_status = "verified".into();
+                            entry.info.external_conversation = url;
+                            if let Some(task) = entry.task_prompt.take() {
+                                entry.pending_prompt = task.clone();
+                                next_prompt = Some(task);
+                            } else {
+                                entry.info.state = AgentState::Failed;
+                                entry.info.error = Some("Missing preflight task".into());
+                            }
+                        } else {
+                            // A text claim or hallucinated tool list cannot
+                            // substitute for authenticated per-tool callbacks.
+                            entry.info.state = AgentState::Failed;
+                            entry.info.capability_status = "unavailable".into();
+                            entry.info.error = Some(format!(
+                                "Child connector preflight failed (patch={}, create={}, progress={}); coding task NOT sent. Refresh/reconnect the named plugin, or explicitly review and apply proposed diffs with parent workspace tools",
+                                entry.probe_patch, entry.probe_create, entry.probe_progress,
+                            ));
+                            entry.pending_prompt.clear();
+                        }
+                        // Do not store the preflight's untrusted prose.
+                        let _ = result;
+                    }
                     Ok((result, url)) => {
                         if result.len() > MAX_RESULT {
                             entry.info.state = AgentState::Failed;
@@ -430,9 +643,14 @@ impl AgentManager {
                     }
                     Err(BackendFailure::Manual(reason)) => {
                         entry.info.state = AgentState::Waiting;
+                        entry.waiting_manual = true;
                         entry.info.error =
                             Some(format!("Manual {reason} required in visible browser"));
-                        // Do not clear pending prompt: resume must not repeat a sent message.
+                    }
+                    Err(BackendFailure::Uncertain(reason)) => {
+                        entry.info.state = AgentState::Waiting;
+                        entry.waiting_manual = false;
+                        entry.info.error = Some(reason.to_owned());
                     }
                     Err(BackendFailure::Unavailable) => {
                         entry.info.state = AgentState::Failed;
@@ -443,7 +661,16 @@ impl AgentManager {
                         entry.info.error = Some(reason.to_owned());
                     }
                 }
+                if entry.probe_pending && entry.info.state == AgentState::Failed {
+                    entry.info.capability_status = "unavailable".into();
+                }
                 entry.updates.send_replace(entry.info.clone());
+            }
+            drop(agents);
+            if let Some(prompt) = next_prompt {
+                // The probe browser reply finished before the actual coding
+                // prompt is sent to this same tab. No tool-text is trusted.
+                manager.start(id, prompt, false, epoch);
             }
         });
     }
@@ -514,6 +741,17 @@ impl AgentManager {
         if entry.completion_claimed {
             return Err(AgentError::Busy);
         }
+        if entry.info.role == AgentRole::Implementer
+            && entry.info.capability_status == "unavailable"
+        {
+            return Err(AgentError::CapabilityUnavailable);
+        }
+        if entry.info.state == AgentState::Cancelled {
+            return Err(AgentError::Cancelled);
+        }
+        if resume && !entry.waiting_manual {
+            return Err(AgentError::NotWaiting);
+        }
         match entry.info.state {
             AgentState::Cancelled => return Err(AgentError::Cancelled),
             AgentState::Running => return Err(AgentError::Busy),
@@ -537,21 +775,50 @@ impl AgentManager {
             entry.completion_claimed = false;
             entry.patch_attempts = 0;
             entry.create_attempts = 0;
+            entry.activity_reports = 0;
+            entry.activity_dropped_before = entry.info.activity_sequence;
+            entry.activity_events.clear();
             let mut next = format!(
                 "{}\n\nWHEN FINISHED: Call the NovaGPT MCP tool subagent_finished with id={id}, code={code}, and result=<your complete final report>. Do this once. Keep the six-character code private; do not include it in messages or logs.",
                 new_prompt.unwrap_or_default()
             );
+            next.push_str("\n\nWhile actively working, use subagent_progress with this id/code and one of: working, reading, editing, testing, reviewing, blocked. Do not include free-text details.");
             if entry.info.role == AgentRole::Implementer {
                 next.push_str("\n\nFor existing files call subagent_apply_patch with this id/code, one selected file per patch. For NEW files anywhere within the authorized workspace call subagent_create_file with id/code/path/content; paths need not be selected. Check the receipt before saying APPLIED; otherwise label changes NOT APPLIED.");
             }
-            next
+            if entry.info.role == AgentRole::Implementer {
+                if let Some(name) = entry.info.connector_name.as_deref() {
+                    // A follow-up is a fresh execution credential and the
+                    // child's plugin access may have changed in the meantime.
+                    // Never skip its capability check.
+                    let connector = format!(
+                        "**NovaGPT workspace tools**\nYour coding workspace is managed by the NovaGPT connector named {}. Discover the actual tool namespace of this exact connected app; do not guess its name or assume it is still connected. The actual task will follow only after server-verified callbacks. Never reveal the private credential or claim edits without server receipts.",
+                        serde_json::to_string(name).unwrap_or_default()
+                    );
+                    entry.task_prompt = Some(format!("{connector}\n\n{next}"));
+                    entry.probe_pending = true;
+                    entry.probe_patch = false;
+                    entry.probe_create = false;
+                    entry.probe_progress = false;
+                    entry.info.capability_status = "probing".into();
+                    format!(
+                        "{connector}\n\nCAPABILITY PREFLIGHT ONLY. Do NOT begin coding yet. Discover the actual connected app's namespace and call subagent_progress with id={id}, code={code}, kind=working; subagent_apply_patch with id={id}, code={code}, patch=\"\", probe=true; and subagent_create_file with id={id}, code={code}, path=\"\", content=\"\", probe=true. These operations return authenticated receipts without writing files. Do not call subagent_finished in preflight. End the turn after successful receipts, or explicitly report unavailable tools."
+                    )
+                } else {
+                    next
+                }
+            } else {
+                next
+            }
         };
         if prompt.is_empty() {
             return Err(AgentError::Invalid);
         }
         entry.epoch += 1;
+        entry.info.epoch = entry.epoch;
         let epoch = entry.epoch;
         entry.info.state = AgentState::Running;
+        entry.waiting_manual = false;
         entry.info.error = None;
         entry.info.result = None;
         if !resume {
@@ -576,6 +843,7 @@ impl AgentManager {
             let mut agents = self.inner.entries.lock().await;
             let entry = agents.get_mut(id).ok_or(AgentError::NotFound)?;
             entry.epoch += 1; // invalidates any pending backend completion
+            entry.info.epoch = entry.epoch;
             entry.info.state = AgentState::Cancelled;
             entry.pending_prompt.clear();
             entry.updates.send_replace(entry.info.clone());
@@ -625,21 +893,14 @@ impl AgentManager {
             let mut agents = self.inner.entries.lock().await;
             let entry = agents.get_mut(id).ok_or(AgentError::CompletionDenied)?;
             if !entry.ready
+                || entry.probe_pending
                 || entry.completion_claimed
                 || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
                 || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
             {
                 return Err(AgentError::CompletionDenied);
             }
-            let correct = code.len() == COMPLETION_KEY_LEN
-                && entry
-                    .completion_code
-                    .as_bytes()
-                    .ct_eq(code.as_bytes())
-                    .unwrap_u8()
-                    == 1;
-            if !correct {
-                entry.completion_failures = entry.completion_failures.saturating_add(1);
+            if !entry.accept_code(code) {
                 return Err(AgentError::CompletionDenied);
             }
             // Claim before releasing the registry lock. Do not wake waiters or
@@ -668,6 +929,138 @@ impl AgentManager {
         Ok(AgentCompletionAck {
             id: entry.info.id.clone(),
             state: AgentState::Completed,
+        })
+    }
+
+    /// Report one safe, authenticated event for a ready, nonterminal execution.
+    /// The worker cannot supply arbitrary descriptions or other metadata.
+    pub async fn progress(&self, id: &str, code: &str, kind: &str) -> AgentResult<ActivityEvent> {
+        let mut agents = self.inner.entries.lock().await;
+        let entry = agents.get_mut(id).ok_or(AgentError::ActivityDenied)?;
+        if !entry.ready
+            || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
+            || entry.completion_claimed
+            || entry.activity_reports >= MAX_ACTIVITY_REPORTS
+            || !entry.accept_code(code)
+        {
+            return Err(AgentError::ActivityDenied);
+        }
+        let description = match kind {
+            "working" => "Working on the assigned task",
+            "reading" => "Reviewing relevant source material",
+            "editing" => "Preparing changes",
+            "testing" => "Checking behavior",
+            "reviewing" => "Reviewing findings",
+            "blocked" => "Worker reported a blocker",
+            _ => return Err(AgentError::Invalid),
+        };
+        let sequence = entry
+            .info
+            .activity_sequence
+            .checked_add(1)
+            .ok_or(AgentError::ActivityDenied)?;
+        let timestamp_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let event = ActivityEvent {
+            id: id.to_owned(),
+            epoch: entry.epoch,
+            sequence,
+            timestamp_ms,
+            kind: kind.to_owned(),
+            description,
+        };
+        entry.info.activity_sequence = sequence;
+        if entry.probe_pending && kind == "working" {
+            entry.probe_progress = true;
+        }
+        entry.activity_reports += 1;
+        entry.activity_events.push_back(event.clone());
+        if entry.activity_events.len() > MAX_ACTIVITY_EVENTS
+            && let Some(evicted) = entry.activity_events.pop_front()
+        {
+            entry.activity_dropped_before = evicted.sequence;
+        }
+        // Lifecycle watchers will ignore running-to-running progress events.
+        entry.updates.send_replace(entry.info.clone());
+        Ok(event)
+    }
+
+    /// Read-only activity snapshot. No credential is disclosed.
+    pub async fn activity(&self, id: &str) -> AgentResult<AgentActivity> {
+        self.activity_since(id, 0).await
+    }
+
+    pub async fn activity_since(
+        &self,
+        id: &str,
+        after_sequence: u64,
+    ) -> AgentResult<AgentActivity> {
+        let entries = self.inner.entries.lock().await;
+        Ok(entries
+            .get(id)
+            .ok_or(AgentError::NotFound)?
+            .activity_since(after_sequence))
+    }
+
+    /// Cursor-based bounded wait for new progress, epoch change or terminal state.
+    /// This does not alter the existing subagent_wait lifecycle contract.
+    pub async fn wait_activity(
+        &self,
+        id: &str,
+        after_sequence: u64,
+        known_epoch: Option<u64>,
+        max_wait_seconds: u64,
+    ) -> AgentResult<AgentActivityWait> {
+        if !(1..=MAX_WAIT_SECONDS).contains(&max_wait_seconds) {
+            return Err(AgentError::Invalid);
+        }
+        let mut updates = {
+            let entries = self.inner.entries.lock().await;
+            entries
+                .get(id)
+                .ok_or(AgentError::NotFound)?
+                .updates
+                .subscribe()
+        };
+        let changed = |info: &AgentInfo| {
+            info.activity_sequence > after_sequence
+                || known_epoch.is_some_and(|epoch| info.epoch != epoch)
+                || matches!(
+                    info.state,
+                    AgentState::Completed | AgentState::Failed | AgentState::Cancelled
+                )
+        };
+        let initial = updates.borrow_and_update().clone();
+        let timed_out = if changed(&initial) {
+            false
+        } else {
+            match timeout(Duration::from_secs(max_wait_seconds), async {
+                loop {
+                    updates.changed().await.map_err(|_| AgentError::Backend)?;
+                    if changed(&updates.borrow_and_update()) {
+                        return Ok::<(), AgentError>(());
+                    }
+                }
+            })
+            .await
+            {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => true,
+            }
+        };
+        let activity = self.activity_since(id, after_sequence).await?;
+        Ok(AgentActivityWait {
+            timed_out: timed_out
+                && matches!(activity.state, AgentState::Running | AgentState::Waiting)
+                && activity.cursor <= after_sequence
+                && !known_epoch.is_some_and(|epoch| activity.epoch != epoch),
+            activity,
         })
     }
 
@@ -719,6 +1112,44 @@ impl AgentManager {
         }
     }
 
+    /// Confirm a live callback endpoint without changing repository state.
+    /// The preflight is scoped to this execution and this exact endpoint;
+    /// self-reported tool names in chat are not accepted as evidence.
+    pub async fn probe_tool(
+        &self,
+        id: &str,
+        code: &str,
+        capability: &str,
+    ) -> AgentResult<AgentToolProbe> {
+        let mut entries = self.inner.entries.lock().await;
+        let entry = entries.get_mut(id).ok_or(AgentError::PatchDenied)?;
+        if !entry.ready
+            || !entry.probe_pending
+            || entry.info.role != AgentRole::Implementer
+            || entry.info.state != AgentState::Running
+            || entry.completion_claimed
+            || !entry.accept_code(code)
+        {
+            return Err(AgentError::PatchDenied);
+        }
+        let capability = match capability {
+            "subagent_apply_patch" => {
+                entry.probe_patch = true;
+                "subagent_apply_patch"
+            }
+            "subagent_create_file" => {
+                entry.probe_create = true;
+                "subagent_create_file"
+            }
+            _ => return Err(AgentError::Invalid),
+        };
+        Ok(AgentToolProbe {
+            id: id.to_owned(),
+            capability,
+            available: true,
+        })
+    }
+
     /// Apply an explicitly requested, authenticated, single-file update in the
     /// assigned real workspace. The blocking worker owns the per-agent gate
     /// until Git exits, even if its async caller disconnects.
@@ -751,6 +1182,7 @@ impl AgentManager {
                 let mut entries = manager.inner.entries.blocking_lock();
                 let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
                 if !entry.ready
+                    || entry.probe_pending
                     || entry.info.role != AgentRole::Implementer
                     || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
                     || entry.completion_claimed
@@ -759,15 +1191,7 @@ impl AgentManager {
                 {
                     return Err(AgentError::PatchDenied);
                 }
-                let correct = code.len() == COMPLETION_KEY_LEN
-                    && entry
-                        .completion_code
-                        .as_bytes()
-                        .ct_eq(code.as_bytes())
-                        .unwrap_u8()
-                        == 1;
-                if !correct {
-                    entry.completion_failures = entry.completion_failures.saturating_add(1);
+                if !entry.accept_code(&code) {
                     return Err(AgentError::PatchDenied);
                 }
                 let workspace_id = entry.info.workspace_id.clone();
@@ -847,6 +1271,7 @@ impl AgentManager {
                 let mut entries = manager.inner.entries.blocking_lock();
                 let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
                 if !entry.ready
+                    || entry.probe_pending
                     || entry.info.role != AgentRole::Implementer
                     || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
                     || entry.completion_claimed
@@ -855,15 +1280,7 @@ impl AgentManager {
                 {
                     return Err(AgentError::PatchDenied);
                 }
-                let correct = code.len() == COMPLETION_KEY_LEN
-                    && entry
-                        .completion_code
-                        .as_bytes()
-                        .ct_eq(code.as_bytes())
-                        .unwrap_u8()
-                        == 1;
-                if !correct {
-                    entry.completion_failures = entry.completion_failures.saturating_add(1);
+                if !entry.accept_code(&code) {
                     return Err(AgentError::PatchDenied);
                 }
                 entry.create_attempts += 1;
@@ -925,16 +1342,392 @@ mod tests {
         );
         assert_eq!(
             map_browser(BrowserError::AmbiguousSubmission).to_string(),
-            "Chrome disconnected after possible submission; prompt replay refused"
+            "Browser outcome uncertain after a possible submission"
         );
         assert_eq!(
             map_browser(BrowserError::Timeout).to_string(),
-            "Browser action timed out"
+            "Browser outcome uncertain after a possible submission"
         );
         assert!(matches!(
             map_browser(BrowserError::Manual("verification")),
             BackendFailure::Manual("verification")
         ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_untrusted_connector_name_is_denied_before_tab_creation() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = probe_backend();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            backend.clone(),
+        );
+        let request = SpawnAgent {
+            workspace_id: None,
+            task: "do not dispatch".into(),
+            role: AgentRole::Implementer,
+            paths: vec![],
+            context: None,
+        };
+        assert!(matches!(
+            manager.spawn_with_connector(request.clone(), None).await,
+            Err(AgentError::ConnectorMissing)
+        ));
+        assert!(matches!(
+            manager
+                .spawn_with_connector(request.clone(), Some("  "))
+                .await,
+            Err(AgentError::ConnectorMissing)
+        ));
+        assert!(matches!(
+            manager
+                .spawn_with_connector(request, Some("malicious\nconnector"))
+                .await,
+            Err(AgentError::Invalid)
+        ));
+        assert!(backend.prompts.lock().await.is_empty());
+    }
+
+    struct ProbeBackend {
+        prompts: Mutex<Vec<String>>,
+        entered: tokio::sync::Notify,
+        release_probe: tokio::sync::Notify,
+        release_task: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ProbeBackend {
+        fn name(&self) -> &'static str {
+            "probe-fixture"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            _id: &str,
+            prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            let number = {
+                let mut sent = self.prompts.lock().await;
+                sent.push(prompt.to_owned());
+                sent.len()
+            };
+            self.entered.notify_one();
+            if number == 1 {
+                self.release_probe.notified().await;
+                Ok(("preflight complete".into(), None))
+            } else {
+                self.release_task.notified().await;
+                Ok(("task reply".into(), None))
+            }
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn complete(&self, _id: &str) {
+            self.release_task.notify_one();
+        }
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    fn probe_backend() -> Arc<ProbeBackend> {
+        Arc::new(ProbeBackend {
+            prompts: Mutex::new(Vec::new()),
+            entered: tokio::sync::Notify::new(),
+            release_probe: tokio::sync::Notify::new(),
+            release_task: tokio::sync::Notify::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn named_connector_probe_gates_real_writes_and_completion() {
+        for name in [
+            "NovaGPT Laptop",
+            "NovaGPT PC",
+            "Arbitrary Custom Connection",
+        ] {
+            let dir = tempfile::tempdir().expect("fixture");
+            std::fs::write(dir.path().join("approved.rs"), "old\n").expect("existing file");
+            let backend = probe_backend();
+            let manager = AgentManager::new(
+                WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+                backend.clone(),
+            );
+            let info = manager
+                .spawn_with_connector(
+                    SpawnAgent {
+                        workspace_id: None,
+                        role: AgentRole::Implementer,
+                        task: "ASSIGNMENT: create file and edit approved.rs".into(),
+                        paths: vec!["approved.rs".into()],
+                        context: None,
+                    },
+                    Some(name),
+                )
+                .await
+                .expect("spawn");
+            backend.entered.notified().await;
+            let sent = backend.prompts.lock().await;
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains(name));
+            assert!(sent[0].contains("CAPABILITY PREFLIGHT ONLY"));
+            assert!(!sent[0].contains("ASSIGNMENT:"));
+            drop(sent);
+            let code = manager.inner.entries.lock().await[&info.id]
+                .completion_code
+                .clone();
+            let initial = manager
+                .status(Some(&info.id))
+                .await
+                .expect("status")
+                .agents
+                .remove(0);
+            assert_eq!(initial.capability_status, "probing");
+            assert_eq!(initial.connector_name.as_deref(), Some(name));
+            assert!(matches!(
+                manager.finished(&info.id, &code, "forged finish").await,
+                Err(AgentError::CompletionDenied)
+            ));
+            assert!(matches!(
+                manager
+                    .create_file(&info.id, &code, "premature.txt", "bad")
+                    .await,
+                Err(AgentError::PatchDenied)
+            ));
+            assert!(matches!(
+                manager
+                    .apply_patch(
+                        &info.id,
+                        &code,
+                        "--- a/approved.rs\n+++ b/approved.rs\n@@ -1 +1 @@\n-old\n+bad\n"
+                    )
+                    .await,
+                Err(AgentError::PatchDenied)
+            ));
+            assert!(!dir.path().join("premature.txt").exists());
+            assert!(matches!(
+                manager
+                    .probe_tool(&info.id, "WRONG!", "subagent_create_file")
+                    .await,
+                Err(AgentError::PatchDenied)
+            ));
+            assert_eq!(
+                manager
+                    .progress(&info.id, &code, "working")
+                    .await
+                    .expect("activity")
+                    .kind,
+                "working"
+            );
+            let patch_probe = manager
+                .probe_tool(&info.id, &code, "subagent_apply_patch")
+                .await
+                .expect("patch proof");
+            let create_probe = manager
+                .probe_tool(&info.id, &code, "subagent_create_file")
+                .await
+                .expect("create proof");
+            assert_eq!(patch_probe.capability, "subagent_apply_patch");
+            assert!(patch_probe.available && create_probe.available);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("approved.rs")).expect("untouched"),
+                "old\n"
+            );
+            backend.release_probe.notify_one();
+            backend.entered.notified().await;
+            let sent = backend.prompts.lock().await;
+            assert_eq!(sent.len(), 2, "coding task sent after all probes");
+            assert!(sent[1].contains("ASSIGNMENT:"));
+            assert!(sent[1].contains(name));
+            drop(sent);
+            assert_eq!(
+                manager.status(Some(&info.id)).await.expect("status").agents[0].capability_status,
+                "verified"
+            );
+            let created = manager
+                .create_file(&info.id, &code, "new/real.txt", "real content\n")
+                .await
+                .expect("create receipt");
+            assert_eq!(created.path, "new/real.txt");
+            assert_eq!(created.files_created, 1);
+            let updated = manager
+                .apply_patch(
+                    &info.id,
+                    &code,
+                    "--- a/approved.rs\n+++ b/approved.rs\n@@ -1 +1 @@\n-old\n+updated\n",
+                )
+                .await
+                .expect("patch receipt");
+            assert_eq!(updated.paths, ["approved.rs"]);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("new/real.txt")).expect("created"),
+                "real content\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("approved.rs")).expect("patched"),
+                "updated\n"
+            );
+            assert!(matches!(
+                manager
+                    .create_file(&info.id, &code, "../escape.txt", "bad")
+                    .await,
+                Err(AgentError::CreateRejected)
+            ));
+            manager
+                .finished(&info.id, &code, "Done with two server receipts")
+                .await
+                .expect("finish");
+            let final_info = manager.result(&info.id).await.expect("result");
+            assert_eq!(final_info.state, AgentState::Completed);
+            assert_eq!(final_info.patches_applied, 1);
+            assert_eq!(final_info.files_created, 1);
+            assert!(final_info.result.expect("report").applied_to_workspace);
+            assert!(matches!(
+                manager
+                    .probe_tool(&info.id, &code, "subagent_create_file")
+                    .await,
+                Err(AgentError::PatchDenied)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_child_connector_tool_fails_before_task_and_reports_recovery() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = probe_backend();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            backend.clone(),
+        );
+        let info = manager
+            .spawn_with_connector(
+                SpawnAgent {
+                    workspace_id: None,
+                    role: AgentRole::Implementer,
+                    task: "Never send this coding task".into(),
+                    paths: vec![],
+                    context: None,
+                },
+                Some("Custom plugin"),
+            )
+            .await
+            .expect("spawn");
+        backend.entered.notified().await;
+        let code = manager.inner.entries.lock().await[&info.id]
+            .completion_code
+            .clone();
+        assert!(matches!(
+            manager
+                .probe_tool(&info.id, "INVALID", "subagent_apply_patch")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        assert!(
+            manager
+                .probe_tool(&info.id, &code, "subagent_create_file")
+                .await
+                .is_ok()
+        );
+        backend.release_probe.notify_one();
+        let waited = manager.wait(&info.id, 2).await.expect("wait");
+        assert_eq!(waited.agent.state, AgentState::Failed);
+        assert_eq!(waited.agent.capability_status, "unavailable");
+        assert!(
+            waited
+                .agent
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Refresh/reconnect")
+        );
+        assert_eq!(
+            backend.prompts.lock().await.len(),
+            1,
+            "task must not be sent"
+        );
+        assert!(matches!(
+            manager.message(&info.id, "attempt bypass").await,
+            Err(AgentError::CapabilityUnavailable)
+        ));
+    }
+
+    struct TimeoutAfterSubmission;
+    #[async_trait]
+    impl AgentBackend for TimeoutAfterSubmission {
+        fn name(&self) -> &'static str {
+            "timeout-fixture"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            _id: &str,
+            _prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            Err(BackendFailure::Uncertain(
+                "Reply timeout after possible submission",
+            ))
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_browser_timeout_keeps_execution_credential_valid() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            Arc::new(TimeoutAfterSubmission),
+        );
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "already sent".into(),
+                role: AgentRole::Reviewer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        let timed_out = manager.wait(&info.id, 2).await.expect("wait");
+        assert_eq!(timed_out.agent.state, AgentState::Waiting);
+        assert!(
+            timed_out
+                .agent
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timeout")
+        );
+        assert!(
+            matches!(
+                manager.resume(&info.id, true).await,
+                Err(AgentError::NotWaiting)
+            ),
+            "no accidental replay"
+        );
+        let code = manager.inner.entries.lock().await[&info.id]
+            .completion_code
+            .clone();
+        assert!(manager.progress(&info.id, &code, "working").await.is_ok());
+        manager
+            .finished(&info.id, &code, "late completion")
+            .await
+            .expect("callback still active");
+        assert_eq!(
+            manager.result(&info.id).await.expect("result").state,
+            AgentState::Completed
+        );
     }
 
     struct BlockedBackend;
@@ -1282,6 +2075,303 @@ mod tests {
         async fn diagnostics(&self, _id: &str) -> serde_json::Value {
             serde_json::json!({})
         }
+    }
+
+    #[tokio::test]
+    async fn waiting_worker_can_report_activity_without_changing_wait_semantics() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            Arc::new(ManualBackend),
+        );
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "inspect".into(),
+                role: AgentRole::Explorer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        let lifecycle = manager.wait(&worker.id, 2).await.expect("wait");
+        assert_eq!(lifecycle.agent.state, AgentState::Waiting);
+        let code = manager
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("entry")
+            .completion_code
+            .clone();
+        let wait_manager = manager.clone();
+        let id = worker.id.clone();
+        let waiter = tokio::spawn(async move {
+            wait_manager
+                .wait_activity(&id, 0, Some(1), 5)
+                .await
+                .expect("activity wait")
+        });
+        tokio::task::yield_now().await;
+        let event = manager
+            .progress(&worker.id, &code, "working")
+            .await
+            .expect("waiting worker progress");
+        let returned = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("wake")
+            .expect("join");
+        assert!(!returned.timed_out);
+        assert_eq!(returned.activity.events[0].sequence, event.sequence);
+        assert_eq!(returned.activity.state, AgentState::Waiting);
+        manager.cancel(&worker.id).await.expect("cancel");
+    }
+
+    #[tokio::test]
+    async fn progress_is_authenticated_and_shares_the_completion_rate_limit() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            backend.clone(),
+        );
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "inspect".into(),
+                role: AgentRole::Reviewer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        backend.entered.notified().await;
+        let code = manager
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("entry")
+            .completion_code
+            .clone();
+        let wrong = if code == "AAAAAA" { "BBBBBB" } else { "AAAAAA" };
+        for _ in 0..MAX_COMPLETION_ATTEMPTS {
+            assert!(matches!(
+                manager.progress(&worker.id, wrong, "working").await,
+                Err(AgentError::ActivityDenied)
+            ));
+        }
+        assert!(matches!(
+            manager.finished(&worker.id, &code, "too late").await,
+            Err(AgentError::CompletionDenied)
+        ));
+        assert!(matches!(
+            manager.progress(&worker.id, &code, "working").await,
+            Err(AgentError::ActivityDenied)
+        ));
+        assert!(
+            manager
+                .activity(&worker.id)
+                .await
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        manager.cancel(&worker.id).await.expect("cancel");
+        backend.release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn progress_buffer_is_bounded_and_followup_rotates_epoch_and_code() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            backend.clone(),
+        );
+        let worker = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "inspect".into(),
+                role: AgentRole::Tester,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        backend.entered.notified().await;
+        let old = manager
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("entry")
+            .completion_code
+            .clone();
+        assert!(matches!(
+            manager
+                .progress(&worker.id, &old, "https://private.invalid")
+                .await,
+            Err(AgentError::Invalid)
+        ));
+        for _ in 0..MAX_ACTIVITY_REPORTS {
+            manager
+                .progress(&worker.id, &old, "working")
+                .await
+                .expect("progress");
+        }
+        assert!(matches!(
+            manager.progress(&worker.id, &old, "working").await,
+            Err(AgentError::ActivityDenied)
+        ));
+        let feed = manager.activity(&worker.id).await.expect("feed");
+        assert_eq!(feed.events.len(), MAX_ACTIVITY_EVENTS);
+        assert_eq!(feed.cursor, u64::from(MAX_ACTIVITY_REPORTS));
+        assert_eq!(feed.dropped_before, 32);
+        assert!(
+            feed.events
+                .iter()
+                .all(|e| e.timestamp_ms > 0 && e.description == "Working on the assigned task")
+        );
+        manager
+            .finished(&worker.id, &old, "complete")
+            .await
+            .expect("finish");
+        assert!(matches!(
+            manager.progress(&worker.id, &old, "working").await,
+            Err(AgentError::ActivityDenied)
+        ));
+        manager
+            .message(&worker.id, "next task")
+            .await
+            .expect("followup");
+        let rotated = manager
+            .wait_activity(&worker.id, feed.cursor, Some(feed.epoch), 1)
+            .await
+            .expect("epoch change");
+        assert!(!rotated.timed_out);
+        assert_eq!(rotated.activity.epoch, feed.epoch + 1);
+        backend.entered.notified().await;
+        let new = manager
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(&worker.id)
+            .expect("entry")
+            .completion_code
+            .clone();
+        assert_ne!(old, new);
+        let reset = manager.activity(&worker.id).await.expect("reset");
+        assert_eq!(reset.cursor, feed.cursor);
+        assert_eq!(reset.epoch, feed.epoch + 1);
+        assert!(reset.events.is_empty());
+        assert!(matches!(
+            manager.progress(&worker.id, &old, "working").await,
+            Err(AgentError::ActivityDenied)
+        ));
+        let event = manager
+            .progress(&worker.id, &new, "testing")
+            .await
+            .expect("new run");
+        assert_eq!(event.sequence, feed.cursor + 1);
+        manager.cancel(&worker.id).await.expect("cancel");
+        assert!(matches!(
+            manager.progress(&worker.id, &new, "testing").await,
+            Err(AgentError::ActivityDenied)
+        ));
+        backend.release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn activity_wait_wakes_one_worker_only_and_then_on_cancellation() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = Arc::new(HeldSendBackend {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("root"),
+            backend.clone(),
+        );
+        let mut ids = Vec::new();
+        let mut codes = Vec::new();
+        for _ in 0..2 {
+            let worker = manager
+                .spawn(SpawnAgent {
+                    workspace_id: None,
+                    task: "inspect".into(),
+                    role: AgentRole::Explorer,
+                    paths: vec![],
+                    context: None,
+                })
+                .await
+                .expect("spawn");
+            backend.entered.notified().await;
+            codes.push(
+                manager
+                    .inner
+                    .entries
+                    .lock()
+                    .await
+                    .get(&worker.id)
+                    .expect("entry")
+                    .completion_code
+                    .clone(),
+            );
+            ids.push(worker.id);
+        }
+        let first_manager = manager.clone();
+        let first_id = ids[0].clone();
+        let first = tokio::spawn(async move {
+            first_manager
+                .wait_activity(&first_id, 0, Some(1), 5)
+                .await
+                .expect("first wait")
+        });
+        let second_manager = manager.clone();
+        let second_id = ids[1].clone();
+        let second = tokio::spawn(async move {
+            second_manager
+                .wait_activity(&second_id, 0, Some(1), 5)
+                .await
+                .expect("second wait")
+        });
+        tokio::task::yield_now().await;
+        manager
+            .progress(&ids[0], &codes[0], "reading")
+            .await
+            .expect("first report");
+        let updated = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first wake")
+            .expect("join");
+        assert!(!updated.timed_out);
+        assert_eq!(updated.activity.events.len(), 1);
+        assert!(!second.is_finished(), "other worker must not wake");
+        manager.cancel(&ids[1]).await.expect("cancel second");
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("cancel wake")
+            .expect("join");
+        assert_eq!(cancelled.activity.state, AgentState::Cancelled);
+        assert!(!cancelled.timed_out);
+        assert!(matches!(
+            manager.wait_activity(&ids[0], 1, Some(1), 0).await,
+            Err(AgentError::Invalid)
+        ));
+        manager.cancel(&ids[0]).await.expect("cancel first");
+        backend.release.notify_one();
+        backend.release.notify_one();
     }
 
     #[tokio::test]

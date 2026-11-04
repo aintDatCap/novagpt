@@ -5,6 +5,7 @@
 //! translate upstream GPL-3.0 source. See
 //! `docs/undetected-chromedriver-parity.md` for the source audit, parity
 //! matrix, license analysis, and remaining gaps.
+mod background;
 mod chrome;
 mod error;
 mod install;
@@ -17,6 +18,7 @@ mod profile;
 mod service;
 mod webdriver;
 
+pub use background::BackgroundTarget;
 pub use chrome::{detect_chrome_version, detect_driver_version, discover_chrome};
 pub use error::UpstreamError;
 pub use install::{ChromeDriverStore, DriverFetcher, HttpFetcher, InstallRequest, InstalledDriver};

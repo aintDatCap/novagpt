@@ -179,10 +179,16 @@ mechanism; **not implemented** = consciously omitted, with reason.
 - One owned Chrome process and one owned ChromeDriver child per managed
   instance. ChromeDriver attaches to Chrome through `debuggerAddress`; it
   does not launch a second browser.
-- Every WebDriver tab operation takes one session-wide async mutex,
-  switches to the tab’s exact window handle, and then issues the command.
-  Four worker tasks therefore cannot observe or mutate another worker’s
-  current window. This is the deterministic ownership model.
+- Every **explicit WebDriver** tab operation takes one session-wide async mutex,
+  switches to the tab's exact window handle, and then issues the command.
+  This remains useful for setup and manual navigation but was responsible for
+  repeated Chrome foreground activation when used during 300-ms worker polls.
+  Ordinary ChatGPT subagent read/poll/input now uses `BackgroundTarget` in the
+  browser-driver layer: a specific tab ID is matched to the owned loopback
+  Chrome DevTools target and addressed via its own page WebSocket, without a
+  WebDriver window switch or `Page.bringToFront`. Mouse/key pairs are kept
+  ordered on the same socket. Concurrent workers cannot switch one another's
+  current target or mix DOM results.
 - `reconnect()` stops and restarts ChromeDriver, creates a new WebDriver
   session, increments the epoch, and invalidates the old session and all old
   tabs. It never re-navigates or replays input. If Chrome is still alive,
@@ -208,9 +214,10 @@ mechanism; **not implemented** = consciously omitted, with reason.
   are covered by tests in `novagpt-browser` and `novagpt-agents`.
 - The transport exposes errors rather than retrying non-idempotent
   commands. A driver crash mid-submit is ambiguous; callers must not replay.
-- Physical click and Enter sequences are single tab transactions
-  (`click_at`, `press_enter`), preventing four workers from interleaving
-  press/release or key-down/up.
+- Physical click and Enter sequences remain ordered per target
+  (`BackgroundTarget::commands` for worker input; legacy WebDriver
+  `click_at`/`press_enter` for explicit/manual operations), preventing four
+  workers from interleaving press/release or key-down/up.
 - Replay policy in the ChatGPT adapter is explicit:
   `tab_recovered_before_send` is the only automatic tab recreation;
   `recovery_blocked_after_send` and `BrowserError::AmbiguousSubmission`

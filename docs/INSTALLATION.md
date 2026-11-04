@@ -134,7 +134,7 @@ It is **not** the plain ngrok hostname: include `/mcp` and the complete `novagpt
 
 These actions depend on your ChatGPT plan and workspace permissions; the exact controls may change. See the [official ChatGPT MCP connection guide](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt) for requirements.
 
-If you later change the NovaGPT HTTP token, regenerate the URL and update the plugin connection. If your ngrok hostname changes, update the URL as well.
+If you later change the NovaGPT HTTP token, regenerate the URL and update the plugin connection. If your ngrok hostname changes, update the URL as well. **After changing MCP tool schemas** (for example after adding the `probe` parameter to subagent callbacks), rebuild/restart NovaGPT and refresh/reconnect the custom ChatGPT plugin so its discovered tool list is current. The connector's display name is selected in ChatGPT; it may be `NovaGPT Laptop`, `NovaGPT PC`, or any custom label. Supply the **actual selected label** as `connector_name` in `subagent_spawn` rather than assuming the Rust server can discover this client-side alias. A separately opened ChatGPT Web worker may not inherit the parent's plugin access; NovaGPT checks actual authenticated callback receipts before sending implementer tasks and reports missing tools instead of assuming inherited access.
 
 ### Security notes
 

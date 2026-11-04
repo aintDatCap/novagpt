@@ -7,7 +7,8 @@ pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
 /// embedders can install/inspect a verified driver without starting a browser.
 pub use novagpt_browser_driver::undetected as managed;
 use novagpt_browser_driver::undetected::{
-    ChromeDriverStore, DriverChoice, ManagedConfig, UndetectedChrome, UpstreamError, WebDriverTab,
+    BackgroundTarget, ChromeDriverStore, DriverChoice, ManagedConfig, UndetectedChrome,
+    UpstreamError, WebDriverTab,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -234,6 +235,7 @@ pub struct BrowserReply {
 
 struct Page {
     transport: WebDriverTab,
+    background: Option<BackgroundTarget>,
     cancelled: AtomicBool,
     // A crashed tab must never cause automatic replay after a send event.
     submission_attempted: AtomicBool,
@@ -266,13 +268,6 @@ impl Page {
         if let Some(reporter) = &self.reporter {
             reporter(&record);
         }
-        // Console output is best-effort: diagnostics must never change the
-        // outcome of a browser action when navigation invalidates the context.
-        let js = format!(
-            "console.log({})",
-            json!(format!("[NovaGPT/browser] {record}"))
-        );
-        let _ = self.eval(&js).await;
     }
 
     async fn note_state(&self, state: &Value) {
@@ -327,17 +322,89 @@ impl Page {
     }
 
     async fn command(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
-        self.transport
-            .cdp_execute(method, params)
-            .await
-            .map_err(BrowserError::from)
+        if let Some(target) = &self.background {
+            target
+                .command(method, params)
+                .await
+                .map_err(BrowserError::from)
+        } else {
+            // Only disposable WebDriver fixtures have no background CDP port.
+            self.transport
+                .cdp_execute(method, params)
+                .await
+                .map_err(BrowserError::from)
+        }
     }
 
     async fn eval(&self, source: &str) -> Result<Value, BrowserError> {
-        self.transport
-            .evaluate(source)
-            .await
-            .map_err(BrowserError::from)
+        if let Some(target) = &self.background {
+            target.evaluate(source).await.map_err(BrowserError::from)
+        } else {
+            self.transport
+                .evaluate(source)
+                .await
+                .map_err(BrowserError::from)
+        }
+    }
+
+    async fn insert_text(&self, text: &str) -> Result<(), BrowserError> {
+        if let Some(target) = &self.background {
+            target
+                .command("Input.insertText", json!({"text":text}))
+                .await
+                .map(|_| ())
+                .map_err(BrowserError::from)
+        } else {
+            self.transport
+                .insert_text(text)
+                .await
+                .map_err(BrowserError::from)
+        }
+    }
+
+    async fn click_at(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        if !x.is_finite()
+            || !y.is_finite()
+            || !(0.0..=100_000.0).contains(&x)
+            || !(0.0..=100_000.0).contains(&y)
+        {
+            return Err(BrowserError::Protocol);
+        }
+        if let Some(target) = &self.background {
+            target
+                .commands(&[
+                    (
+                        "Input.dispatchMouseEvent",
+                        json!({"type":"mousePressed","x":x,"y":y,"button":"left","clickCount":1}),
+                    ),
+                    (
+                        "Input.dispatchMouseEvent",
+                        json!({"type":"mouseReleased","x":x,"y":y,"button":"left","clickCount":1}),
+                    ),
+                ])
+                .await
+                .map(|_| ())
+                .map_err(BrowserError::from)
+        } else {
+            self.transport
+                .click_at(x, y)
+                .await
+                .map_err(BrowserError::from)
+        }
+    }
+
+    async fn press_enter(&self) -> Result<(), BrowserError> {
+        if let Some(target) = &self.background {
+            target.commands(&[
+                ("Input.dispatchKeyEvent", json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13})),
+                ("Input.dispatchKeyEvent", json!({"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13})),
+            ]).await.map(|_| ()).map_err(BrowserError::from)
+        } else {
+            self.transport
+                .press_enter()
+                .await
+                .map_err(BrowserError::from)
+        }
     }
 }
 struct Inner {
@@ -530,8 +597,18 @@ impl ChatGptBrowser {
         let transport = self
             .create_tab(&chrome, if id == BROWSE_TAB { "" } else { HOME })
             .await?;
+        let background = if chrome.debug_port() == 0 {
+            // WebDriver-only test fixture.
+            None
+        } else {
+            Some(
+                BackgroundTarget::new(chrome.debug_port(), transport.handle())
+                    .map_err(BrowserError::from)?,
+            )
+        };
         let page = Arc::new(Page {
             transport,
+            background,
             cancelled: AtomicBool::new(false),
             submission_attempted: AtomicBool::new(false),
             send_lock: Mutex::new(()),
@@ -1060,10 +1137,7 @@ impl ChatGptBrowser {
                 return Err(BrowserError::Unavailable);
             }
             page.diagnostic("composer_focused", "").await;
-            page.transport
-                .insert_text(prompt)
-                .await
-                .map_err(BrowserError::from)?;
+            page.insert_text(prompt).await?;
             page.diagnostic("text_input_dispatched", "").await;
             // Check an actual prefix of the inserted prompt, not merely that
             // some unrelated element had nonempty text.
@@ -1104,10 +1178,7 @@ impl ChatGptBrowser {
                 page.diagnostic("send_button_found", "").await;
                 // ChromeDriver can fail after the first event with unknown outcome.
                 page.submission_attempted.store(true, Ordering::Release);
-                page.transport
-                    .click_at(x, y)
-                    .await
-                    .map_err(BrowserError::from)?;
+                page.click_at(x, y).await?;
                 page.diagnostic("send_mouse_dispatched", "").await;
             } else {
                 page.diagnostic("send_button_missing_enter_fallback", "")
@@ -1115,10 +1186,7 @@ impl ChatGptBrowser {
                 // The send button is absent in some ChatGPT layouts; Enter is
                 // the fallback after filling the editor.
                 page.submission_attempted.store(true, Ordering::Release);
-                page.transport
-                    .press_enter()
-                    .await
-                    .map_err(BrowserError::from)?;
+                page.press_enter().await?;
                 page.diagnostic("send_enter_dispatched", "").await;
             }
             *page.pending_before.lock().await = Some(before);
@@ -2016,6 +2084,7 @@ mod tests {
             "agent-crashed".into(),
             Arc::new(Page {
                 transport: tab,
+                background: None,
                 cancelled: AtomicBool::new(false),
                 submission_attempted: AtomicBool::new(true),
                 send_lock: Mutex::new(()),
