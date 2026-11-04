@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 tokio.workspace = true
 serde_json.workspace = true
