@@ -21,7 +21,7 @@ NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **
 - **Start MCP HTTP:** Start the local authenticated server on the saved port. When **Automatic ngrok** is enabled, this also starts the owned tunnel.
 - **Start MCP + ngrok:** Explicitly start the server and tunnel, even if automatic ngrok is disabled in Settings.
 - **Stop MCP HTTP:** Stop the server owned by this TUI instance, after confirmation.
-- **Show / copy ChatGPT URL:** Reveal the complete private URL only after the server and tunnel are ready. Press **C** in the dialog to copy it.
+- **Show / copy ChatGPT URL:** Reveal the complete private URL only after the server and tunnel are ready. Press **C** in the dialog to copy it. NovaGPT selects Wayland (`wl-copy`), X11 (`xclip`/`xsel`), WSL (`clip.exe`), macOS (`pbcopy`) or Windows (`clip.exe`) as appropriate. On Linux, install the appropriate clipboard utility if it is absent; the dialog displays an error instead of reporting a false success.
 - **Diagnostics and optional tools:** Verify workspace status, inspect VM images when enabled, or launch the dedicated browser login flow.
 
 If ngrok is **missing** when starting a tunnel, NovaGPT asks whether to install it using an available supported system package manager. The confirmation defaults to **No**. The installer needs the user's explicit consent, and ngrok account authentication remains a separate manual step. See the [ngrok setup guide](INSTALLATION.md#configure-ngrok-for-chatgpt-access).
@@ -39,7 +39,7 @@ Settings are shared across the current operating-system user, regardless of the 
 - **Authorized directories:** Add or remove existing directories explicitly.
 - **Import NovaGPT workspace settings:** Preview and import selected connection preferences from another NovaGPT workspace configuration, with confirmation. Secrets and workspace permissions are not imported.
 
-Changes remain in a draft until saved with `s`. Most changes that affect the running server require stopping and restarting MCP; changing the TUI language or auto-start setting does not alter the already-running server.
+Changes remain in a draft until saved with `s`. During guided setup, pressing **s** immediately opens the save confirmation, even before the review step; **Enter** accepts this non-destructive save (or select **No** to cancel). Other sensitive confirmations, including installing ngrok, still default to **No**. Enabling Automatic ngrok and/or Start MCP automatically never starts either service during setup and does not prevent saving. If saving fails, the reason appears in a dialog without changing the saved settings. Most changes that affect the running server require stopping and restarting MCP; changing the TUI language or auto-start setting does not alter the already-running server.
 
 ## Activity and diagnostics
 

@@ -482,7 +482,12 @@ impl App {
                             );
                         }
                     }
-                    Err(msg) => self.log(Level::Error, msg),
+                    Err(msg) => {
+                        self.log(Level::Error, msg.clone());
+                        // Saving failed: display the reason without requiring
+                        // the user to switch to the Activity tab.
+                        self.notice(i18n::Messages::save_failed(self.language()), &msg);
+                    }
                 }
             }
         }
@@ -649,7 +654,9 @@ impl App {
         });
     }
     fn confirm(&mut self, action: Confirm) {
-        self.yes = false; // Safe default: No.
+        // A normal settings save is explicitly requested and is non-destructive:
+        // Enter confirms it. Sensitive actions still default to No.
+        self.yes = action == Confirm::Save;
         self.modal = Some(Modal::Confirm(action));
     }
     fn start_edit(&mut self, field: Field) {
@@ -784,12 +791,13 @@ impl App {
                 }
             }
             8 => {
+                // The first Save keypress must actually ask to save, even in
+                // the initial setup steps. Previously it only jumped to
+                // Review, making the workspace appear impossible to save.
                 if self.setup && self.step < 3 {
                     self.step = 3;
-                    self.log_localized(Level::Info, i18n::Messages::setup_review_step);
-                } else {
-                    self.confirm(Confirm::Save);
                 }
+                self.confirm(Confirm::Save);
             }
             9 => {
                 if self.dirty() {

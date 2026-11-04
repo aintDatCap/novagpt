@@ -254,6 +254,85 @@ mod tests {
         assert!(!a.dirty());
     }
     #[test]
+    fn first_run_can_save_ngrok_and_mcp_autostart_in_every_combination() {
+        for (ngrok_enabled, auto_start_mcp) in [(true, false), (false, true), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let mut app = App::new(
+                temp.path().to_path_buf(),
+                LocalSettings::default(),
+                true,
+                vec![],
+            );
+            app.tab = 2;
+            app.step = 1; // The user need not reach Review before saving.
+            if ngrok_enabled {
+                app.config = 11;
+                app.key(key(KeyCode::Enter));
+            }
+            if auto_start_mcp {
+                app.config = 16;
+                app.key(key(KeyCode::Enter));
+            }
+            assert!(app.dirty());
+            assert!(app.key(key(KeyCode::Char('s'))).is_none());
+            assert_eq!(app.step, 3);
+            assert!(matches!(
+                app.modal,
+                Some(Modal::Confirm(model::Confirm::Save))
+            ));
+            assert!(
+                app.yes,
+                "Save should be the default for this non-destructive confirmation"
+            );
+            let Some(Effect::Save(settings, true)) = app.key(key(KeyCode::Enter)) else {
+                panic!("The first Save action must request persistence");
+            };
+            assert_eq!(settings.ngrok_enabled, ngrok_enabled);
+            assert_eq!(settings.auto_start_mcp, auto_start_mcp);
+            let stored = crate::settings::save_to_for_test(&settings, temp.path()).unwrap();
+            app.on_event(OperationEvent::Saved {
+                settings: settings.clone(),
+                outcome: Ok(format!("Settings saved: {}", stored.display())),
+            });
+            assert_eq!(
+                crate::settings::load_from_for_test(temp.path()).unwrap(),
+                settings
+            );
+            assert!(!app.dirty());
+            assert_eq!(app.step, 4);
+            assert!(matches!(app.modal, Some(Modal::SetupResult(_))));
+        }
+    }
+
+    #[test]
+    fn saving_errors_are_visible_without_switching_to_activity() {
+        let mut app = app();
+        app.tab = 2;
+        app.config = 11;
+        app.key(key(KeyCode::Enter));
+        let previous = app.persisted.clone();
+        app.key(key(KeyCode::Char('s')));
+        assert!(matches!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::Save(_, false))
+        ));
+        app.on_event(OperationEvent::Saved {
+            settings: app.draft.clone(),
+            outcome: Err("Settings save rejected: permission denied".into()),
+        });
+        assert_eq!(app.persisted, previous);
+        assert!(app.dirty());
+        assert!(matches!(app.modal, Some(Modal::Notice { .. })));
+        assert!(!app.busy);
+    }
+
+    #[test]
     fn import_port_ngrok_and_only_after_approval() {
         let dir = tempfile::tempdir().unwrap();
         let profile = ImportProfile {
