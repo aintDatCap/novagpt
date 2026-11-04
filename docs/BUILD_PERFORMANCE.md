@@ -1,6 +1,6 @@
 # Rust build performance
 
-NovaGPT favors repeatable, safe builds over compiler tricks that make one target fail or change the MCP protocol. The release matrix builds five native targets, and PR checks run on Linux, Windows and macOS.
+NovaGPT favors repeatable, safe builds over compiler tricks that make one target fail or change the MCP protocol. The release matrix builds three native targets (Linux x86_64, Linux ARM64 and Windows x86_64), and PR checks run on Linux and Windows. macOS GitHub CI jobs are disabled.
 
 ## Current configuration
 
@@ -8,8 +8,6 @@ NovaGPT favors repeatable, safe builds over compiler tricks that make one target
 | --- | --- | --- |
 | `x86_64-unknown-linux-gnu` | Ubuntu 24.04 x64 | Cargo dependency cache; Clang + LLVM LLD linker when already available |
 | `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64 | Separate ARM64 Cargo cache; Clang + LLVM LLD when available |
-| `x86_64-apple-darwin` | macOS 15 Intel | Architecture-specific Cargo cache; native Apple linker |
-| `aarch64-apple-darwin` | macOS 15 Apple Silicon | Architecture-specific Cargo cache; native Apple linker |
 | `x86_64-pc-windows-msvc` | Windows Server 2025 | Architecture-specific Cargo cache; standard MSVC linker |
 
 The Linux linker choice is **CI only**, conditional on Clang and `ld.lld` being installed; otherwise the build uses the normal linker. No toolchain flags are imposed on developers' machines, and the workflows do not use nightly Rust or require new native dependencies.
@@ -56,7 +54,7 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 ```
 
-Use the matching `aarch64-unknown-linux-gnu` target on native Linux ARM64. This is optional and should be removed if it conflicts with custom native libraries; compiler flags change Cargo cache keys and cause a one-time rebuild. Apple and Windows targets intentionally continue to use the platform linker.
+Use the matching `aarch64-unknown-linux-gnu` target on native Linux ARM64. This is optional and should be removed if it conflicts with custom native libraries; compiler flags change Cargo cache keys and cause a one-time rebuild. Windows targets continue to use the platform linker; macOS builds are not part of the GitHub Actions matrix.
 
 ## Measuring improvements responsibly
 

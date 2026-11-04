@@ -22,11 +22,13 @@ You run NovaGPT on your own machine. ChatGPT connects to it through a protected 
 
 Download the latest release from [GitHub Releases](https://github.com/aintDatCap/novagpt/releases), or use an installer:
 
-**Linux / macOS**
+**Linux**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh | bash
 ```
+
+macOS is not included in the GitHub Actions release matrix; build it locally with `cargo build --release -p novagpt-cli` instead of using the release installer.
 
 **Windows (PowerShell)**
 

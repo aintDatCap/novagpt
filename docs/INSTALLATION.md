@@ -6,11 +6,13 @@ NovaGPT runs locally and exposes MCP tools to explicitly authorized clients. The
 
 Download an archive from [NovaGPT Releases](https://github.com/aintDatCap/novagpt/releases) or use the installation scripts.
 
-**Linux / macOS** (requires Bash, curl, tar and SHA-256 utilities):
+**Linux** (requires Bash, curl, tar and SHA-256 utilities):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh | bash
 ```
+
+macOS is excluded from GitHub Actions CI and automated releases. On a Mac, build from source with `cargo build --release -p novagpt-cli`; the current release workflow does not publish the macOS archives required by the Bash installer.
 
 **Windows x64** (PowerShell):
 

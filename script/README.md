@@ -2,9 +2,9 @@
 
 ## GitHub Actions
 
-All workflow variants use Rust-version-aware dependency caching; the five native release targets also upload Cargo timing reports. Linux release builds use Clang + LLVM LLD where installed, with a system-linker fallback. See [build performance and per-target settings](../docs/BUILD_PERFORMANCE.md) for commands, trade-offs, and measurement limits.
+All workflow variants use Rust-version-aware dependency caching; the three native release targets also upload Cargo timing reports. Linux release builds use Clang + LLVM LLD where installed, with a system-linker fallback. See [build performance and per-target settings](../docs/BUILD_PERFORMANCE.md) for commands, trade-offs, and measurement limits.
 
-- **PR testing** (`.github/workflows/test.yml`): every pull request runs `cargo fmt`, Clippy with warnings denied, `cargo check` and the workspace tests on Ubuntu x64, Windows x64 and macOS ARM64.
+- **PR testing** (`.github/workflows/test.yml`): every pull request runs `cargo fmt`, Clippy with warnings denied, `cargo check` and the workspace tests on Ubuntu x64 and Windows x64. macOS jobs are excluded from GitHub CI.
 - **Manual release** (`.github/workflows/release.yml`): from **Actions → Manual release → Run workflow** on **main**. The tag is derived from `[workspace.package].version` in root `Cargo.toml` (for example, `0.1.1` becomes `v0.1.1`). It runs the release checks, builds native `novagpt` binaries, uploads release archives and matching `.sha256` checksums, then creates a GitHub release with generated notes. An existing tag stops the workflow; bump the Cargo version before the next release.
 
 The current release matrix produces:
@@ -13,9 +13,9 @@ The current release matrix produces:
 | --- | --- | --- |
 | Linux | x86_64 | `novagpt-linux-x86_64.tar.gz` |
 | Linux | aarch64 | `novagpt-linux-aarch64.tar.gz` |
-| macOS | x86_64 | `novagpt-macos-x86_64.tar.gz` |
-| macOS | Apple Silicon (aarch64) | `novagpt-macos-aarch64.tar.gz` |
 | Windows | x86_64 | `novagpt-windows-x86_64.zip` |
+
+macOS archives are not built or published by this CI release workflow. macOS users can build from source with `cargo build --release -p novagpt-cli` or use any separately maintained distribution; the release installer cannot download a macOS archive from releases produced by this workflow.
 
 Each archive includes the executable and `LICENSE.md`. The workflow needs permission to create releases using its built-in `GITHUB_TOKEN` (job permission `contents: write`). These archives are **not code-signed**, and an install/rollback smoke test on every supported OS is still needed before treating them as production-quality distributions.
 
@@ -27,7 +27,7 @@ To install directly from GitHub without cloning this repository, follow the [qui
 
 From a clone of this repository:
 
-**Linux or macOS** (Bash; installs for the current user, no `sudo`):
+**Linux** (Bash; installs for the current user, no `sudo`):
 
 ```bash
 bash script/install.sh
@@ -47,4 +47,4 @@ powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -InstallDir "$env:
 
 Downloads and verifies `novagpt-windows-x86_64.zip`, installs `novagpt.exe` under the user's `%LOCALAPPDATA%\Programs\NovaGPT\bin` by default, and appends that directory to the **user** PATH if absent. A new terminal is needed to pick up persistent PATH changes. Windows ARM64 does not have a published native release package in this matrix.
 
-Installers use `https://github.com/aintDatCap/novagpt/releases` and therefore require an **already published, accessible release** and GitHub download access; they do not build from source. They never modify the machine-wide PATH or another user's installation.
+Installers use `https://github.com/aintDatCap/novagpt/releases` and therefore require an **already published, accessible release** and GitHub download access; they do not build from source. This workflow no longer supplies a macOS release asset, so the Bash installer cannot install its generated releases on macOS. They never modify the machine-wide PATH or another user's installation.

@@ -85,10 +85,6 @@ jobs:
             platform: linux-x86_64
           - runner: ubuntu-24.04-arm
             platform: linux-aarch64
-          - runner: macos-15-intel
-            platform: macos-x86_64
-          - runner: macos-15
-            platform: macos-aarch64
           - runner: windows-2025
             platform: windows-x86_64
     steps:
@@ -101,7 +97,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      # Use the Linux linker only where available; native macOS/Windows linking stays unchanged.
+      # Use the Linux linker only where available; native Windows linking stays unchanged.
       - name: Prefer LLVM lld on Linux when installed
         if: runner.os == 'Linux'
         shell: bash
@@ -183,7 +179,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64; do
+          for platform in linux-x86_64 linux-aarch64 windows-x86_64; do
             if [[ "$platform" == windows-* ]]; then
               archive="dist/novagpt-$platform.zip"
             else
