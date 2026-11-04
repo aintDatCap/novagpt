@@ -1,188 +1,89 @@
 # NovaGPT
 
-**NovaGPT is an experimental Rust MCP coding server for working with explicitly approved local workspaces from ChatGPT.** It is a separate, in-progress rewrite of CodexPro, not a drop-in replacement, and does not modify the CodexPro installation or its user data.
+**Work with your local projects directly from ChatGPT.**
 
-## Installation
+NovaGPT is an independent, open-source MCP server written in Rust. It connects ChatGPT to the files, Git repositories and development tools on your computer, while keeping control of which workspaces are available to the server.
 
-The installers download the latest **published GitHub release**, verify the release archive's SHA-256 checksum, and install NovaGPT for your user account without administrator privileges. You do not need to clone the repository or install Rust.
+You run NovaGPT on your own machine. ChatGPT connects to it through a protected MCP endpoint, and you can use ordinary conversations to explore source code, review changes and work on your projects.
 
-### Linux / macOS
+## What can NovaGPT do?
 
-Run this command in a terminal (requires Bash, `curl`, `tar`, and `sha256sum` or `shasum`):
+- **Explore and edit projects:** read files, search, inspect directories and make changes in explicitly approved workspaces.
+- **Work with Git:** inspect status and diffs, manage selected Git operations and review changes.
+- **Run commands:** execute development commands in your computer's normal shell.
+- **Connect multiple conversations:** different ChatGPT conversations can access the same project without copying it.
+- **Optional tools:** use a dedicated Chrome browser, subagents or virtual machines when configured.
+
+> **Security:** NovaGPT's shell runs with your user account's permissions; it is not sandboxed. Give access only to ChatGPT connections you trust. Keep your connector URL and token secret.
+
+## Get started
+
+### 1. Install NovaGPT
+
+Download the latest release from [GitHub Releases](https://github.com/aintDatCap/novagpt/releases), or use an installer:
+
+**Linux / macOS**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.sh -o novagpt-install.sh
+bash novagpt-install.sh
 ```
 
-The installer supports Linux and macOS on x86_64 and ARM64, installs `novagpt` to `~/.local/bin` by default, and adds that directory to your shell startup file if needed.
-
-### Windows (PowerShell)
-
-Run this command in PowerShell on **Windows x64**:
+**Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1 | iex
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/aintDatCap/novagpt/main/script/install.ps1" -OutFile "novagpt-install.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\novagpt-install.ps1"
 ```
 
-The installer puts `novagpt.exe` in `%LOCALAPPDATA%\Programs\NovaGPT\bin` by default and adds it to your user PATH. A native Windows ARM64 release is not currently included.
+Review downloaded installation scripts before running them. Open a new terminal after installation if the command is not yet on your PATH.
 
-**Open a new terminal** after installation so PATH changes take effect. These one-line commands execute the downloaded scripts immediately; review the [Bash installer](script/install.sh) or [PowerShell installer](script/install.ps1) before using them, or follow the download-first instructions in the [installation guide](docs/INSTALLATION.md). The scripts require an accessible, published [GitHub release](https://github.com/aintDatCap/novagpt/releases); they do not build NovaGPT from source. See [installation options and version pinning](script/README.md).
-
-## Configuration
-
-NovaGPT works on an existing directory that you explicitly select as its workspace. The simplest way to configure it is the interactive setup:
+### 2. Open your project
 
 ```bash
 cd /path/to/your/project
 novagpt --setup
 ```
 
-Or run `novagpt --root /absolute/path/to/your/project --setup` from anywhere. On Windows, for example: `novagpt --root "C:\Projects\my-project" --setup`.
+Follow the setup guide, check your workspace and save the settings. On subsequent launches, just run `novagpt` to open the terminal interface.
 
-1. **Choose the workspace.** The current directory is the default; `--root` selects another existing directory. Add any other explicitly allowed roots in **Settings**.
-2. **Set connection preferences.** The default HTTP port is `8787`. Enable ngrok only if you need remote access; enable the dedicated ChatGPT Browser or VM integration only if you intend to use them.
-3. **Save and confirm.** Press `s` in **Settings**, then confirm the changes. Settings are saved once per OS user in the private `NovaGPT/config.json` user-state directory; the current workspace selects where tools operate, not which settings apply. A single HTTP token is generated per OS user and shared by all their NovaGPT workspaces, outside the repository; `NOVAGPT_HTTP_TOKEN`, if set, overrides it.
+The **Overview** screen shows server and tunnel status, **Activity** shows events, and **Settings** lets you manage the connection and optional features. Interface language is detected automatically, with English as the fallback.
 
-To start the local MCP server, use **Start MCP HTTP** from the TUI, or run this in a terminal:
+### 3. Connect ChatGPT
 
-```bash
-novagpt --root /absolute/path/to/your/project http --port 8787
-```
+1. Create a free [ngrok account](https://dashboard.ngrok.com/signup) and install [ngrok](https://ngrok.com/download). If it is missing when you try to start an ngrok connection, NovaGPT's terminal interface can offer to install it with a supported system package manager, after your confirmation.
+2. Add your ngrok authentication token **locally** (copy it from your ngrok dashboard):
 
-The local endpoint is `http://127.0.0.1:8787/mcp` and requires the shared user token. For a local stdio-based MCP client, run `novagpt --root /absolute/path/to/your/project stdio` instead. To connect ChatGPT remotely, configure an ngrok tunnel and generate a connector URL explicitly; **treat that URL as a password**, because authenticated MCP clients can execute host-shell commands. Remote ChatGPT interoperability is still being verified.
+   ```bash
+   ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+   ```
 
-For step-by-step configuration, token management, optional browser login, ngrok/ChatGPT connector setup, troubleshooting, and building from source, see the **[Installation and configuration guide](docs/INSTALLATION.md)**.
+3. In NovaGPT **Settings**, enable **Automatic ngrok**, save, then choose **Start MCP + ngrok** from Overview. If you prefer, enable **Start MCP automatically** to launch your configured server whenever you open `novagpt`.
+4. Once the tunnel is ready, select **Show / copy ChatGPT URL**. Press **C** to copy the full HTTPS URL. It looks like this (the token below is only a placeholder):
 
-## Further details
+   ```text
+   https://your-domain.ngrok-free.app/mcp?novagpt_token=YOUR_PRIVATE_TOKEN
+   ```
 
-Architecture: `novagpt-core` (workspace/security/file operations), `novagpt-mcp` (official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk), transports), and `novagpt-cli` (binary/configuration).
+5. In **ChatGPT on the web**, open **Plugins → + → Add custom MCP server**. Enter a name such as `NovaGPT`, paste the full URL under **Connection**, choose **No authentication** (the URL already carries your secret), review the security warning and select **Create as a plugin**. Then select the NovaGPT plugin in a conversation.
 
-## Build and Ratatui TUI
+ChatGPT's availability and permission requirements vary by plan and workspace. See [OpenAI's custom MCP server guide](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt).
 
-`novagpt` without a subcommand opens a three-tab Ratatui console (**Overview**, **Activity**, **Settings**; Italian translations available) for the current directory (or `--root`). Overview highlights verified MCP status, Chrome configuration (not login status), tunnel readiness, and context-sensitive primary actions; press `a` to reveal advanced operations. Use arrows and `Enter`, `Tab` to change views, `s` to save settings, and `?` for help. **English is the default TUI language**; under Settings > General > Interface language, press Enter to cycle between English, Italian and Automatic (system locale, with English fallback), and `s` to save. Existing settings without a language preference load in English. `novagpt --setup` opens the same TUI with a guided, four-step configuration flow. Choose Save (`s` is optional) and **explicitly confirm** before writing local settings and installing a non-overwriting launcher under `<workspace>/.novagpt/`. CodexPro import is **read-only and port-only**, with preview and separate confirmation; no credentials or browser/VM data are copied. One HTTP token is generated per OS user and shared across their NovaGPT workspaces, or can be **chosen explicitly** with `novagpt token set --replace` (hidden interactive input). It is kept in per-user private state outside repositories and revealed only on explicit `novagpt token show`. See [TUI setup instructions](docs/TUI_SETUP.md).
+**Never share or publish the full URL**: it grants authenticated access to NovaGPT, including host-shell commands. For a URL that stays the same across restarts, configure an ngrok domain assigned to your account in NovaGPT Settings.
 
-```powershell
-cargo build --workspace
-cargo test --workspace
-cargo run -p novagpt-cli -- --root C:\path\to\repo stdio
-```
+## Everyday use
 
-For Streamable HTTP on localhost, NovaGPT automatically generates and reuses one strong token shared by all workspaces of the OS user when `NOVAGPT_HTTP_TOKEN` is unset (the environment variable still takes precedence):
+Run `novagpt` from your project folder (or use `novagpt --root /absolute/project/path`). Start and stop MCP from the TUI, view connection status and manage additional authorized workspaces from Settings. The automatic MCP startup option is **off by default**; setup itself never starts a server automatically.
 
-```powershell
-cargo run -p novagpt-cli -- --root C:\path\to\repo http --port 8787
-```
+You can also start a local-only server using `novagpt http --no-ngrok`, or start HTTP and ngrok together with `novagpt http --ngrok`.
 
-Chrome executable auto-discovery now matches CodexPro's standard locations: Windows Program Files (64-bit and x86) and LocalAppData, macOS Applications, and common Chrome/Chromium names on the Linux PATH. Enable ChatGPT Browser in the TUI and leave its executable field blank to auto-detect; explicit `--chatgpt-chrome`, `NOVAGPT_CHROME_PATH`, or saved `chrome_executable` remain overrides. Browser profiles stay NovaGPT-owned, never copied or shared with CodexPro. This does not enable ChatGPT browser integration unless opted in.
+## More information
 
-The HTTP endpoint is `http://127.0.0.1:8787/mcp`. HTTP always requires a token; stdio does not. Retrieve the active token locally with `novagpt token show` (secret output) or view its path with `novagpt token path`. The token is stored in `NovaGPT/tokens/http.token` under your OS user state directory. If there is exactly one old workspace token, it is preserved; if there are multiple, NovaGPT generates a new shared token and deletes the validated old token files on first use. Existing HTTP servers must be restarted and saved connector URLs updated after rotation. `NOVAGPT_HTTP_TOKEN` remains an explicit per-process override. This shared token grants access to every workspace the server permits. Do not paste it into logs, screenshots or Git.
+- [Detailed installation, ngrok and troubleshooting](docs/INSTALLATION.md)
+- [Terminal interface and keyboard shortcuts](docs/TUI_SETUP.md)
+- [Security, architecture and development](docs/ARCHITECTURE.md)
+- [Contributing](CONTRIBUTING.md)
 
-## Git, Bash, patch and attachment import (INITIAL)
+NovaGPT is under active development. Some optional capabilities need additional configuration and have not yet been verified in every environment.
 
-NovaGPT exposes MCP tools `git`, `git_status`, `git_diff`, `show_changes`, `bash`, `apply_patch`, `import_file` and `view_image` (guarded PNG/JPEG/GIF/WebP reads, maximum 2 MiB). These are **initial guarded implementations**, not complete CodexPro parity. Git supports status/history, guarded single-file diff, branches, staging/unstaging, bounded local commit, explicit `restore` with `discard_changes=true`, and owned worktree create/list/remove using an OS temporary directory. Commit refuses already-staged protected paths; worktree removal refuses unowned or dirty worktrees. Records are process-local and worktrees may become orphaned after a server restart. Workspace-wide raw diff is refused unless an individual safe file path is supplied; `include_diff=false` returns summary stats. Git index mutations are serialized per canonical root, not per ChatGPT conversation.
-
-The MCP `bash` tool always uses the normal host shell (PowerShell on Windows or Bash on Unix by default); there is no `BashMode`, `--bash-mode`, `--allow-full-shell` or shell command allow-list. Commands have a bounded duration and output, but **are not sandboxed** and can perform arbitrary operations with the server user's OS permissions, including outside a selected workspace. Browser MCP tools (`browser_open`, `browser_navigate`, `browser_read`, `browser_close`) remain independent of Bash and are available whenever ChatGPT Browser is configured. Interactive login uses `novagpt browser-login` locally. **Critical security warning:** An authenticated MCP HTTP client—including a client accessing an ngrok URL—can use this shell. Treat the HTTP token as a remote-execution credential and do not expose NovaGPT to untrusted users or public networks. Prefer local-only stdio for development. Structured Git operations honor the process's **normal global and system Git configuration**, including identity, signing and hooks; NovaGPT never alters the user's .gitconfig.
-
-`apply_patch` accepts one ordinary unified update diff targeting an existing guarded file, rejects stale hunks and multiple targets, and checks before applying. It does not promise crash-atomic updates or multi-file transactions. `import_file` accepts ChatGPT Apps SDK attachment objects, requires a guarded destination, approved HTTPS hosts, pinned public IPv4 DNS resolution, no redirects, a 5 MiB byte cap and an optional SHA-256 precondition. Real remote attachment transfer and MIME verification have **not** been demonstrated.
-
-## Additional MCP and CLI slices (INITIAL)
-
-`list_workspaces`, `workspace_snapshot`, `reconnect_workspace` and `inspect_workspace` provide explicit-root validation and bounded metadata-only inventory; they are not semantic dependency or symbol analysis. `codex_context` reads a guarded and bounded AGENTS.md instruction chain with fingerprint deduplication; it does not automatically include unrelated files, Git patches or handoff outputs. `handoff_to_agent` creates an exclusive bounded `.ai-bridge/handoffs/<ID>.md` plan **without running an agent**. `wait_for_handoff` polls a separate executor's `.ai-bridge/handoff-run-state.json` for a matching plan hash and iteration; it does not run the executor or expose raw artifact contents. `read_handoff` and `load_skill` expose only explicit guarded files. `export_pro_context` creates `.ai-bridge/pro-context.md` from 1–12 specifically selected files (up to 8 KiB each, 96 KiB total) without overwriting; no implicit secret scanning, Git diff collection or agent execution. `runtime_status` includes capped metadata-only HUMAN and LLM views of tool outcomes, shared across MCP HTTP sessions and now retained on disk across server restarts. Its `dropped_events` and `write_errors` explicitly report capacity/I/O problems. `server_config` exposes nonsecret configuration flags.
-
-CLI commands `novagpt doctor --json`, `novagpt inspect --json`, `novagpt review --json`, and `novagpt connection-test --port 8787 --json` are read-only diagnostics. Connection-test sends a bounded authenticated MCP initialize request **only to 127.0.0.1**, validates that the reply identifies NovaGPT, and never prints the bearer token. Server diagnostics on stderr can use `--log-format human` (default) or `--log-format llm` (compact English text). Neither mode is an unrestricted transcript logger; sensitive tool inputs and file bodies are not recorded by the metadata-only audit. A real two-client MCP HTTP test validates separate sessions, shared file visibility, stale-hash rejection, GET/SSE and DELETE isolation. Full TS protocol parity and stress/TTL tests remain pending.
-
-## Recent shell output retrieval (INITIAL)
-
-A successful `bash` call now returns `output_resource_id`. MCP `read_output` accepts `output_resource_id`, optional `workspace_id`, `stream=stdout|stderr`, `offset` and `max_chars` (2–8000) to page through retained output. The last four completed shell captures are stored **in memory**, scoped to canonical workspace IDs and shared across MCP transports; UTF-16 page offsets match the TypeScript client contract. Actual command capture remains limited to 64 KiB per stream; it is marked incomplete if truncated. No output is written to the persistent metadata audit. This is not yet complete CodexPro 2 MB shell/VM output retention.
-
-## Persistent audit logging (INITIAL)
-
-The MCP tool activity audit is enabled by default for CLI `stdio` / `http` and TUI-started HTTP. It writes **only** bounded metadata (sequence, UTC Unix timestamp, fixed tool identifier, success/error) as English plain-text lines under the user's state directory, never inside the repository. It does **not** save prompts, command text, arguments, file paths, responses, HTTP authorization headers or bearer tokens; it is not a full request/response transcript or a complete transport-event trace.
-
-On Windows the directory is `%LOCALAPPDATA%\NovaGPT\logs\<workspace-sha256>`; on Linux/macOS it is `$XDG_STATE_HOME/NovaGPT/logs/<workspace-sha256>/` or `~/.local/state/NovaGPT/logs/<workspace-sha256>/`. The current file is `audit.log`, rotated to `audit.1.log` through `audit.3.log`. Each file is at most 64 KiB (256 KiB maximum per workspace), and the current in-memory snapshot holds the latest 128 events. A bounded background writer keeps disk I/O off async MCP handlers. On clean server shutdown and `runtime_status`, queued records are written and all log segments are synchronized to disk. To keep diagnostics responsive on slower Windows disks, the writer does not synchronize each individual event; events not yet covered by a successful flush can be lost after a crash. If the queue is saturated, a flush times out or disk writes/synchronization fail, inspect `dropped_events` and `write_errors`.
-
-```powershell
-novagpt --root C:\path\to\repo logs path
-novagpt --root C:\path\to\repo logs tail --lines 50
-novagpt --root C:\path\to\repo logs tail --lines 50 --json
-```
-
-`--log-format human|llm` controls ordinary or compact **English text** diagnostics on stderr; neither setting produces JSON logs. The persistent audit also uses fixed plain-text fields (`event=... timestamp_unix=... tool=... status=...`). Historical `audit*.jsonl` files from older versions are left untouched but are no longer read or appended by the new release. The `--json` flags of `doctor`, `inspect`, `review` and `connection-test` remain because they are structured command outputs, not logs. MCP JSON-RPC responses likewise remain structured by protocol. Unix-created directories/files use private permissions (0700/0600), and symlinked log targets are rejected; Windows access additionally depends on inherited user-profile ACLs. Concurrent independent NovaGPT **processes** sharing one log directory, OS-level path-swap attacks, cross-platform ACL auditing and exact CodexPro logging parity are not yet verified.
-
-## Optional Browser Bridge (INITIAL; separate from subagents)
-
-The new **Browser Bridge** is independent of the dedicated `ChatGptBrowser` subagent driver. It attaches only to a **separately started** Chrome debugging endpoint on loopback, and must be explicitly enabled with both a port and one approved public HTTPS origin:
-
-```powershell
-# First start a separate Chrome instance with its own NEW profile and
-# --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222.
-# Open the desired site yourself, then start NovaGPT:
-novagpt --root C:\path\to\repo --browser-bridge-port 9222 --browser-bridge-origin https://www.instagram.com http
-```
-
-MCP `browser_tabs` lists up to 32 tabs **only** on the approved origin (title and opaque CDP target ID). MCP `browser_tab_read` takes that exact ID and returns up to 32K characters of rendered visible text. URL query strings are not returned. It rechecks the origin both at discovery and in the browser-side fixed read-only JavaScript before collecting text. Arbitrary JavaScript, browsing/navigating, clicking, passwords, cookies and other origins are not exposed. A browser opened with remote debugging is sensitive: **never expose its debugging port publicly or point this bridge at the Chrome used by subagents**. This does not yet support Chrome extension attachment, screenshots or fully verified live Instagram.
-
-## Development with last-good hot reload (Linux/macOS)
-
-From the **NovaGPT source repository** run:
-
-```bash
-python3 script/dev.py --port 8787 --ngrok
-# Optional: keep the same public connector hostname on each successful reload:
-python3 script/dev.py --port 8787 --ngrok-domain your-owned-domain.ngrok-free.app
-# Local-only development:
-python3 script/dev.py --port 8787 --no-ngrok
-```
-
-This Python 3 standard-library supervisor watches Rust sources and Cargo manifests. It runs `cargo build -p novagpt-cli --bin novagpt` **while the previous server stays active**, starts a versioned executable only after a successful build, and keeps the running version if compilation fails. If the newly compiled executable cannot start or pass the authenticated local MCP readiness probe, it attempts to restore the previous build. It does not take over a port already occupied by a server it did not start: stop your existing NovaGPT instance on that port first.
-
-On each successful rebuild, connected MCP sessions are interrupted briefly: the owned HTTP server is stopped with SIGTERM, ngrok is reaped, and the new process and tunnel start. Use an ngrok domain reserved in your own account to keep your connector URL stable across restarts; a randomly assigned domain may change. Stop the supervisor with Ctrl+C; its shutdown path asks NovaGPT to stop and uses a bounded forced process-group kill if necessary. This **does not guarantee preservation of in-flight requests** or cleanup after an uncatchable SIGKILL, crash, or power failure. The tool does not launch or modify CodexPro and does not copy or print the MCP token.
-
-The tests for the supervisor run with `python3 -m unittest discover -s script -p 'test_dev.py'`. This runner targets POSIX systems, not Windows.
-
-## Experimental ngrok exposure
-
-The CLI can run a managed ngrok v3 tunnel for the loopback MCP service. Both bearer authentication and a CodexPro-compatible `codexpro_token` URL query parameter are supported; this permits a ChatGPT MCP connector configured with **No authentication**. The query URL is itself a password.
-
-```powershell
-novagpt --root C:\path\to\repo http --port 8787 --ngrok
-novagpt --root C:\path\to\repo http --port 8787 --ngrok --ngrok-domain your-owned-domain.ngrok-free.app
-```
-
-After starting the server, in a **second terminal** run:
-
-```powershell
-novagpt --root C:\Projects\novagpt connector-url --port 8787
-```
-
-This on-demand command verifies authenticated local MCP readiness, confirms that ngrok forwards the chosen loopback port, and prints the full HTTPS connector URL, including its URL-encoded workspace credential, **only when explicitly requested**. Startup prints only the public endpoint, never the token; no automatic clipboard copying occurs. A stable domain assigned to your ngrok account can be selected with `--ngrok-domain` and reused on later starts. To migrate connection preferences from one old NovaGPT workspace into global settings, run `novagpt --root C:\\path\\to\\destination --novagpt-source C:\\path\\to\\source` and use the existing TUI preview/confirmation/save, or choose **Config → Importa da cartella NovaGPT** to type an absolute source folder. This copies *only* HTTP port and ngrok mode/domain from the source `.novagpt/config.json`, never files, secrets, workspace grants, VM or browser configuration; the source is read-only.
-
-The TUI can optionally import **port**, **ngrok startup preference** and a validated public **hostname** from a CodexPro profile after preview/confirmation, then save them in the global `NovaGPT/config.json`. Ordinary `novagpt http` follows that saved preference; `novagpt http --no-ngrok` overrides it for a local-only run. The original CodexPro profile and all tokens stay untouched; `ngrokConfig` file paths and file contents are deliberately not imported.
-
-In the Ratatui TUI choose **Avvia MCP + ngrok**, then **Mostra / copia URL ChatGPT**. The URL is shown only in a modal; press **C** to copy it explicitly via your system clipboard, or close the modal without copying. Paste the URL into your ChatGPT MCP connector and choose **No authentication**. Treat that URL like a password: don't share it or include it in logs; ngrok as the tunnel provider can still see tunneled requests. The local ngrok inspection and ngrok logs are disabled. Query-authenticated MCP POST, GET/SSE and DELETE are covered by real local HTTP tests. The server persists metadata-only HTTP diagnostics (auth reason, safe method class, response status, listener and tunnel readiness) without credentials, request paths, bodies, session IDs or connector URLs. After a rejected ChatGPT connection, collect the bounded events with `novagpt --root C:\\Projects\\novagpt logs tail`, even after restarting. The TUI verifies an authenticated NovaGPT handshake before announcing readiness, and CLI/TUI never launch ngrok until the local TCP listener is owned by NovaGPT. For public ngrok traffic, the server now also discovers and explicitly authorizes **only that tunnel's hostname** in rmcp's DNS-rebinding protection allowlist, in addition to loopback hosts. A correct URL token previously passed middleware but failed with `403 Forbidden` when rmcp rejected the external `Host`; the new real HTTP integration verifies successful initialize for the approved public hostname and continuing `403` for unknown hosts. **The remote ChatGPT connector still needs an end-to-end user test**. Keep permitted workspace roots and shell privileges restricted.
-
-## Status
-
-This remains an **early vertical slice**, not a complete port. Optional tool surfaces cover VM host lifecycle and asynchronous ChatGPT Browser subagents. Real guest control, generic browser projects, comprehensive persistent diagnostic tracing beyond the metadata-only audit, advanced analysis, broader skills/Pro workflows, complete CLI/release behavior, and TS differential parity remain pending. See [VM and subagent guide](docs/VM_AND_SUBAGENTS.md), [parity](docs/PARITY.md) and [architecture](docs/ARCHITECTURE.md).
-
-CodexPro remains the reference oracle and production implementation until parity and rollback have been validated.
-
-## NovaGPT-owned interactive Chrome and subagents
-
-Enable **ChatGPT Browser** from the TUI Config tab (the Chrome executable is auto-detected), save, and start the HTTP server, or use explicit `--chatgpt-chrome PATH --chatgpt-profile NEW_DIRECTORY` flags. After reconnecting ChatGPT to the new server build, `browser_open` launches the visible, NovaGPT-owned Chrome window. `browser_navigate` visits a specified public HTTPS address, `browser_read` returns bounded visible page text/title/URL, and `browser_close` closes only the independent browsing tab. The existing `subagent_spawn` / `subagent_wait` / `subagent_finished` / `subagent_status` / `subagent_result` / `subagent_message` tools share the **same** Chrome process/profile but use separate ChatGPT tabs. Browser automation does not bypass sign-in or anti-bot prompts. No personal or CodexPro Chrome profile is opened. Network/DNS policy is not a complete browser sandbox; only browse explicitly requested public pages and treat their content as untrusted.
-
-## Optional VMs and ChatGPT Browser subagents
-
-Both are **off by default**, can be enabled either by explicit runtime flags or by a saved global TUI configuration, and are not part of ordinary file operations. For managed Hyper-V/QEMU images use `--vm-home <NEW_DIRECTORY>` and the human-only `vm-import` CLI command. For browser subagents use `--chatgpt-chrome <CHROME_EXE> --chatgpt-profile <FRESH_PROFILE_DIRECTORY>`; login and verification must be manual. See [setup, capabilities, security and gaps](docs/VM_AND_SUBAGENTS.md).
-
-## Contributing and scaling
-
-Start with [AGENTS.md](AGENTS.md) for agent-friendly repository rules. The engineering reference is split by purpose:
-
-- [Engineering standards](docs/ENGINEERING_STANDARDS.md) — crate ownership, types, module/API design, dependency and concurrency boundaries.
-- [Extension playbook](docs/EXTENSION_PLAYBOOK.md) — steps for adding safe core operations, MCP tools, settings and optional subsystems.
-- [Quality gates](docs/QUALITY_GATES.md) — tests, security cases, compatibility evidence and review checklist.
-- [Architecture decisions](docs/decisions/README.md) — why the important boundaries exist.
-- [Parity ledger](docs/PARITY.md) — verified status compared with CodexPro, not assumed success.
-
-When several agents contribute simultaneously, assign nonoverlapping files/modules and coordinate manifest, public schema and Git index changes.
+**License:** see [LICENSE.md](LICENSE.md).
