@@ -139,6 +139,8 @@ pub trait AgentBackend: Send + Sync {
         prompt: &str,
     ) -> Result<(String, Option<String>), BackendFailure>;
     async fn cancel(&self, id: &str);
+    /// Stop awaiting an already acknowledged response without closing its tab.
+    async fn complete(&self, _id: &str) {}
     async fn close(&self, _id: &str) {}
     async fn diagnostics(&self, id: &str) -> serde_json::Value;
 }
@@ -177,6 +179,9 @@ impl AgentBackend for ChatGptBackend {
     async fn close(&self, id: &str) {
         let _ = self.browser.close(id).await;
     }
+    async fn complete(&self, id: &str) {
+        let _ = self.browser.complete(id).await;
+    }
     async fn diagnostics(&self, id: &str) -> serde_json::Value {
         serde_json::to_value(self.browser.diagnostics(Some(id)).await).unwrap_or_default()
     }
@@ -195,6 +200,7 @@ struct Entry {
     pending_prompt: String,
     completion_code: String,
     completion_failures: u8,
+    completion_claimed: bool,
     epoch: u64,
     ready: bool,
     updates: watch::Sender<AgentInfo>,
@@ -299,6 +305,7 @@ impl AgentManager {
                     pending_prompt: prompt.clone(),
                     completion_code: code,
                     completion_failures: 0,
+                    completion_claimed: false,
                     epoch: 1,
                     ready: false,
                     updates,
@@ -329,7 +336,10 @@ impl AgentManager {
                 // An authenticated subagent callback may have already
                 // completed this run. A stale browser response must not
                 // overwrite its result or resurrect a cancelled agent.
-                if entry.epoch != epoch || entry.info.state != AgentState::Running {
+                if entry.epoch != epoch
+                    || entry.info.state != AgentState::Running
+                    || entry.completion_claimed
+                {
                     return;
                 }
                 match outcome {
@@ -406,6 +416,9 @@ impl AgentManager {
     ) -> AgentResult<AgentInfo> {
         let mut agents = self.inner.entries.lock().await;
         let entry = agents.get_mut(id).ok_or(AgentError::NotFound)?;
+        if entry.completion_claimed {
+            return Err(AgentError::Busy);
+        }
         match entry.info.state {
             AgentState::Cancelled => return Err(AgentError::Cancelled),
             AgentState::Running => return Err(AgentError::Busy),
@@ -426,6 +439,7 @@ impl AgentManager {
             }
             entry.completion_code = code.clone();
             entry.completion_failures = 0;
+            entry.completion_claimed = false;
             format!(
                 "{}\n\nWHEN FINISHED: Call the NovaGPT MCP tool subagent_finished with id={id}, code={code}, and result=<your complete final report>. Do this once. Keep the six-character code private; do not include it in messages or logs.",
                 new_prompt.unwrap_or_default()
@@ -493,38 +507,52 @@ impl AgentManager {
         if result.trim().is_empty() || result.len() > MAX_RESULT {
             return Err(AgentError::Invalid);
         }
+        {
+            let mut agents = self.inner.entries.lock().await;
+            let entry = agents.get_mut(id).ok_or(AgentError::CompletionDenied)?;
+            if !entry.ready
+                || entry.completion_claimed
+                || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
+                || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
+            {
+                return Err(AgentError::CompletionDenied);
+            }
+            let correct = code.len() == COMPLETION_KEY_LEN
+                && entry
+                    .completion_code
+                    .as_bytes()
+                    .ct_eq(code.as_bytes())
+                    .unwrap_u8()
+                    == 1;
+            if !correct {
+                entry.completion_failures = entry.completion_failures.saturating_add(1);
+                return Err(AgentError::CompletionDenied);
+            }
+            // Claim before releasing the registry lock. Do not wake waiters or
+            // permit new messages until the previous browser poller has been
+            // signalled to stop: otherwise two sends can race on one tab.
+            entry.completion_claimed = true;
+            entry.info.error = None;
+            entry.info.result = Some(AgentOutput {
+                raw_response: result.to_owned(),
+                untrusted: true,
+                applied_to_workspace: false,
+            });
+            entry.pending_prompt.clear();
+            entry.completion_code.clear();
+        }
+        self.inner.backend.complete(id).await;
         let mut agents = self.inner.entries.lock().await;
         let entry = agents.get_mut(id).ok_or(AgentError::CompletionDenied)?;
-        if !entry.ready
-            || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
-            || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
-        {
-            return Err(AgentError::CompletionDenied);
+        if entry.info.state == AgentState::Cancelled {
+            return Err(AgentError::Cancelled);
         }
-        let correct = code.len() == COMPLETION_KEY_LEN
-            && entry
-                .completion_code
-                .as_bytes()
-                .ct_eq(code.as_bytes())
-                .unwrap_u8()
-                == 1;
-        if !correct {
-            entry.completion_failures = entry.completion_failures.saturating_add(1);
-            return Err(AgentError::CompletionDenied);
-        }
+        entry.completion_claimed = false;
         entry.info.state = AgentState::Completed;
-        entry.info.error = None;
-        entry.info.result = Some(AgentOutput {
-            raw_response: result.to_owned(),
-            untrusted: true,
-            applied_to_workspace: false,
-        });
-        entry.pending_prompt.clear();
-        entry.completion_code.clear();
         entry.updates.send_replace(entry.info.clone());
         Ok(AgentCompletionAck {
             id: entry.info.id.clone(),
-            state: entry.info.state,
+            state: AgentState::Completed,
         })
     }
 
@@ -1106,6 +1134,108 @@ mod tests {
             manager.resume(&info.id, true).await,
             Err(AgentError::NotWaiting)
         ));
+    }
+
+    struct DelayedCompleteBackend {
+        sending: tokio::sync::Notify,
+        completing: tokio::sync::Notify,
+        release_complete: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl AgentBackend for DelayedCompleteBackend {
+        fn name(&self) -> &'static str {
+            "delayed-complete"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            _id: &str,
+            _prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            self.sending.notify_one();
+            std::future::pending().await
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn complete(&self, _id: &str) {
+            self.completing.notify_one();
+            self.release_complete.notified().await;
+        }
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_callback_blocks_new_messages_until_backend_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(DelayedCompleteBackend {
+            sending: tokio::sync::Notify::new(),
+            completing: tokio::sync::Notify::new(),
+            release_complete: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+            backend.clone(),
+        );
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "review implementation".into(),
+                role: AgentRole::Reviewer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .unwrap();
+        backend.sending.notified().await;
+        let code = manager
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(&info.id)
+            .unwrap()
+            .completion_code
+            .clone();
+        let worker = manager.clone();
+        let id = info.id.clone();
+        let callback =
+            tokio::spawn(async move { worker.finished(&id, &code, "callback result").await });
+        backend.completing.notified().await;
+        assert!(matches!(
+            manager.message(&info.id, "next task").await,
+            Err(AgentError::Busy)
+        ));
+        assert!(matches!(
+            manager.result(&info.id).await.unwrap().state,
+            AgentState::Running
+        ));
+        backend.release_complete.notify_one();
+        assert_eq!(
+            callback.await.unwrap().unwrap().state,
+            AgentState::Completed
+        );
+        assert_eq!(
+            manager
+                .result(&info.id)
+                .await
+                .unwrap()
+                .result
+                .unwrap()
+                .raw_response,
+            "callback result"
+        );
+        assert_eq!(
+            manager.message(&info.id, "next task").await.unwrap().state,
+            AgentState::Running
+        );
+        backend.sending.notified().await;
     }
 
     #[tokio::test]

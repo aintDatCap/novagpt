@@ -29,6 +29,10 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const HOME: &str = "https://chatgpt.com/";
 const BROWSE_TAB: &str = "browse-main";
 const MAX_BROWSE_TEXT: usize = 20_000;
+const MAX_SCREENSHOT_BASE64: usize = 8 * 1024 * 1024;
+const MAX_SELECTOR: usize = 512;
+const MAX_INPUT_TEXT: usize = 16_000;
+const MAX_DEV_EVENTS: usize = 80;
 // Match textbox-first discovery, but require a real visible,
 // editable element before typing. A matching wrapper is not a composer.
 const COMPOSER_SELECTORS: &[&str] = &[
@@ -113,6 +117,10 @@ pub enum BrowserError {
     ProfileBusy,
     #[error("Browser navigation requires a public HTTPS URL with no credentials or custom port")]
     UnsafeUrl,
+    #[error("Browser control is invalid, hidden, disabled or unavailable")]
+    InvalidControl,
+    #[error("Development origin must be an explicit loopback HTTP origin with a port")]
+    InvalidDevOrigin,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -135,6 +143,53 @@ pub struct BrowsedPage {
     pub text: String,
 }
 
+/// Screenshot data is only returned as an MCP image block, never as a text log.
+#[derive(Clone, Debug)]
+pub struct BrowserScreenshot {
+    pub png_base64: String,
+    pub url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct BrowserControl {
+    pub tag: String,
+    pub label: String,
+    pub selector: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct BrowserInspection {
+    pub url: String,
+    pub title: String,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub document_width: u32,
+    pub broken_images: usize,
+    pub headings: Vec<String>,
+    pub controls: Vec<BrowserControl>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowserConsoleEntry {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowserConsole {
+    pub url: String,
+    pub entries: Vec<BrowserConsoleEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowserViewport {
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BrowserReply {
     pub content: String,
@@ -146,10 +201,12 @@ struct Page {
     socket: Mutex<Socket>,
     next_command: AtomicU64,
     cancelled: AtomicBool,
+    send_lock: Mutex<()>,
     pending_before: Mutex<Option<usize>>,
     manual: Mutex<Option<String>>,
     recent_events: Mutex<VecDeque<String>>,
     previous_state: Mutex<Option<String>>,
+    console: Mutex<VecDeque<BrowserConsoleEntry>>,
     reporter: Option<DiagnosticReporter>,
 }
 impl Page {
@@ -220,6 +277,13 @@ impl Page {
                 if let Message::Text(text) = message {
                     let response: Value =
                         serde_json::from_str(&text).map_err(|_| BrowserError::Protocol)?;
+                    if let Some(entry) = browser_event(&response) {
+                        let mut entries = self.console.lock().await;
+                        if entries.len() == MAX_DEV_EVENTS {
+                            entries.pop_front();
+                        }
+                        entries.push_back(entry);
+                    }
                     if response["id"].as_u64() == Some(id) {
                         if response.get("error").is_some() {
                             // Never print the CDP error payload or original
@@ -261,6 +325,7 @@ impl Page {
 struct Inner {
     executable: PathBuf,
     profile: PathBuf,
+    dev_origin: Option<reqwest::Url>,
     process: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
     profile_lease: Mutex<Option<ProfileLease>>,
@@ -311,6 +376,7 @@ impl ChatGptBrowser {
             inner: Arc::new(Inner {
                 executable,
                 profile,
+                dev_origin: None,
                 process: Mutex::new(None),
                 port: Mutex::new(None),
                 profile_lease: Mutex::new(None),
@@ -325,6 +391,38 @@ impl ChatGptBrowser {
                 reporter: None,
             }),
         })
+    }
+
+    /// Opt in to one exact local HTTP origin for live web development.
+    /// This permission is never inferred from a page, prompt or redirect.
+    pub fn with_dev_origin(mut self, origin: &str) -> Result<Self, BrowserError> {
+        let approved = local_dev_origin(origin)?;
+        let inner = Arc::get_mut(&mut self.inner).ok_or(BrowserError::Protocol)?;
+        inner.dev_origin = Some(approved);
+        Ok(self)
+    }
+
+    fn approved_url(&self, input: &str) -> Result<reqwest::Url, BrowserError> {
+        if let Ok(url) = public_https_url(input) {
+            return Ok(url);
+        }
+        let url = reqwest::Url::parse(input).map_err(|_| BrowserError::UnsafeUrl)?;
+        if input.len() > 2048
+            || input.bytes().any(|b| b.is_ascii_control())
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(BrowserError::UnsafeUrl);
+        }
+        if self
+            .inner
+            .dev_origin
+            .as_ref()
+            .is_some_and(|origin| url.origin() == origin.origin())
+        {
+            return Ok(url);
+        }
+        Err(BrowserError::UnsafeUrl)
     }
 
     /// Forward redacted browser lifecycle steps to an embedding UI (e.g. the
@@ -511,14 +609,22 @@ impl ChatGptBrowser {
             socket: Mutex::new(socket),
             next_command: AtomicU64::new(1),
             cancelled: AtomicBool::new(false),
+            send_lock: Mutex::new(()),
             pending_before: Mutex::new(None),
             manual: Mutex::new(None),
             recent_events: Mutex::new(VecDeque::new()),
             previous_state: Mutex::new(None),
+            console: Mutex::new(VecDeque::new()),
             reporter: self.inner.reporter.clone(),
         });
         page.diagnostic("tab_opened", "").await;
         page.command("Runtime.enable", json!({})).await?;
+        if id == BROWSE_TAB {
+            // Capture only bounded console and failed-request metadata.
+            // These events are kept in memory, never in persistent audit logs.
+            page.command("Log.enable", json!({})).await?;
+            page.command("Network.enable", json!({})).await?;
+        }
         self.inner.pages.lock().await.insert(id.to_owned(), page);
         sleep(self.inner.start_interval).await;
         Ok(())
@@ -541,7 +647,7 @@ impl ChatGptBrowser {
     /// Navigate the dedicated browsing tab. No arbitrary JavaScript is accepted
     /// through MCP. Subagent pages and their conversations are unaffected.
     pub async fn browse_navigate(&self, url: &str) -> Result<BrowsedPage, BrowserError> {
-        let target = public_https_url(url)?;
+        let target = self.approved_url(url)?;
         let page = self.page(BROWSE_TAB).await?;
         let previous = page
             .eval("location.href")
@@ -550,6 +656,9 @@ impl ChatGptBrowser {
             .unwrap_or("")
             .to_owned();
         page.command("Page.enable", json!({})).await?;
+        // Diagnostics from a previous browsing destination must not be
+        // mistaken for errors produced by the next website.
+        page.console.lock().await.clear();
         let navigation = page
             .command("Page.navigate", json!({"url":target.as_str()}))
             .await?;
@@ -567,7 +676,7 @@ impl ChatGptBrowser {
                         && (current != previous || current == target.as_str())
                         && state["ready"] != "loading"
                     {
-                        public_https_url(current)?;
+                        self.approved_url(current)?;
                         return self.browse_read().await;
                     }
                 }
@@ -589,7 +698,7 @@ impl ChatGptBrowser {
             .eval("(() => ({url:location.href,title:document.title,text:(document.body?.innerText || '').slice(0,20000)}))()")
             .await?;
         let url = value["url"].as_str().ok_or(BrowserError::Protocol)?;
-        public_https_url(url)?;
+        self.approved_url(url)?;
         let title = value["title"]
             .as_str()
             .unwrap_or("")
@@ -606,6 +715,215 @@ impl ChatGptBrowser {
             url: url.to_owned(),
             title,
             text,
+        })
+    }
+
+    /// Inspect a bounded set of visible elements and common layout problems.
+    /// This returns page data, not executable JavaScript or hidden DOM.
+    pub async fn browse_inspect(&self) -> Result<BrowserInspection, BrowserError> {
+        let page = self.page(BROWSE_TAB).await?;
+        let value = page.eval(r#"(() => {
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                    s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            const short = s => String(s || '').trim().slice(0, 160);
+            const controls = [...document.querySelectorAll('button, a, input, textarea, select, [role="button"]')]
+                .filter(visible).slice(0, 60).map(el => {
+                    const testid = el.getAttribute('data-testid');
+                    const selector = el.id ? '#' + CSS.escape(el.id) :
+                        testid ? '[data-testid=' + JSON.stringify(testid) + ']' : null;
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        label: short(el.getAttribute('aria-label') || el.innerText ||
+                            el.getAttribute('placeholder') || el.getAttribute('type')),
+                        selector
+                    };
+                });
+            return {
+                url: location.href,
+                title: short(document.title),
+                viewport_width: innerWidth,
+                viewport_height: innerHeight,
+                document_width: document.documentElement.scrollWidth,
+                broken_images: [...document.images].filter(img => !img.complete || img.naturalWidth === 0).length,
+                headings: [...document.querySelectorAll('h1,h2,h3')]
+                    .filter(visible).slice(0, 40).map(el => short(el.innerText)),
+                controls
+            };
+        })()"#).await?;
+        let url = value["url"].as_str().ok_or(BrowserError::Protocol)?;
+        self.approved_url(url)?;
+        serde_json::from_value(value).map_err(|_| BrowserError::Protocol)
+    }
+
+    /// Capture the visible viewport only (not a full-page or private offscreen dump).
+    /// The MCP adapter renders the returned PNG as an actual image content block.
+    pub async fn browse_screenshot(&self) -> Result<BrowserScreenshot, BrowserError> {
+        let page = self.page(BROWSE_TAB).await?;
+        let before = page
+            .eval("({url:location.href,width:innerWidth,height:innerHeight})")
+            .await?;
+        let url = before["url"].as_str().ok_or(BrowserError::Protocol)?;
+        self.approved_url(url)?;
+        page.command("Page.enable", json!({})).await?;
+        let screenshot = page
+            .command(
+                "Page.captureScreenshot",
+                json!({"format":"png","captureBeyondViewport":false,"fromSurface":true}),
+            )
+            .await?;
+        let data = screenshot["data"].as_str().ok_or(BrowserError::Protocol)?;
+        if data.len() > MAX_SCREENSHOT_BASE64 {
+            return Err(BrowserError::TooLarge);
+        }
+        // A page can navigate during capture: never return content from an
+        // unapproved redirect, even when the original page was approved.
+        let after = page.eval("location.href").await?;
+        let final_url = after.as_str().ok_or(BrowserError::Protocol)?;
+        self.approved_url(final_url)?;
+        if url != final_url {
+            return Err(BrowserError::Unavailable);
+        }
+        Ok(BrowserScreenshot {
+            png_base64: data.to_owned(),
+            url: url.to_owned(),
+            width: before["width"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
+            height: before["height"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
+        })
+    }
+
+    /// Emulate a desktop viewport to test responsive layouts. Dimensions and
+    /// scale are bounded to avoid excessive image/memory allocations.
+    pub async fn browse_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> Result<BrowserViewport, BrowserError> {
+        if !(320..=2560).contains(&width)
+            || !(240..=1800).contains(&height)
+            || !device_scale_factor.is_finite()
+            || !(1.0..=3.0).contains(&device_scale_factor)
+            || width as f64 * height as f64 * device_scale_factor.powi(2) > 10_000_000.0
+        {
+            return Err(BrowserError::InvalidControl);
+        }
+        let page = self.page(BROWSE_TAB).await?;
+        let location = page.eval("location.href").await?;
+        self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
+        page.command(
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width":width, "height":height,
+                "deviceScaleFactor":device_scale_factor, "mobile":false
+            }),
+        )
+        .await?;
+        Ok(BrowserViewport {
+            width,
+            height,
+            device_scale_factor,
+        })
+    }
+
+    /// Click a visible, unobscured element using a real CDP mouse event.
+    pub async fn browse_click(&self, selector: &str) -> Result<bool, BrowserError> {
+        validate_selector(selector)?;
+        let page = self.page(BROWSE_TAB).await?;
+        let location = page.eval("location.href").await?;
+        self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
+        let expression = format!(
+            r#"(() => {{
+            let el;
+            try {{ el = document.querySelector({selector}); }} catch {{ return null; }}
+            if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return null;
+            const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+            if (r.width <= 0 || r.height <= 0 || s.display === 'none' ||
+                s.visibility === 'hidden') return null;
+            const x = Math.max(0, Math.min(innerWidth - 1, r.left + r.width / 2));
+            const y = Math.max(0, Math.min(innerHeight - 1, r.top + r.height / 2));
+            if (x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
+            const hit = document.elementFromPoint(x, y);
+            if (!hit || !(el === hit || el.contains(hit))) return null;
+            return {{x,y,href: el.closest('a[href]')?.href || null}};
+        }})()"#,
+            selector = json!(selector)
+        );
+        let point = page.eval(&expression).await?;
+        if let Some(href) = point["href"].as_str() {
+            self.approved_url(href)?;
+        }
+        let (Some(x), Some(y)) = (point["x"].as_f64(), point["y"].as_f64()) else {
+            return Err(BrowserError::InvalidControl);
+        };
+        for kind in ["mousePressed", "mouseReleased"] {
+            page.command(
+                "Input.dispatchMouseEvent",
+                json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1}),
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    /// Type into a visible editable web form field; never fill passwords or
+    /// file inputs. Authentication and verification remain entirely manual.
+    pub async fn browse_type(&self, selector: &str, text: &str) -> Result<bool, BrowserError> {
+        validate_selector(selector)?;
+        if text.is_empty() || text.len() > MAX_INPUT_TEXT {
+            return Err(BrowserError::InvalidControl);
+        }
+        let page = self.page(BROWSE_TAB).await?;
+        let location = page.eval("location.href").await?;
+        self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
+        let expression = format!(
+            r#"(() => {{
+            let el;
+            try {{ el = document.querySelector({selector}); }} catch {{ return false; }}
+            if (!el || el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true') return false;
+            const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+            if (r.width <= 0 || r.height <= 0 || s.display === 'none' || s.visibility === 'hidden')
+                return false;
+            const tag = el.tagName.toLowerCase();
+            if (tag === 'input' && !['text','search','email','url','tel','number'].includes(el.type))
+                return false;
+            if (tag !== 'input' && tag !== 'textarea' && !el.isContentEditable) return false;
+            el.focus();
+            if (tag === 'input' || tag === 'textarea') el.select();
+            else {{
+                const selection = getSelection(), range = document.createRange();
+                range.selectNodeContents(el);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }}
+            return document.activeElement === el;
+        }})()"#,
+            selector = json!(selector)
+        );
+        if page.eval(&expression).await? != Value::Bool(true) {
+            return Err(BrowserError::InvalidControl);
+        }
+        page.command("Input.insertText", json!({"text":text}))
+            .await?;
+        Ok(true)
+    }
+
+    /// Read recent console messages, JavaScript exceptions and HTTP/network
+    /// failures captured from the browsing tab. Stored only in process memory.
+    pub async fn browse_console(&self) -> Result<BrowserConsole, BrowserError> {
+        let page = self.page(BROWSE_TAB).await?;
+        // The evaluate command also drains queued CDP events. Its result is
+        // validated so redirects to private/internal origins cannot be read.
+        let location = page.eval("location.href").await?;
+        let url = location.as_str().ok_or(BrowserError::Protocol)?;
+        self.approved_url(url)?;
+        let entries = page.console.lock().await.iter().cloned().collect();
+        Ok(BrowserConsole {
+            url: url.to_owned(),
+            entries,
         })
     }
 
@@ -673,6 +991,9 @@ impl ChatGptBrowser {
             return Err(BrowserError::TooLarge);
         }
         let page = self.page(id).await?;
+        // The old CDP poller must leave before a new prompt resets its
+        // cancellation flag or reuses the per-tab pending response state.
+        let _send_guard = page.send_lock.lock().await;
         page.cancelled.store(false, Ordering::Relaxed);
         page.diagnostic("send_started", "").await;
         // A new Chrome target may still be navigating when the first worker
@@ -917,6 +1238,16 @@ impl ChatGptBrowser {
         page.eval(&expression).await
     }
 
+    /// A completion callback already contains the trusted-by-transport but
+    /// unverified agent result. Stop the old poller without clicking ChatGPT's
+    /// Stop button or destroying its visible conversation tab.
+    pub async fn complete(&self, id: &str) -> Result<(), BrowserError> {
+        let page = self.page(id).await?;
+        page.cancelled.store(true, Ordering::Relaxed);
+        *page.pending_before.lock().await = None;
+        Ok(())
+    }
+
     pub async fn cancel(&self, id: &str) -> Result<(), BrowserError> {
         let page = self.page(id).await?;
         page.cancelled.store(true, Ordering::Relaxed);
@@ -947,6 +1278,27 @@ impl ChatGptBrowser {
 /// Restrict automated browsing to ordinary public HTTPS hostnames. Avoid
 /// local services, raw IP addresses, embedded credentials and custom ports.
 /// DNS names still require network-layer restrictions against rebinding.
+/// A loopback origin requires an explicit startup opt-in, never a page-level
+/// request. Require its exact scheme/host/port; path and query are forbidden.
+fn local_dev_origin(input: &str) -> Result<reqwest::Url, BrowserError> {
+    if input.len() > 200 || input.bytes().any(|b| b.is_ascii_control()) {
+        return Err(BrowserError::InvalidDevOrigin);
+    }
+    let url = reqwest::Url::parse(input).map_err(|_| BrowserError::InvalidDevOrigin)?;
+    if url.scheme() != "http"
+        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(BrowserError::InvalidDevOrigin);
+    }
+    Ok(url)
+}
+
 fn public_https_url(input: &str) -> Result<reqwest::Url, BrowserError> {
     if input.len() > 2048 || input.bytes().any(|b| b.is_ascii_control()) {
         return Err(BrowserError::UnsafeUrl);
@@ -973,6 +1325,80 @@ fn public_https_url(input: &str) -> Result<reqwest::Url, BrowserError> {
         return Err(BrowserError::UnsafeUrl);
     }
     Ok(url)
+}
+
+/// Retain only bounded diagnostics from the dedicated browsing target.
+fn browser_event(event: &Value) -> Option<BrowserConsoleEntry> {
+    let (kind, message) = match event["method"].as_str()? {
+        "Runtime.consoleAPICalled" => {
+            let kind = event["params"]["type"].as_str().unwrap_or("console");
+            let message = event["params"]["args"]
+                .as_array()?
+                .iter()
+                .take(4)
+                .filter_map(|arg| {
+                    arg["value"]
+                        .as_str()
+                        .or_else(|| arg["description"].as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            (kind.to_owned(), message)
+        }
+        "Runtime.exceptionThrown" => (
+            "exception".to_owned(),
+            event["params"]["exceptionDetails"]["text"]
+                .as_str()
+                .unwrap_or("Uncaught exception")
+                .to_owned(),
+        ),
+        "Log.entryAdded" => (
+            event["params"]["entry"]["level"]
+                .as_str()
+                .unwrap_or("log")
+                .to_owned(),
+            event["params"]["entry"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        "Network.loadingFailed" => (
+            "network_error".to_owned(),
+            event["params"]["errorText"]
+                .as_str()
+                .unwrap_or("Request failed")
+                .to_owned(),
+        ),
+        "Network.responseReceived" => {
+            let status = event["params"]["response"]["status"].as_u64()?;
+            if status < 400 {
+                return None;
+            }
+            let resource = event["params"]["type"].as_str().unwrap_or("Other");
+            (
+                "http_error".to_owned(),
+                format!("HTTP {status} ({resource})"),
+            )
+        }
+        _ => return None,
+    };
+    if message.is_empty() {
+        return None;
+    }
+    Some(BrowserConsoleEntry {
+        kind: kind.chars().take(32).collect(),
+        message: message.chars().take(300).collect(),
+    })
+}
+
+fn validate_selector(selector: &str) -> Result<(), BrowserError> {
+    if selector.trim().is_empty()
+        || selector.len() > MAX_SELECTOR
+        || selector.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(BrowserError::InvalidControl);
+    }
+    Ok(())
 }
 
 fn safe_id(id: &str) -> bool {
@@ -1183,10 +1609,12 @@ mod tests {
                 socket: Mutex::new(socket),
                 next_command: AtomicU64::new(1),
                 cancelled: AtomicBool::new(false),
+                send_lock: Mutex::new(()),
                 pending_before: Mutex::new(None),
                 manual: Mutex::new(None),
                 recent_events: Mutex::new(VecDeque::new()),
                 previous_state: Mutex::new(None),
+                console: Mutex::new(VecDeque::new()),
                 reporter: None,
             }),
         );
@@ -1274,6 +1702,208 @@ mod tests {
             assert!(public_https_url(denied).is_err(), "{denied}");
         }
     }
+    #[test]
+    fn explicit_local_dev_origin_is_exact_and_never_inferred() {
+        let executable = tempfile::NamedTempFile::new().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let browser = ChatGptBrowser::new(executable.path(), root.path().join("profile")).unwrap();
+        assert!(browser.approved_url("https://example.org/app").is_ok());
+        assert!(browser.approved_url("http://127.0.0.1:3000/").is_err());
+        for invalid in [
+            "http://192.168.1.5:3000",
+            "http://localhost",
+            "https://localhost:3000",
+            "http://localhost:3000/secret",
+            "http://localhost:3000/?key=secret",
+            "http://user:password@localhost:3000",
+            "http://localhost:3000#fragment",
+        ] {
+            assert!(local_dev_origin(invalid).is_err(), "{invalid}");
+        }
+        let browser = browser.with_dev_origin("http://127.0.0.1:3000").unwrap();
+        for allowed in [
+            "http://127.0.0.1:3000/",
+            "http://127.0.0.1:3000/dashboard?tab=1",
+        ] {
+            assert!(browser.approved_url(allowed).is_ok(), "{allowed}");
+        }
+        for denied in [
+            "http://127.0.0.1:3001/",
+            "http://localhost:3000/",
+            "http://127.0.0.2:3000/",
+            "http://169.254.169.254:3000/",
+            "http://user:secret@127.0.0.1:3000/",
+            "file:///etc/passwd",
+        ] {
+            assert!(browser.approved_url(denied).is_err(), "{denied}");
+        }
+        for invalid in ["", "   ", "\n", &"a".repeat(513)] {
+            assert!(validate_selector(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn console_entries_are_bounded_and_do_not_record_request_urls() {
+        let secret_url = "https://example.org/api?token=sensitive";
+        let entry = browser_event(&json!({
+            "method":"Network.responseReceived",
+            "params":{"response":{"status":404,"url":secret_url},"type":"XHR"}
+        }))
+        .unwrap();
+        assert_eq!(entry.kind, "http_error");
+        assert_eq!(entry.message, "HTTP 404 (XHR)");
+        assert!(!entry.message.contains(secret_url));
+        let long = "x".repeat(1000);
+        let entry = browser_event(&json!({
+            "method":"Runtime.consoleAPICalled",
+            "params":{"type":"error","args":[{"value":long}]}
+        }))
+        .unwrap();
+        assert_eq!(entry.kind, "error");
+        assert_eq!(entry.message.len(), 300);
+        assert!(browser_event(&json!({"method":"Network.requestWillBeSent"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn browsing_tools_use_cdp_and_return_viewable_image_without_real_chrome() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut screenshot_requested = false;
+            let mut typed = false;
+            let mut clicked = 0;
+            while let Some(Ok(Message::Text(raw))) = socket.next().await {
+                let request: Value = serde_json::from_str(&raw).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "Runtime.evaluate" => {
+                        let expr = request["params"]["expression"].as_str().unwrap();
+                        let value = if expr.contains("broken_images:") {
+                            json!({"url":"https://example.org/app","title":"Fixture",
+                                "viewport_width":800,"viewport_height":600,
+                                "document_width":801,"broken_images":1,
+                                "headings":["Fixture heading"],
+                                "controls":[{"tag":"button","label":"Save","selector":"#save"}]})
+                        } else if expr.contains("url:location.href,width:innerWidth") {
+                            json!({"url":"https://example.org/app","width":800,"height":600})
+                        } else if expr.contains("elementFromPoint") {
+                            json!({"x":55.0,"y":30.0,"href":null})
+                        } else if expr.contains("document.activeElement === el") {
+                            json!(true)
+                        } else {
+                            json!("https://example.org/app")
+                        };
+                        if expr == "location.href" {
+                            socket.send(Message::Text(json!({
+                                "method":"Runtime.consoleAPICalled",
+                                "params":{"type":"warning","args":[{"value":"fixture warning"}]}
+                            }).to_string().into())).await.unwrap();
+                        }
+                        json!({"result":{"value":value}})
+                    }
+                    "Page.captureScreenshot" => {
+                        assert_eq!(request["params"]["captureBeyondViewport"], false);
+                        screenshot_requested = true;
+                        json!({"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XvCuXwAAAABJRU5ErkJggg=="})
+                    }
+                    "Emulation.setDeviceMetricsOverride" => {
+                        assert_eq!(request["params"]["width"], 800);
+                        json!({})
+                    }
+                    "Input.insertText" => {
+                        typed = request["params"]["text"] == "fixture text";
+                        json!({})
+                    }
+                    "Input.dispatchMouseEvent" => {
+                        clicked += 1;
+                        json!({})
+                    }
+                    "Page.enable" => json!({}),
+                    other => panic!("unexpected CDP method: {other}"),
+                };
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "id":request["id"],"result":result
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            (screenshot_requested, typed, clicked)
+        });
+        let (socket, _) = connect_async(format!("ws://{address}/")).await.unwrap();
+        let executable = tempfile::NamedTempFile::new().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let browser =
+            ChatGptBrowser::new(executable.path(), profile.path().join("profile")).unwrap();
+        browser.inner.pages.lock().await.insert(
+            BROWSE_TAB.into(),
+            Arc::new(Page {
+                target_id: "abcdef".into(),
+                socket: Mutex::new(socket),
+                next_command: AtomicU64::new(1),
+                cancelled: AtomicBool::new(false),
+                send_lock: Mutex::new(()),
+                pending_before: Mutex::new(None),
+                manual: Mutex::new(None),
+                recent_events: Mutex::new(VecDeque::new()),
+                previous_state: Mutex::new(None),
+                console: Mutex::new(VecDeque::new()),
+                reporter: None,
+            }),
+        );
+
+        assert!(matches!(
+            browser.browse_viewport(100, 600, 1.0).await,
+            Err(BrowserError::InvalidControl)
+        ));
+        assert!(matches!(
+            browser.browse_viewport(2560, 1800, 3.0).await,
+            Err(BrowserError::InvalidControl)
+        ));
+        assert!(matches!(
+            browser.browse_viewport(800, 600, f64::NAN).await,
+            Err(BrowserError::InvalidControl)
+        ));
+        let viewport = browser.browse_viewport(800, 600, 2.0).await.unwrap();
+        assert_eq!(viewport.width, 800);
+        let inspection = browser.browse_inspect().await.unwrap();
+        assert_eq!(inspection.broken_images, 1);
+        assert_eq!(inspection.controls[0].selector.as_deref(), Some("#save"));
+        assert_eq!(inspection.document_width, 801);
+
+        assert!(browser.browse_click("#save").await.unwrap());
+        assert!(
+            browser
+                .browse_type("#search", "fixture text")
+                .await
+                .unwrap()
+        );
+        let screenshot = browser.browse_screenshot().await.unwrap();
+        assert!(screenshot.png_base64.starts_with("iVBORw0KGgo"));
+        assert_eq!(screenshot.width, 800);
+        assert_eq!(screenshot.url, "https://example.org/app");
+        let console = browser.browse_console().await.unwrap();
+        assert!(
+            console
+                .entries
+                .iter()
+                .any(|entry| entry.message == "fixture warning")
+        );
+        drop(browser);
+        let (captured, inserted, clicks) = tokio::time::timeout(Duration::from_secs(3), fixture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(captured && inserted);
+        assert_eq!(clicks, 2);
+    }
+
     #[test]
     fn id_validation_is_safe() {
         assert!(safe_id("agent-abcdef01"));

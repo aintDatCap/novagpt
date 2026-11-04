@@ -51,6 +51,10 @@ struct Cli {
     /// Dedicated browser profile path; never reuse a personal browser profile.
     #[arg(long)]
     chatgpt_profile: Option<PathBuf>,
+    /// Optionally allow this exact loopback HTTP origin for local web development.
+    /// Example: http://127.0.0.1:3000 (not an arbitrary LAN/private host).
+    #[arg(long)]
+    browser_dev_origin: Option<String>,
     /// Opt in to an already-running, separate local Chrome CDP endpoint; never uses the ChatGPT subagent Chrome.
     #[arg(long, requires = "browser_bridge_origin")]
     browser_bridge_port: Option<u16>,
@@ -397,7 +401,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let vm = vm_home.map(VmManager::new).transpose()?;
     let browser_enabled = local.browser_enabled;
-    let requested_browser = browser_enabled || cli.chatgpt_chrome.is_some();
+    let requested_browser = browser_enabled
+        || cli.chatgpt_chrome.is_some()
+        || cli.chatgpt_profile.is_some()
+        || cli.browser_dev_origin.is_some();
     let configured_chrome = cli
         .chatgpt_chrome
         .or_else(|| std::env::var_os("NOVAGPT_CHROME_PATH").map(PathBuf::from))
@@ -409,11 +416,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let profile = match cli.chatgpt_profile {
         Some(path) => Some(path),
-        None if browser_enabled => Some(settings::global_dir()?.join("browser")),
+        // Reuse the profile from `browser-login` even when Chrome was enabled
+        // by an explicit --chatgpt-chrome flag rather than local settings.
+        None if requested_browser => Some(settings::global_dir()?.join("browser")),
         None => None,
     };
     let browser = match (chrome, profile) {
-        (Some(executable), Some(profile)) => Some(ChatGptBrowser::new(executable, profile)?),
+        (Some(executable), Some(profile)) => {
+            let browser = ChatGptBrowser::new(executable, profile)?;
+            Some(match cli.browser_dev_origin.as_deref() {
+                Some(origin) => browser.with_dev_origin(origin)?,
+                None => browser,
+            })
+        }
         (None, None) => None,
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
     };

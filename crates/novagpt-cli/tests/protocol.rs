@@ -218,6 +218,12 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "browser_open",
         "browser_navigate",
         "browser_read",
+        "browser_screenshot",
+        "browser_inspect",
+        "browser_viewport",
+        "browser_click",
+        "browser_type",
+        "browser_console",
         "browser_close",
         "subagent_spawn",
         "subagent_message",
@@ -234,7 +240,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 45);
+    assert_eq!(listed.len(), 51);
     assert_eq!(by_id(13)["result"]["isError"], true);
     assert_eq!(by_id(14)["result"]["isError"], true);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");

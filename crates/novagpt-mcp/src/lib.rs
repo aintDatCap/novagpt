@@ -365,6 +365,31 @@ struct BrowserNavigateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserViewportArgs {
+    /// Viewport width in CSS pixels (320–2560).
+    width: u32,
+    /// Viewport height in CSS pixels (240–1800).
+    height: u32,
+    /// Device pixel ratio (1–3, defaults to 1).
+    #[serde(default)]
+    device_scale_factor: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserElementArgs {
+    /// CSS selector for a visible element on the dedicated browsing tab.
+    selector: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BrowserTypeArgs {
+    /// CSS selector for a visible, non-password editable field.
+    selector: String,
+    /// Text to insert into the selected field (replaces its current content).
+    text: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentSpawnArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -998,6 +1023,132 @@ impl NovaMcp {
             ))),
         };
         self.observed("browser_read", result)
+    }
+
+    #[tool(
+        description = "Capture the visible viewport of the dedicated Chrome tab as an actual PNG image the agent can view. Requires browser_open; checks the public HTTPS origin and limits image size."
+    )]
+    async fn browser_screenshot(&self) -> CallToolResult {
+        let result = match &self.extras.browser {
+            Some(browser) => browser.browse_screenshot().await,
+            None => {
+                return self.observed(
+                    "browser_screenshot",
+                    tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+                    ))),
+                );
+            }
+        };
+        let reply = match result {
+            Ok(screenshot) => {
+                let decoded =
+                    base64::engine::general_purpose::STANDARD.decode(&screenshot.png_base64);
+                match decoded {
+                    Ok(bytes)
+                        if bytes.len() <= 6 * 1024 * 1024
+                            && bytes.starts_with(b"\x89PNG\r\n\x1a\n") =>
+                    {
+                        let mut response = CallToolResult::success(vec![ContentBlock::image(
+                            screenshot.png_base64,
+                            "image/png",
+                        )]);
+                        response.structured_content = Some(serde_json::json!({
+                            "url": screenshot.url,
+                            "width": screenshot.width,
+                            "height": screenshot.height,
+                            "mime_type": "image/png",
+                            "bytes": bytes.len()
+                        }));
+                        response
+                    }
+                    _ => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "Browser screenshot was invalid or too large".into(),
+                    ))),
+                }
+            }
+            Err(error) => external_reply::<(), _>(Err(error)),
+        };
+        self.observed("browser_screenshot", reply)
+    }
+
+    #[tool(
+        description = "Inspect visible headings, interactive elements, selectors, broken images and horizontal overflow for web development; no arbitrary JavaScript or hidden DOM."
+    )]
+    async fn browser_inspect(&self) -> CallToolResult {
+        let reply = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_inspect().await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_inspect", reply)
+    }
+
+    #[tool(
+        description = "Set a bounded responsive desktop viewport on the dedicated browser tab (width 320–2560, height 240–1800, device_scale_factor 1–3)."
+    )]
+    async fn browser_viewport(
+        &self,
+        Parameters(args): Parameters<BrowserViewportArgs>,
+    ) -> CallToolResult {
+        let reply = match &self.extras.browser {
+            Some(browser) => external_reply(
+                browser
+                    .browse_viewport(
+                        args.width,
+                        args.height,
+                        args.device_scale_factor.unwrap_or(1.0),
+                    )
+                    .await,
+            ),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_viewport", reply)
+    }
+
+    #[tool(
+        description = "Click a visible, unobscured element using a CSS selector and Chrome mouse events. Use only on sites/actions authorized by the user; may submit forms."
+    )]
+    async fn browser_click(
+        &self,
+        Parameters(args): Parameters<BrowserElementArgs>,
+    ) -> CallToolResult {
+        let reply = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_click(&args.selector).await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_click", reply)
+    }
+
+    #[tool(
+        description = "Replace text in a visible editable CSS-selected field with Chrome input events; password and file fields are forbidden. Authentication stays manual."
+    )]
+    async fn browser_type(&self, Parameters(args): Parameters<BrowserTypeArgs>) -> CallToolResult {
+        let reply = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_type(&args.selector, &args.text).await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_type", reply)
+    }
+
+    #[tool(
+        description = "Read bounded in-memory JavaScript console messages, exceptions, HTTP error statuses and failed network requests from the dedicated browsing tab. No cookies or request bodies."
+    )]
+    async fn browser_console(&self) -> CallToolResult {
+        let reply = match &self.extras.browser {
+            Some(browser) => external_reply(browser.browse_console().await),
+            None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Dedicated Chrome disabled; enable ChatGPT Browser at startup".into(),
+            ))),
+        };
+        self.observed("browser_console", reply)
     }
 
     #[tool(

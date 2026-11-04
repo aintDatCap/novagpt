@@ -15,7 +15,7 @@ This document tracks observable NovaGPT functionality and test coverage. Statuse
 | TUI setup, language, settings and auto-start | IMPLEMENTED | UI-model tests cover default Automatic locale, English fallback, explicit save, opt-in normal startup, no startup during setup |
 | ngrok installation consent | IMPLEMENTED / PARTIAL | TUI confirmation tests and deterministic package-manager selection; platform installers still need interactive OS tests |
 | HTTP token management, private audit | IMPLEMENTED / PARTIAL | Token migration/reuse, redaction and bounded log tests; platform ACL and abrupt-exit guarantees incomplete |
-| Browser and subagents | PARTIAL | CDP fixture tests; real sign-in and dynamic UI behavior need physical browser tests |
+| Browser and subagents | PARTIAL | 14 browser tests (mock CDP screenshot, inspect, input, viewport, console and origin denials); 10 agent tests (including completion/message race); MCP stdio tool registration passes. Live Chrome sign-in, persistence across process restarts and dynamic UI still need testing on an installed Chrome browser |
 | VM images and host controls | PARTIAL | Guarded image operations; real Hyper-V/QEMU deployment and guest APIs need platform validation |
 | Release packaging | PARTIAL | Installer and CI workflows exist; every platform still needs a published-release installation and upgrade smoke test |
 
