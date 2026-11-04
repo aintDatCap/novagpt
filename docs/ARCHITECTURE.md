@@ -1,58 +1,65 @@
-# NovaGPT architecture and migration decisions
+# NovaGPT architecture
 
-For normative extension rules see [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md), [EXTENSION_PLAYBOOK.md](EXTENSION_PLAYBOOK.md), [QUALITY_GATES.md](QUALITY_GATES.md), [VM_AND_SUBAGENTS.md](VM_AND_SUBAGENTS.md) and the [decision log](decisions/README.md). The independent project and optional VM/ChatGPT Browser choices are recorded in [ADR 0001](decisions/0001-independent-workspace-and-mcp-sdk.md) and [ADR 0002](decisions/0002-optional-vm-and-browser-agents.md).
+NovaGPT is an independent Rust MCP coding server. Product design, protocol support and release decisions belong to this repository; backward compatibility is not guaranteed for every change. See [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md), [EXTENSION_PLAYBOOK.md](EXTENSION_PLAYBOOK.md), and [QUALITY_GATES.md](QUALITY_GATES.md).
 
-**NovaGPT lives at `C:\Projects\novagpt`, separate from CodexPro.** No overwrite, rename or update-in-place of the TypeScript server, Node launcher or user profiles. CodexPro remains the compatibility oracle.
-
-## Technology decision
-
-The MCP layer uses the [official modelcontextprotocol/rust-sdk](https://github.com/modelcontextprotocol/rust-sdk), published as `rmcp`. This repository initially selects `rmcp = "3.7.0"`. The SDK supplies tool registration and serialization, stdio and Streamable HTTP; NovaGPT implements workspace policy itself instead of relying on transport-session identity.
-
-**Protocol warning:** `rmcp` 3.x implements the MCP 2026-07-28 stateless HTTP behavior for newly negotiated clients and legacy session support for earlier negotiated versions. CodexPro's current TypeScript transport uses stateful `Mcp-Session-Id` for its historical clients; prove compatibility, especially long-lived SSE and concurrent sessions, with differential tests before switching any client.
-
-## Crate dependency graph
+## Crate boundaries
 
 ```text
 novagpt-cli
   ├─ novagpt-mcp ── novagpt-core
   │    ├─ novagpt-vm
   │    └─ novagpt-agents ── novagpt-browser
-  ├─ novagpt-vm, novagpt-agents, novagpt-browser (composition)
+  ├─ novagpt-vm, novagpt-agents, novagpt-browser
   └─ novagpt-core
 ```
 
-- **novagpt-core:** workspace registry and root-derived IDs, guard/blocked paths, text reads, bounded tree/search, optimistic SHA-256 writes, initial guarded Git/command/patch/attachment import and raster-image read operations, per-file mutation locks and per-root async Git locks. Must never depend on MCP, HTTP or CLI.
-- **novagpt-mcp:** official rmcp adapters, tool schemas, result envelopes and HTTP/stdin transports. Stateless per-call workspace targeting with a shared registry; no chat IDs.
-- **novagpt-cli:** CLI parsing, one per-OS-user `NovaGPT/config.json` and a shared per-OS-user HTTP credential, local Ratatui 3-tab console, guided setup/explicit read-only CodexPro or other NovaGPT workspace connection-profile import, stdio and token-protected loopback HTTP. CLI-only ngrok exposure is experimental and strictly opt-in; the ngrok subprocess is owned by the HTTP launcher and its request inspector is disabled. HTTP handles Ctrl+C and (on Unix) SIGTERM through graceful shutdown, then flushes the audit; the CLI kills and reaps its owned ngrok child after HTTP returns. The POSIX source-development supervisor in `script/dev.py` builds while the previous server runs, then performs an owned restart only after a successful compilation, with rollback if the new build fails readiness. Bash modes are configured at startup. Full MCP tracing and CLI feature parity are not yet implemented. MCP stdio logs go to stderr, never protocol stdout.
-- **novagpt-vm (opt-in):** independent NovaGPT VM home, approved image import, VM image listing and host create/status/destroy with Windows Hyper-V or QEMU; guest control is not implemented. See [VM_AND_SUBAGENTS.md](VM_AND_SUBAGENTS.md).
-- **novagpt-agents + novagpt-browser (opt-in):** bounded asynchronous subagent state + a dedicated visible Chrome CDP driver. Browser login/verification requires the user; live UI behavior and project automation are not verified. A separate optional read-only `BrowserBridge` attaches to an explicitly selected loopback debugging port and approved HTTPS origin, never to the subagent Chrome by default. It is not yet the generic CodexPro Playwright browser.
-- **Future modules:** semantic repository analysis beyond bounded inventory, generic browser automation, verified VM guest controls, executed handoff workflows, broader skills/Pro/history, widgets, Cloudflare/Tailscale tunnels and platform management. Initial metadata-only HUMAN/LLM audit now persists bounded per-workspace English plain-text `.log` files outside project roots, but full diagnostic tracing, independent multiple-process safety and TS parity remain pending. Complete the guarded Git/command/patch/import and ngrok slices before considering migration. Keep optional frameworks out of the core domain dependency graph.
+- **novagpt-core:** owned workspaces, allowed-root and path guards, file reads and writes, optimistic SHA-256 updates, safe Git operations, commands and structured workspace operations. It must not depend on CLI, HTTP or MCP.
+- **novagpt-mcp:** tools, schemas, protocol dispatch, stdio and HTTP transport, and request authentication through the official Rust MCP SDK (`rmcp`).
+- **novagpt-cli:** argument parsing, shared private per-user configuration and token, terminal UI, process ownership, ngrok tunnel management, and optional integrations.
+- **novagpt-vm:** optional approved VM images and platform-specific VM controls; real guest execution support is incomplete.
+- **novagpt-agents** and **novagpt-browser:** optional bounded subagent management and a dedicated visible Chrome/CDP integration.
 
-## Safety and concurrency model
+## Workspace and security model
 
-One server can serve many independent MCP transports. Each core operation receives optional `workspace_id`, with omission resolving the configured default root only. Canonical real roots are hashed to `ws_`-prefixed SHA-256 identifiers; alternate roots must be in the CLI allow-list.
+One server can serve multiple simultaneous MCP clients on the same filesystem. MCP session IDs represent transport sessions, not ChatGPT conversations. Each operation uses the default configured root unless another explicitly approved workspace ID is supplied.
 
-A `WorkspaceRegistry` is shared across HTTP service instances via clones of an `Arc`. Locks are per-file, not a global serialize-all mutex. The optimistic `expected_sha256` is checked within the lock; two stale concurrent writers cannot both succeed. Root and path checks reject `..` traversal, disallowed canonical paths, sensitive directories/files, and symlink write targets. Read/search bound size and skip binary files. HTTP requires a >=24-character shared per-OS-user token and binds only to loopback. On first use, the CLI migrates one valid legacy workspace token or rotates when several exist, removing only validated old files; a private file lock serializes migration across processes. The environment override remains explicit and takes precedence. Both Bearer headers and the CodexPro-compatible `codexpro_token` URL query parameter authenticate MCP; query credentials are stripped before passing requests to the SDK. Explicit CLI or TUI ngrok startup forwards this protected listener; the ngrok-local agent supplies the exact public hostname, which is added to the SDK's otherwise-loopback-only DNS-rebinding allowlist without disabling host validation. Tunnel startup stops when no matching approved public hostname is discoverable. The connector URL is revealed only on user request and is never copied automatically. Public tunnel access and actual ChatGPT MCP interoperability are NOT VERIFIED.
+Canonical workspace roots and path guards reject disallowed paths and selected sensitive files. Optimistic SHA-256 changes are checked under per-file locks. Git index operations coordinate per canonical root. OS-level hostile path races still require further testing.
 
-**Known limitations, not accepted parity:** `write`/`edit` currently modify existing files in place on Windows and are not crash-atomic; symlink-swap TOCTOU resistance and a more complete blocked-glob contract need implementation and adversarial tests. Git restore now requires explicit discard consent, commits reject protected staged paths and worktree create/remove only manages process-registered records in a controlled OS temp location; cleanup after crash/restart and Windows reparse-path race resistance remain unverified. Raw Git patches require one safe file; patch transactions support one ordinary update hunk target, not multi-file atomics. Safe Bash uses a fixed allow-list rather than CodexPro's richer policy; full Bash is host execution, not a sandbox, and child-process-tree termination is unproven. Import permits HTTPS approved hosts with pinned IPv4 and rejects redirects; real Apps SDK attachment import/MIME checks have not been verified. The ngrok CLI/TUI can launch a tunnel; query-authenticated POST/GET/SSE/DELETE pass loopback protocol tests, but public ngrok and remote ChatGPT interoperability have not been verified. Output shapes, per-tool limits/defaults and errors differ from CodexPro. There is not yet a verified SSE capacity/TTL/reconnect contract. Do not use NovaGPT as a production CodexPro replacement.
+The MCP HTTP server binds to loopback and requires the shared user token. It accepts a bearer header or the private URL query parameter `novagpt_token`; the query secret is removed before MCP protocol handling. The token is private user state outside the repository. A previously issued query key is accepted temporarily for existing private connections, but is not emitted in new URLs.
 
-## Implementation phases
+The CLI/TUI can manage its own ngrok process and verify the matching upstream port and hostname before disclosing the HTTPS endpoint. The ngrok inspector and tunnel logs are disabled. The full connector URL is shown only on user request. Credentials and full URLs are not written to audit logs.
 
-1. **Bootstrap (in progress):** minimal Cargo workspace, official MCP SDK, guarded root and file operations, tests, README and ledger.
-2. **Freeze TS fixtures:** exact tools/list mode configurations, tool schemas, output envelopes/error codes, HTTP wire sessions and CLI config. Capture stable fixtures against a disposable checkout, never production data.
-3. **Full safe core:** structured results, CAS/atomic file writes, safe patches/import, Git, command safety, analysis and output store with unit/integration/property testing.
-4. **Transport reliability:** legacy/modern HTTP, SSE/GET/DELETE, simultaneous transport sessions, capacity and TTL, cancellation, auth, reconnect, paused Windows clock, graceful shutdown, redacted event logs.
-5. **CLI/optional parity:** profiles and setup/doctor, tunnels, release/Windows liveness, VM and Hyper-V, dedicated browser/subagents, handoff, widgets and opt-in history. Keep dependencies feature-gated.
-6. **Verification and cutover:** differential TS/Rust tests, independent review, Windows and cross-platform release validation, rollback on a separate system. Only switch distribution after G0-G8 in PARITY.md pass.
+**Host-shell execution is not sandboxed.** A client with the full private connector URL can run commands with the server user's OS permissions. Explicitly allowed workspaces are not a sandbox around shell commands. Browser, VM and subagent features are opt-in.
 
-## Commands and evidence
+## User experience and lifecycle
 
-```powershell
+`novagpt` opens a three-page terminal UI: Overview, Activity and Settings. Guided `--setup` requires confirmation before it saves settings or creates a workspace-local launcher. The default UI language is Automatic, resolved from the system locale, with English fallback; all logs and diagnostics are in English.
+
+The saved `auto_start_mcp` preference is disabled by default. If enabled, normal TUI launch requests MCP startup using saved HTTP and ngrok preferences; guided setup does not. Missing ngrok prompts for explicit installer consent, with No as the default answer. The installer uses only supported system package managers and does not handle ngrok account credentials.
+
+Graceful HTTP shutdown handles Ctrl+C and SIGTERM on Unix and flushes audit events. CLI-owned ngrok is stopped and reaped on normal termination. Forced process termination, power failures and all in-flight requests are not guaranteed to be recoverable.
+
+For local Rust iteration, `script/dev.py` watches source and manifests, builds without stopping the last working server, then restarts its owned server and tunnel on successful compilation. It attempts rollback if a new binary fails readiness. Each successful restart briefly interrupts active MCP sessions and may change a dynamically assigned ngrok hostname.
+
+## Known limitations
+
+- The full live public ChatGPT-to-ngrok integration has not been independently verified on every supported platform.
+- TUI shutdown currently aborts some async server tasks; complete graceful resource cleanup needs an end-to-end audit.
+- Shell commands run with host permissions; subprocess-tree cleanup and full sandboxing are not guaranteed.
+- VM guest control, browser automation, and some optional integrations require live testing and are not equivalent to a fully managed cloud environment.
+- Some filesystem writes are not crash-atomic on all platforms; path-swap defenses and adversarial concurrency require further review.
+- Public MCP transport session TTL, reconnect and load boundaries need additional integration tests.
+
+## Development checks
+
+From the repository root:
+
+```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 cargo test --workspace
-cargo build --release --workspace
+python3 -m unittest discover -s script -p 'test_dev.py'
 ```
 
-Use CodexPro's `docs/PRODUCT_USE_CASE.md`, `src/server.ts`, `src/http.ts`, `src/stdio.ts`, `src/config.ts` and `scripts/codexpro.mjs` as references. The new project must not silently remove protected TS behavior or migrate user state. Update PARITY.md with concrete output rather than marking a capability complete by inspection alone.
+All runtime behavior and security changes require relevant positive and negative integration tests, plus recorded verification evidence. See [CAPABILITIES.md](CAPABILITIES.md), [QUALITY_GATES.md](QUALITY_GATES.md) and the [architecture decisions](decisions/README.md).

@@ -1,6 +1,6 @@
 # Extension playbook — adding functionality safely
 
-This is a practical procedure for implementing **one vertical slice** of NovaGPT. Read [AGENTS.md](../AGENTS.md), [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md), and [QUALITY_GATES.md](QUALITY_GATES.md) first. Current source code is an early Rust port; examples here describe **target practice** and must not be mistaken for already-implemented features.
+This is a practical procedure for implementing **one vertical slice** of NovaGPT. Read [AGENTS.md](../AGENTS.md), [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md), and [QUALITY_GATES.md](QUALITY_GATES.md) first. Current source code is under active development; examples here describe **target practice** and must not be mistaken for already-implemented features.
 
 ## Decide where work belongs
 
@@ -23,7 +23,7 @@ Create a focused private module first; do **not** create a new crate, registry, 
 4. **Validate at the trust boundary** and again at dangerous mutation boundaries; all resolutions must remain under approved canonical roots. Write through a per-target lock + hash precondition when necessary. Never return secret data or expose arbitrary paths.
 5. **Add tests before exposure:** success, invalid input, denied path, blocked files, large/binary input, retry/conflict and multi-thread interactions when stateful.
 6. **Expose at MCP only after core tests pass:** handler should contain argument conversion, service call and result mapping, not business logic.
-7. **Check diff and gates:** run targeted tests plus Cargo lint/test baseline. Update parity evidence for any CodexPro equivalent.
+7. **Check diff and gates:** run targeted tests plus Cargo lint/test baseline. Update capability evidence for affected behavior.
 
 Keep error messages suitable for the caller without exposing internal paths or secrets. An unrecognized optional argument should follow a conscious validation/compatibility rule.
 
@@ -31,13 +31,13 @@ Keep error messages suitable for the caller without exposing internal paths or s
 
 Use this checklist for every tool, even an apparently trivial read-only one:
 
-1. **Inventory the TS oracle:** locate its `registerCodexTool` definition in CodexPro `src/server.ts`, the called implementation and one or more smoke tests; capture exact name, input fields (types, defaults, required), description, output envelope and negative cases. If no TS equivalent exists, label it a NovaGPT extension and give it a documented compatibility policy.
+1. **Define the NovaGPT tool contract:** specify public tool name, schema, limits, errors, metadata and positive/negative fixtures.
 2. **Choose a domain operation** in `novagpt-core`; define request/response types and typed errors. Keep `rmcp` and HTTP out of its public API.
 3. **Add one thin `rmcp` registration** using the existing handler/router pattern; use `serde`/`schemars` and the official SDK. The tool's public name, visible description, JSON input schema and `structuredContent` are versioned contracts.
 4. **Map both outcomes:** success has bounded `content` and typed `structuredContent`; failure has `isError` and a safe, stable error structure. Distinguish tool errors from protocol-level malformed JSON-RPC. Never echo secrets or verbose host diagnostics.
 5. **Add a real protocol integration test** analogous to `crates/novagpt-cli/tests/protocol.rs`: initialize, list, invoke success, invoke rejection, assert JSON fields and filesystem postconditions, and avoid relying on invocation of Rust functions alone.
 6. **Test mode exposure** (once mode support exists) and ensure an intentionally disabled tool cannot be called through an alternate dispatch path.
-7. **Update** `docs/PARITY.md`: from NOT STARTED to INITIAL when real Rust behavior exists; to VERIFIED only with comparable TS/Rust fixtures and command output.
+7. **Update** `docs/CAPABILITIES.md` with actual implementation and integration-test evidence.
 
 **Example (pseudocode, not a copy-paste compile target):**
 
@@ -75,13 +75,13 @@ Treat optional capabilities as independent bounded **resources**, not global bac
 2. Propagate a validated immutable value into the owning service. Domain code should not read `std::env` in arbitrary methods.
 3. Define how the setting interacts with disabled modes, profiles and secrets; prefer stricter defaults if new risk is introduced.
 4. Test absent, valid, malformed, limit, precedence and compatibility with existing profiles.
-5. Update `--help`, README and parity fixtures for a user-visible option. Never write secrets into a generated config, log or test output.
+5. Update `--help`, the relevant user guide and capability tests for a user-visible option. Never write secrets into a generated config, log or test output.
 
 ## Recipe E — refactor a growing area
 
 Start with a **behavior-preserving move**, not an API redesign and feature addition in the same patch. Define before/after dependency graph and tests; extract small private modules while keeping public names stable. Move focused tests with their domain logic; keep integration tests at the application boundary.
 
-Introduce an interface only if at least two real callers/backends or a deterministic test seam justify it. Migrate one consumer at a time and remove deprecated paths promptly once parity is proven. If changing an external contract, create an ADR and explicit version/migration plan first.
+Introduce an interface only if at least two real callers/backends or a deterministic test seam justify it. Migrate one consumer at a time and remove deprecated paths promptly once behavior is verified. If changing an external contract, create an ADR and explicit version/migration plan first.
 
 ## Completion checklist for a vertical slice
 
@@ -90,6 +90,6 @@ Introduce an interface only if at least two real callers/backends or a determini
 - [ ] Cancellation/timeout/cleanup defined for any long-lived resource.
 - [ ] Tests include real protocol integration and negative cases when externally exposed.
 - [ ] Cargo fmt, Clippy with warnings as errors, check and relevant tests actually run.
-- [ ] Compatible TS fixtures compared or outstanding differences explicitly marked in PARITY.
+- [ ] NovaGPT protocol fixtures tested or outstanding differences recorded in CAPABILITIES.
 - [ ] Documentation and CLI/tool discoverability updated if public-facing.
 - [ ] Diff reviewed for unintended changes, credentials, dependencies and stale docs.

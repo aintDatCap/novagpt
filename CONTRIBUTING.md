@@ -1,10 +1,10 @@
 # Development rules
 
-NovaGPT is an independent Rust project; never edit the CodexPro runtime or launcher to test it. Keep the workspace small, with explicit errors and no `unwrap` in production paths. Prefer domain types and narrow APIs over broad trait hierarchies. Every stateful resource needs a defined lifetime and cancellation/shutdown behavior.
+NovaGPT is an independent Rust project; keep changes inside this repository and avoid modifying unrelated applications. Keep the workspace small, with explicit errors and no `unwrap` in production paths. Prefer domain types and narrow APIs over broad trait hierarchies. Every stateful resource needs a defined lifetime and cancellation/shutdown behavior.
 
 The multi-chat product contract is one real shared filesystem across many MCP sessions; an MCP transport session is never a ChatGPT conversation identity. Keep workspace targeting explicit and fail closed on unauthorized paths.
 
-Before proposing a release, run formatting, Clippy as errors, unit/integration tests, differential CodexPro parity fixtures, concurrency and security regressions on supported platforms. Report both passes and failures accurately. Preserve a verified rollback path; never claim full parity while any required feature remains INITIAL or NOT STARTED in docs/PARITY.md.
+Before proposing a release, run formatting, Clippy as errors, unit/integration tests, concurrency and security regressions on supported platforms. Report both passes and failures accurately. Preserve a verified rollback path; never claim production readiness without verified results in docs/CAPABILITIES.md.
 
 ## Contributor reference
 

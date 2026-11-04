@@ -40,7 +40,7 @@ The dependency graph is `cli -> mcp -> core` (with `cli -> core` also permitted)
 
 ## Safety and runtime rules
 
-- Deny paths outside approved canonical roots; reject blocked paths, symlink escapes, binary/oversize reads, unsafe commands and unexpected write targets. Revalidate after acquiring mutation locks; test TOCTOU and Windows-specific reparse/drive behavior before asserting parity.
+- Deny paths outside approved canonical roots; reject blocked paths, symlink escapes, binary/oversize reads, unsafe commands and unexpected write targets. Revalidate after acquiring mutation locks; test TOCTOU and Windows-specific reparse/drive behavior before asserting security guarantees.
 - Treat `expected_sha256` as optimistic concurrency control; fail stale writers without clobbering newer bytes. Never claim multi-file atomicity unless demonstrated.
 - No global lock around unrelated work. State ownership and cancellation/timeout/cleanup of commands, sessions, streams, VMs and workers explicitly.
 - Never log credentials, bearer tokens, environment secrets, private file contents or full unbounded tool outputs. Errors sent to MCP clients must be redacted and stable.

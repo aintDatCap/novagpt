@@ -1,6 +1,6 @@
 # VM, subagents and dedicated ChatGPT Browser — initial Rust implementation
 
-**Status (2026-10-24): INITIAL, NOT full CodexPro parity.** These are independently optional capabilities of NovaGPT. The original CodexPro TypeScript implementation is the oracle, not a shared runtime or data directory. This page names what actually works and what remains unfinished.
+**Status: PARTIAL.** These optional NovaGPT capabilities require further live platform testing. This page names what actually works and what remains unfinished.
 
 ## Module ownership
 
@@ -17,10 +17,10 @@ The crates follow the direction `novagpt-cli -> novagpt-mcp -> optional domain a
 
 ## VM setup (Windows Hyper-V)
 
-Requires supported Windows, Hyper-V PowerShell commands, sufficient privileges and an **already prepared, trusted and human-approved VHDX base image**. This implementation does not download an OS image, accept arbitrary host image paths through MCP or reuse CodexPro VM home. The import command copies the entire file to the separate NovaGPT VM store and hashes it.
+Requires supported Windows, Hyper-V PowerShell commands, sufficient privileges and an **already prepared, trusted and human-approved VHDX base image**. This implementation does not download an OS image, accept arbitrary host image paths through MCP or reuse another application's VM home. The import command copies the entire file to the separate NovaGPT VM store and hashes it.
 
 ```powershell
-# Use a fresh, dedicated directory; never your CodexPro VM home.
+# Use a fresh, dedicated directory; never your another application's VM home.
 cargo run -p novagpt-cli -- --vm-home C:\NovaGPT-VMs vm-import --name win-test --source C:\ApprovedImages\win-test.vhdx --cpus 2 --memory-mb 4096
 
 # Start the MCP server with VM actions enabled.
@@ -35,7 +35,7 @@ On Linux/macOS the same CLI import accepts a `.qcow2` base image and the host ba
 
 ## ChatGPT Browser subagent setup
 
-Requires a real local Chrome-compatible executable (pass its exact path) and a **fresh, dedicated** Chrome user-data directory. NovaGPT refuses a populated non-NovaGPT profile, to avoid accidentally attaching to your personal or CodexPro login state. You must complete ChatGPT login/Cloudflare checks in the **visible** Chrome window. NovaGPT never automatically solves challenges or extracts cookies, bearer tokens, passwords or browser storage.
+Requires a real local Chrome-compatible executable (pass its exact path) and a **fresh, dedicated** Chrome user-data directory. NovaGPT refuses a populated non-NovaGPT profile, to avoid accidentally attaching to your personal or other applications' login state. You must complete ChatGPT login/Cloudflare checks in the **visible** Chrome window. NovaGPT never automatically solves challenges or extracts cookies, bearer tokens, passwords or browser storage.
 
 ```powershell
 cargo run -p novagpt-cli -- `
@@ -59,7 +59,7 @@ cargo run -p novagpt-cli -- `
   browser-login
 ```
 
-This mode does **not** add `--remote-debugging-port`, WebDriver, headless, or injection switches. The CLI waits for Chrome to exit. Log in personally in the Chrome window, complete any authentication or verification yourself, and **close that dedicated Chrome** before starting NovaGPT with `stdio` or `http`. If you previously configured browser support in the TUI, `--root C:\Projects\your-repo browser-login` uses the TUI's `.novagpt/browser` directory and detected/configured Chrome automatically. Use exactly the same profile path in both modes; never use a personal or CodexPro profile.
+This mode does **not** add `--remote-debugging-port`, WebDriver, headless, or injection switches. The CLI waits for Chrome to exit. Log in personally in the Chrome window, complete any authentication or verification yourself, and **close that dedicated Chrome** before starting NovaGPT with `stdio` or `http`. If you previously configured browser support in the TUI, `--root C:\Projects\your-repo browser-login` uses the TUI's `.novagpt/browser` directory and detected/configured Chrome automatically. Use exactly the same profile path in both modes; never use a personal or another application's profile.
 
 A cross-process OS file lock prevents two NovaGPT instances from claiming the same owned profile at the same time. The profile marker and existing Chrome data are preserved. A stale CDP endpoint after Chrome exits is discarded instead of treating it as a healthy browser.
 
@@ -91,17 +91,17 @@ Only fixed event names, page-state booleans and bounded assistant counts are log
 
 ### Prompt entry and submission
 
-The Rust CDP adapter is modeled on the interaction pattern in CodexPro's `src/chatgptBrowserManager.ts`: look for a visible, genuinely editable ChatGPT composer (including an accessible textbox), insert text using Chrome input events, prefer a visible enabled Send button, and fall back to Enter. The Send button is activated with CDP mouse events rather than a synthetic DOM click. Hidden login/verification widgets do not block an otherwise usable composer; a **visible** challenge still requires manual user action. A local mock-CDP send/response test checks these commands and the initial page-navigation retry. **This is not a successful live ChatGPT account smoke test.** Restart the NovaGPT server with the rebuilt binary before testing the updated driver.
+The Rust CDP adapter is modeled on the interaction pattern used by interactive ChatGPT clients: look for a visible, genuinely editable ChatGPT composer (including an accessible textbox), insert text using Chrome input events, prefer a visible enabled Send button, and fall back to Enter. The Send button is activated with CDP mouse events rather than a synthetic DOM click. Hidden login/verification widgets do not block an otherwise usable composer; a **visible** challenge still requires manual user action. A local mock-CDP send/response test checks these commands and the initial page-navigation retry. **This is not a successful live ChatGPT account smoke test.** Restart the NovaGPT server with the rebuilt binary before testing the updated driver.
 
 ## Important technical gaps
 
-1. **Guest operations:** `vm_exec`, `vm_upload`, `vm_download`, QEMU guest agent and credential-scoped Hyper-V PowerShell Direct must be implemented before guest-control parity. No credential transport is implemented in this initial slice.
-2. **Native VM interoperability:** image import intentionally does not claim CodexPro image manifest parity, boot-tested images, real Hyper-V/QEMU integration, recovery or secure boot. Windows disk creation and cleanup need smoke tests on isolated hardware.
-3. **ChatGPT Browser:** the Rust implementation uses Chrome CDP rather than CodexPro's Patchright engine. It has **not** been validated against a live ChatGPT account, dynamic UI changes, project auto-creation, browser relogin, anti-bot gates, multi-tab races or actual response completion. It may require selector/API adjustments. Human verification must remain manual.
-4. **Tool visibility:** optional tool names are present in `tools/list` even when a subsystem is disabled; invocation fails explicitly. CodexPro suppresses some disabled tools; mode/visibility parity is not yet implemented.
-5. **Subagent parity:** no DeepSeek backend, scoped file-context snippets, isolated implementer worktree, patch validation/application or browser project auto-create. Subagent registry is bounded to 64 entries, six running/waiting agents; no persistence across NovaGPT process restarts.
+1. **Guest operations:** `vm_exec`, `vm_upload`, `vm_download`, QEMU guest agent and credential-scoped Hyper-V PowerShell Direct must be implemented before guest control. No credential transport is implemented in this initial slice.
+2. **Native VM interoperability:** image import intentionally does not claim other image manifest formats, boot-tested images, real Hyper-V/QEMU integration, recovery or secure boot. Windows disk creation and cleanup need smoke tests on isolated hardware.
+3. **ChatGPT Browser:** the Rust implementation uses Chrome CDP rather than a Patchright engine. It has **not** been validated against a live ChatGPT account, dynamic UI changes, project auto-creation, browser relogin, anti-bot gates, multi-tab races or actual response completion. It may require selector/API adjustments. Human verification must remain manual.
+4. **Tool visibility:** optional tool names are present in `tools/list` even when a subsystem is disabled; invocation fails explicitly. Disabled-tool visibility needs its own policy and tests.
+5. **Subagent completeness:** no DeepSeek backend, scoped file-context snippets, isolated implementer worktree, patch validation/application or browser project auto-create. Subagent registry is bounded to 64 entries, six running/waiting agents; no persistence across NovaGPT process restarts.
 6. **Reliability:** browser profile ownership is checked but full symlink/reparse-point and process-handoff audits remain; VM image checksum is checked before create, but launch + metadata commit is not transactionally atomic. No real guest credentials should ever be passed to a tool until their secure ephemeral handling is implemented.
-7. **Performance/limits:** browser polls every ~300 ms with a 180-second response bound, a maximum prompt/reply size and serialized tab creation. These are provisional defaults, not proven CodexPro parity.
+7. **Performance/limits:** browser polls every ~300 ms with a 180-second response bound, a maximum prompt/reply size and serialized tab creation. These are provisional defaults, not verified in every environment.
 
 ## Development and checks
 
@@ -113,4 +113,4 @@ cargo test --workspace
 cargo run -p novagpt-cli -- --help
 ```
 
-For a release or parity milestone, add real protocols tests for enabled VM tools; mock PowerShell/qemu command tests; isolated Hyper-V/QEMU provisioning and cleanup; browser CDP integration against a consented throwaway account/page; manual-check/resume/cancel races; explicit role-specific worktree tests. Update [PARITY.md](PARITY.md) only with actual evidence and never overwrite CodexPro as a shortcut.
+For a release milestone, add real protocols tests for enabled VM tools; mock PowerShell/qemu command tests; isolated Hyper-V/QEMU provisioning and cleanup; browser CDP integration against a consented throwaway account/page; manual-check/resume/cancel races; explicit role-specific worktree tests. Update [CAPABILITIES.md](CAPABILITIES.md) only with actual evidence; never modify unrelated applications as a shortcut.

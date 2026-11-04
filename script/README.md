@@ -45,4 +45,4 @@ powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -InstallDir "$env:
 
 Downloads and verifies `novagpt-windows-x86_64.zip`, installs `novagpt.exe` under the user's `%LOCALAPPDATA%\Programs\NovaGPT\bin` by default, and appends that directory to the **user** PATH if absent. A new terminal is needed to pick up persistent PATH changes. Windows ARM64 does not have a published native release package in this matrix.
 
-Installers use `https://github.com/aintDatCap/novagpt/releases` and therefore require an **already published, accessible release** and GitHub download access; they do not build from source. They never touch CodexPro, machine-wide PATH, or another user's installation.
+Installers use `https://github.com/aintDatCap/novagpt/releases` and therefore require an **already published, accessible release** and GitHub download access; they do not build from source. They never modify the machine-wide PATH or another user's installation.

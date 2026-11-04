@@ -58,10 +58,10 @@ For changes to MCP-visible behavior, specify and test:
 - tool name, description, required/optional fields, defaults and schema form;
 - JSON result envelope (`content`, `structuredContent`, `isError`, metadata), byte caps and truncation markers;
 - the exact denied/invalid/conflict behavior and error classification;
-- behavior in `minimal`, `standard`, `full` and disabled modes (target parity; some modes do not exist in NovaGPT yet);
-- corresponding CodexPro baseline fixture in [PARITY.md](PARITY.md).
+- behavior when optional capabilities are enabled or disabled;
+- corresponding NovaGPT contract tests and capability status in [CAPABILITIES.md](CAPABILITIES.md).
 
-Treat these as versioned external APIs even if only one current client is known. A deliberate breaking change needs an ADR, migration instructions, differential tests and explicit approval. Never silently drop a CodexPro feature to simplify the port.
+Treat these as versioned external APIs even if only one current client is known. A deliberate breaking change needs an ADR, migration instructions, regression tests and explicit approval. Document deliberate breaking changes and their user impact.
 
 ## Concurrent resources and lifecycle
 
@@ -77,7 +77,7 @@ Treat these as versioned external APIs even if only one current client is known.
 
 ## Security and configuration boundaries
 
-Reject operations outside approved **canonical** allowed roots. Apply sensitive-path rules and symlink checks on both requested and resolved paths, including parents; plan for Windows junction/reparse-point and case-insensitive behavior. Use secure creation/rename primitives and handle-based checks where available. Record remaining symlink-swap/TOCTOU issues in the parity ledger instead of overstating protections.
+Reject operations outside approved **canonical** allowed roots. Apply sensitive-path rules and symlink checks on both requested and resolved paths, including parents; plan for Windows junction/reparse-point and case-insensitive behavior. Use secure creation/rename primitives and handle-based checks where available. Record remaining symlink-swap/TOCTOU issues in the capability register instead of overstating protections.
 
 Separate **read**, **write**, **shell execution**, **network exposure** and **optional automated browser/VM** permissions. A safe default may be more restrictive than an eventual compatibility mode; differences must be explicit. Load secrets from environment or protected external configuration without copying values into logs, tests or fixtures. Limit input, output, search, duration, sessions and worker counts. Prefer sanitizing at output boundaries *and* never collecting unnecessary sensitive data.
 
@@ -95,7 +95,7 @@ Config must have one documented precedence and startup validation path. Runtime 
 ## Documentation ownership and decision records
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) describes actual crate relationships and known caveats.
-- [PARITY.md](PARITY.md) tracks real port status and commands/evidence.
+- [CAPABILITIES.md](CAPABILITIES.md) tracks current capabilities and verification evidence.
 - [EXTENSION_PLAYBOOK.md](EXTENSION_PLAYBOOK.md) provides change steps.
 - [QUALITY_GATES.md](QUALITY_GATES.md) sets verifiable acceptance criteria.
 - [decisions/](decisions/README.md) captures durable decisions and rejected alternatives; a decision log is **not** a substitute for code/tests.
