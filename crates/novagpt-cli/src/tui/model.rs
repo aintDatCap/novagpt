@@ -24,7 +24,8 @@ pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
     }
 }
 
-pub(super) const CONFIG_ORDER: [usize; 16] = [15, 0, 11, 12, 10, 2, 3, 1, 4, 5, 6, 7, 13, 8, 9, 14];
+pub(super) const CONFIG_ORDER: [usize; 17] =
+    [15, 0, 16, 11, 12, 10, 2, 3, 1, 4, 5, 6, 7, 13, 8, 9, 14];
 pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
     match index {
         0 => i18n::Messages::http_port(lang),
@@ -43,6 +44,7 @@ pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
         13 => i18n::Messages::import_novagpt_folder(lang),
         14 => i18n::Messages::next_setup_step(lang),
         15 => i18n::Messages::settings_language(lang),
+        16 => i18n::Messages::auto_start_mcp(lang),
         _ => "",
     }
 }
@@ -217,6 +219,13 @@ impl App {
         app.log(Level::Info, "NovaGPT started. Press ? for help.");
         app
     }
+    pub fn start_on_launch(&mut self) -> Option<Effect> {
+        if !self.setup && self.persisted.auto_start_mcp {
+            self.activate_command(0)
+        } else {
+            None
+        }
+    }
     pub fn language(&self) -> Language {
         self.draft.language.resolved(self.system_language)
     }
@@ -224,16 +233,17 @@ impl App {
         self.draft != self.persisted
     }
     pub fn restart_needed(&self) -> bool {
-        // Language is a TUI-only preference. It never changes MCP startup state.
+        // UI language and startup policy do not change the already-running server.
         self.server == ServerState::Running
             && self.running_config.as_ref().is_some_and(|running| {
                 let mut current = self.persisted.clone();
                 current.language = running.language;
+                current.auto_start_mcp = running.auto_start_mcp;
                 *running != current
             })
     }
     pub fn config_len(&self) -> usize {
-        if self.setup { 16 } else { 15 }
+        if self.setup { 17 } else { 16 }
     }
 
     pub fn config_order(&self) -> &'static [usize] {
@@ -696,6 +706,10 @@ impl App {
     }
     fn config_action(&mut self) -> Option<Effect> {
         match self.config {
+            16 => {
+                self.draft.auto_start_mcp = !self.draft.auto_start_mcp;
+                self.log_localized(Level::Info, i18n::Messages::auto_start_changed);
+            }
             15 => {
                 self.draft.language = self.draft.language.next();
                 self.log_localized(

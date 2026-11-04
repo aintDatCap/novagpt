@@ -87,6 +87,9 @@ pub fn run(
     let mut app = model::App::new(root, settings, setup, profiles);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut controller = operations::Controller::new(handle, tx);
+    if let Some(effect) = app.start_on_launch() {
+        controller.execute(effect, app.root.clone());
+    }
     loop {
         // UI stays responsive while filesystem, VM and server work off-thread.
         while let Ok(message) = rx.try_recv() {
@@ -334,6 +337,35 @@ mod tests {
         assert!(app.dirty());
     }
     #[test]
+    fn automatic_mcp_start_is_opt_in_and_never_runs_during_setup() {
+        let mut disabled = app();
+        assert!(disabled.start_on_launch().is_none());
+        let config = LocalSettings {
+            auto_start_mcp: true,
+            ..LocalSettings::default()
+        };
+        let mut enabled = App::new(PathBuf::from("."), config.clone(), false, vec![]);
+        assert!(matches!(enabled.start_on_launch(), Some(Effect::Start(_))));
+        assert_eq!(enabled.server, ServerState::Starting);
+        let mut ngrok = App::new(
+            PathBuf::from("."),
+            LocalSettings {
+                ngrok_enabled: true,
+                ..config.clone()
+            },
+            false,
+            vec![],
+        );
+        assert!(matches!(
+            ngrok.start_on_launch(),
+            Some(Effect::StartNgrok(_))
+        ));
+        let mut setup = App::new(PathBuf::from("."), config, true, vec![]);
+        assert!(setup.start_on_launch().is_none());
+        assert_eq!(setup.server, ServerState::Stopped);
+    }
+
+    #[test]
     fn saved_ngrok_preference_controls_normal_http_start() {
         let settings = LocalSettings {
             ngrok_enabled: true,
@@ -547,6 +579,8 @@ mod tests {
         assert_eq!(a.config, 15);
         a.key(key(KeyCode::Down));
         assert_eq!(a.config, 0);
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.config, 16);
         a.key(key(KeyCode::Down));
         assert_eq!(a.config, 11);
 

@@ -83,6 +83,9 @@ macro_rules! messages {
 
 messages! {
     static {
+        auto_start_mcp: { en: "Start MCP automatically when NovaGPT opens", it: "Avvia MCP automaticamente all'apertura di NovaGPT" },
+        auto_start_mcp_help: { en: "Start MCP when opening the TUI with novagpt. Setup mode never starts it automatically.", it: "Avvia MCP aprendo la TUI con novagpt. Il setup non lo avvia automaticamente." },
+        auto_start_changed: { en: "Automatic MCP startup preference changed; save to apply.", it: "Preferenza di avvio automatico MCP modificata; salva per applicarla." },
         nova_folder_verified: { en: "NovaGPT folder verified: review the preview.", it: "Cartella NovaGPT verificata: controlla l'anteprima." },
         invalid_chrome_binary: { en: "Chrome executable invalid or inaccessible.", it: "Eseguibile Chrome non valido o non accessibile." },
         save_before_http: { en: "Save changes before starting HTTP.", it: "Salva le modifiche prima di avviare HTTP." },

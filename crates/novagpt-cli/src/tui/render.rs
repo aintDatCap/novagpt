@@ -186,6 +186,11 @@ fn config_value(app: &App, index: usize) -> String {
             dirty_mark(app.draft.ngrok_domain != app.persisted.ngrok_domain)
         ),
         13 => Messages::choose_source_folder(lang).into(),
+        16 => format!(
+            "{}{}",
+            on(app.draft.auto_start_mcp, lang),
+            dirty_mark(app.draft.auto_start_mcp != app.persisted.auto_start_mcp)
+        ),
         15 => match app.draft.language {
             LanguageChoice::English => "English".into(),
             crate::i18n::LanguageChoice::Italian => Messages::language_italian(lang).into(),
@@ -457,6 +462,7 @@ fn config_help(index: usize, lang: Language) -> &'static str {
         12 => Messages::optional_ngrok_hostname_do_not_enter_complete(lang),
         13 => Messages::import_novagpt_help(lang),
         15 => Messages::choose_english_italian_or_automatic_system_language(lang),
+        16 => Messages::auto_start_mcp_help(lang),
         _ => Messages::next_setup_help(lang),
     }
 }
@@ -502,7 +508,7 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
     for &i in app.config_order() {
         let group = match i {
             15 => Messages::settings_general(lang),
-            0 | 11 | 12 | 10 => Messages::settings_connection(lang),
+            0 | 16 | 11 | 12 | 10 => Messages::settings_connection(lang),
             2 | 3 => Messages::settings_browser_heading(lang),
             1 => Messages::virtual_machines(lang),
             4 | 5 => Messages::authorized_directories(lang),

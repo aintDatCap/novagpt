@@ -42,6 +42,7 @@ pub struct LocalSettings {
     pub vm_enabled: bool,
     pub browser_enabled: bool,
     pub chrome_executable: Option<PathBuf>,
+    pub auto_start_mcp: bool,
     pub ngrok_enabled: bool,
     pub ngrok_domain: Option<String>,
 }
@@ -55,6 +56,7 @@ impl Default for LocalSettings {
             vm_enabled: false,
             browser_enabled: false,
             chrome_executable: None,
+            auto_start_mcp: false,
             ngrok_enabled: false,
             ngrok_domain: None,
         }
@@ -372,6 +374,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.json"), serde_json::to_vec(cfg).unwrap()).unwrap();
     }
+    #[test]
+    fn legacy_settings_do_not_implicitly_start_an_http_server() {
+        let config: LocalSettings =
+            serde_json::from_str(r#"{"version":1,"port":8787,"ngrok_enabled":true}"#).unwrap();
+        assert!(!config.auto_start_mcp);
+        assert_eq!(config.language, crate::i18n::LanguageChoice::Auto);
+    }
+
     #[test]
     fn settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
