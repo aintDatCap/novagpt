@@ -122,6 +122,24 @@ novagpt --root C:\path\to\repo --browser-bridge-port 9222 --browser-bridge-origi
 
 MCP `browser_tabs` lists up to 32 tabs **only** on the approved origin (title and opaque CDP target ID). MCP `browser_tab_read` takes that exact ID and returns up to 32K characters of rendered visible text. URL query strings are not returned. It rechecks the origin both at discovery and in the browser-side fixed read-only JavaScript before collecting text. Arbitrary JavaScript, browsing/navigating, clicking, passwords, cookies and other origins are not exposed. A browser opened with remote debugging is sensitive: **never expose its debugging port publicly or point this bridge at the Chrome used by subagents**. This does not yet support Chrome extension attachment, screenshots or fully verified live Instagram.
 
+## Development with last-good hot reload (Linux/macOS)
+
+From the **NovaGPT source repository** run:
+
+```bash
+python3 script/dev.py --port 8787 --ngrok
+# Optional: keep the same public connector hostname on each successful reload:
+python3 script/dev.py --port 8787 --ngrok-domain your-owned-domain.ngrok-free.app
+# Local-only development:
+python3 script/dev.py --port 8787 --no-ngrok
+```
+
+This Python 3 standard-library supervisor watches Rust sources and Cargo manifests. It runs `cargo build -p novagpt-cli --bin novagpt` **while the previous server stays active**, starts a versioned executable only after a successful build, and keeps the running version if compilation fails. If the newly compiled executable cannot start or pass the authenticated local MCP readiness probe, it attempts to restore the previous build. It does not take over a port already occupied by a server it did not start: stop your existing NovaGPT instance on that port first.
+
+On each successful rebuild, connected MCP sessions are interrupted briefly: the owned HTTP server is stopped with SIGTERM, ngrok is reaped, and the new process and tunnel start. Use an ngrok domain reserved in your own account to keep your connector URL stable across restarts; a randomly assigned domain may change. Stop the supervisor with Ctrl+C; its shutdown path asks NovaGPT to stop and uses a bounded forced process-group kill if necessary. This **does not guarantee preservation of in-flight requests** or cleanup after an uncatchable SIGKILL, crash, or power failure. The tool does not launch or modify CodexPro and does not copy or print the MCP token.
+
+The tests for the supervisor run with `python3 -m unittest discover -s script -p 'test_dev.py'`. This runner targets POSIX systems, not Windows.
+
 ## Experimental ngrok exposure
 
 The CLI can run a managed ngrok v3 tunnel for the loopback MCP service. Both bearer authentication and a CodexPro-compatible `codexpro_token` URL query parameter are supported; this permits a ChatGPT MCP connector configured with **No authentication**. The query URL is itself a password.
