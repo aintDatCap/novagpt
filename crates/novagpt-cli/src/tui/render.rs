@@ -637,9 +637,12 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
         Modal::ConnectorUrl(url) => (
             Messages::chatgpt_url_private(lang).into(),
             format!(
-                "{}\n\n{url}\n\n{}",
+                "{}\n\n{url}\n\n{}{}",
                 Messages::in_chatgpt_choose_no_authentication_and_paste(lang),
-                Messages::warn_credential_url(lang)
+                Messages::warn_credential_url(lang),
+                app.clipboard_feedback
+                    .as_deref()
+                    .map_or(String::new(), |message| format!("\n\n{message}"))
             ),
             Messages::c_copy_to_clipboard_enter_esc_close(lang).into(),
         ),

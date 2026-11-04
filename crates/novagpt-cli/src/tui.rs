@@ -445,6 +445,16 @@ mod tests {
         assert!(matches!(a.key(key(KeyCode::Char('c'))),
             Some(Effect::CopyConnectorUrl(value)) if value == link));
         a.on_event(OperationEvent::CopyFinished(Ok(())));
+        assert!(a.clipboard_feedback.as_deref().unwrap().contains("copied"));
+        a.on_event(OperationEvent::CopyFinished(Err(
+            "Install wl-clipboard".into()
+        )));
+        assert!(
+            a.clipboard_feedback
+                .as_deref()
+                .unwrap()
+                .contains("wl-clipboard")
+        );
         assert!(a.logs.iter().all(|entry| !entry.english.contains(&token)));
         a.key(key(KeyCode::Esc));
         assert!(a.modal.is_none());

@@ -180,6 +180,7 @@ pub(super) struct App {
     pub logs: VecDeque<LogEntry>,
     pub log_offset: usize,
     pub status: String,
+    pub clipboard_feedback: Option<String>,
 }
 impl App {
     pub fn new(
@@ -219,6 +220,7 @@ impl App {
             logs: VecDeque::new(),
             log_offset: 0,
             status: "Ready".into(),
+            clipboard_feedback: None,
         };
         app.log(Level::Info, "NovaGPT started. Press ? for help.");
         app
@@ -355,6 +357,7 @@ impl App {
                 self.busy = false;
                 match result {
                     Ok(url) => {
+                        self.clipboard_feedback = None;
                         self.modal = Some(Modal::ConnectorUrl(url));
                         self.log_localized(
                             Level::Info,
@@ -365,11 +368,19 @@ impl App {
                 }
             }
             OperationEvent::CopyFinished(result) => match result {
-                Ok(()) => self.log_localized(
-                    Level::Success,
-                    i18n::Messages::url_copied_to_clipboard_on_request,
-                ),
-                Err(message) => self.log(Level::Error, message),
+                Ok(()) => {
+                    self.clipboard_feedback = Some(
+                        i18n::Messages::url_copied_to_clipboard_on_request(self.language()).into(),
+                    );
+                    self.log_localized(
+                        Level::Success,
+                        i18n::Messages::url_copied_to_clipboard_on_request,
+                    );
+                }
+                Err(message) => {
+                    self.clipboard_feedback = Some(message.clone());
+                    self.log(Level::Error, message);
+                }
             },
             OperationEvent::NovaSourceLoaded(result) => {
                 self.busy = false;

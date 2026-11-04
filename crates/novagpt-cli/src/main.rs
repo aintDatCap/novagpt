@@ -1,5 +1,6 @@
 //! Independent NovaGPT command-line entrypoint.
 mod chrome;
+mod clipboard;
 mod connection;
 mod i18n;
 mod logging;

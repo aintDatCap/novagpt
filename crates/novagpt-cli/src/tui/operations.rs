@@ -86,41 +86,7 @@ impl Controller {
             Effect::CopyConnectorUrl(url) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
-                    use std::{
-                        io::Write,
-                        process::{Command, Stdio},
-                    };
-                    let program = if cfg!(windows) {
-                        "clip.exe"
-                    } else if cfg!(target_os = "macos") {
-                        "pbcopy"
-                    } else {
-                        "wl-copy"
-                    };
-                    let result = (|| -> Result<(), String> {
-                        let mut process = Command::new(program)
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                            .map_err(|_| {
-                                "Clipboard unavailable: select the URL manually".to_string()
-                            })?;
-                        process
-                            .stdin
-                            .take()
-                            .ok_or("Clipboard standard input unavailable".to_string())?
-                            .write_all(url.as_bytes())
-                            .map_err(|_| "Clipboard write failed".to_string())?;
-                        if !process
-                            .wait()
-                            .map_err(|_| "Clipboard operation failed".to_string())?
-                            .success()
-                        {
-                            return Err("Clipboard operation failed".into());
-                        }
-                        Ok(())
-                    })();
+                    let result = crate::clipboard::copy(&url);
                     let _ = tx.send(OperationEvent::CopyFinished(result));
                 });
             }

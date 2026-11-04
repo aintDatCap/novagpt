@@ -103,6 +103,17 @@ novagpt --root /absolute/path/to/your-project connector-url --port 8787
 
 If you started it from the TUI, select **Show / copy ChatGPT URL** instead and press **C** to copy. The private URL is never copied automatically.
 
+On Linux the copy command uses a clipboard helper appropriate to the desktop session: `wl-copy` on Wayland or `xclip`/`xsel` on X11 (with fallback when one fails). A fresh installation might not include these commands. Install **wl-clipboard** or **xclip**, depending on your desktop:
+
+| Distribution | Wayland | X11 |
+| --- | --- | --- |
+| Ubuntu / Debian / Linux Mint | `sudo apt install wl-clipboard` | `sudo apt install xclip` |
+| Fedora | `sudo dnf install wl-clipboard` | `sudo dnf install xclip` |
+| Arch / Manjaro | `sudo pacman -S wl-clipboard` | `sudo pacman -S xclip` |
+| openSUSE | `sudo zypper install wl-clipboard` | `sudo zypper install xclip` |
+
+WSL uses `clip.exe` to access the Windows clipboard. If no graphical clipboard is accessible (for example, an SSH-only terminal), the TUI displays an error and keeps the URL visible for manual copying; it does not send your secret through unsupported terminal clipboard escape sequences. Confirm the selected clipboard helper works in your user session before copying sensitive URLs.
+
 ### 4. Create a ChatGPT plugin
 
 The complete URL has this shape:
