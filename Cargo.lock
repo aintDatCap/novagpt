@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-agents"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-browser"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "novagpt-browser-driver",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-browser-driver"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-cli"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -1472,7 +1472,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "hex",
  "reqwest",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-mcp"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "novagpt-vm"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "hex",
