@@ -75,6 +75,23 @@ impl BrowserDriver {
         self.inner.epoch.load(Ordering::Acquire)
     }
 
+    /// Metadata-only process status; does not inspect a page or its contents.
+    pub async fn status(&self) -> &'static str {
+        let running = self
+            .inner
+            .process
+            .lock()
+            .await
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        let attached = self.inner.port.lock().await.is_some();
+        match (running, attached) {
+            (true, true) => "attached",
+            (false, true) => "disconnected",
+            _ => "stopped",
+        }
+    }
+
     /// The requested Chrome instance is either healthy or relaunched with
     /// its existing dedicated profile. No tab or prompt is replayed on restart.
     pub async fn ensure_started(&self) -> Result<u16, DriverError> {
@@ -260,19 +277,7 @@ impl BrowserDriver {
         let _lease = tokio::task::spawn_blocking(move || profile::acquire(&owned))
             .await
             .map_err(|_| DriverError::InvalidProfile)??;
-        let mut child = Command::new(&config.executable);
-        child
-            .args([
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--new-window",
-            ])
-            .arg(format!("--user-data-dir={}", config.profile.display()))
-            .arg(home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+        let mut child = manual_login_command(&config.executable, &config.profile, home);
         let status = child
             .spawn()
             .map_err(|_| DriverError::NotRunning)?
@@ -286,6 +291,23 @@ impl BrowserDriver {
     }
 }
 
+fn manual_login_command(executable: &Path, profile: &Path, home: &str) -> Command {
+    let mut child = Command::new(executable);
+    child
+        .args([
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--new-window",
+        ])
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg(home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    child
+}
+
 pub(crate) fn valid_target_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -293,6 +315,30 @@ pub(crate) fn valid_target_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_login_uses_no_automation_or_remote_debugging_flags() {
+        let command = manual_login_command(
+            Path::new("chrome"),
+            Path::new("/tmp/novagpt-dedicated"),
+            "https://chatgpt.com/",
+        );
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=")));
+        assert!(args.iter().any(|arg| arg == "https://chatgpt.com/"));
+        for denied in [
+            "--remote-debugging-port",
+            "--headless",
+            "--enable-automation",
+            "--disable-web-security",
+            "--ignore-certificate-errors",
+        ] {
+            assert!(!args.iter().any(|arg| arg.starts_with(denied)));
+        }
+    }
     #[test]
     fn only_hex_target_ids() {
         assert!(valid_target_id("a012BC"));

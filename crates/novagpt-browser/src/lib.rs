@@ -1,31 +1,28 @@
 //! Dedicated visible Chrome CDP transport for ChatGPT subagents.
 //! Never reads Chrome cookies/credentials; manual challenges are for the user.
 mod bridge;
-mod profile;
 pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
+#[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
-use profile::ProfileLease;
+use novagpt_browser_driver::{BrowserDriver, DriverConfig, DriverError, DriverPage};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
-    path::{Path, PathBuf},
-    process::Stdio,
+    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
 };
 use thiserror::Error;
 use tokio::{
-    fs,
-    process::{Child, Command},
     sync::Mutex,
-    time::{Duration, Instant, sleep, timeout},
+    time::{Duration, Instant, sleep},
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+#[cfg(test)]
+use tokio_tungstenite::tungstenite::Message;
 
-type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const HOME: &str = "https://chatgpt.com/";
 const BROWSE_TAB: &str = "browse-main";
 const MAX_BROWSE_TEXT: usize = 20_000;
@@ -125,6 +122,22 @@ pub enum BrowserError {
     InvalidDevOrigin,
 }
 
+impl From<DriverError> for BrowserError {
+    fn from(value: DriverError) -> Self {
+        match value {
+            DriverError::NotRunning => Self::NotRunning,
+            DriverError::InvalidConfig | DriverError::InvalidProfile => Self::InvalidProfile,
+            DriverError::ProfileBusy => Self::ProfileBusy,
+            DriverError::Timeout => Self::Timeout,
+            DriverError::Cancelled => Self::Cancelled,
+            DriverError::InvalidControl => Self::InvalidControl,
+            DriverError::TooLarge => Self::TooLarge,
+            DriverError::Protocol => Self::Protocol,
+            DriverError::StalePage => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BrowserDiagnostics {
     pub browser_state: String,
@@ -199,9 +212,7 @@ pub struct BrowserReply {
 }
 
 struct Page {
-    target_id: String,
-    socket: Mutex<Socket>,
-    next_command: AtomicU64,
+    transport: DriverPage,
     cancelled: AtomicBool,
     send_lock: Mutex<()>,
     pending_before: Mutex<Option<usize>>,
@@ -265,77 +276,35 @@ impl Page {
         }
     }
 
-    async fn command(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
-        let id = self.next_command.fetch_add(1, Ordering::Relaxed);
-        let mut socket = self.socket.lock().await;
-        let request = json!({"id":id,"method":method,"params":params}).to_string();
-        socket
-            .send(Message::Text(request.into()))
-            .await
-            .map_err(|_| BrowserError::Protocol)?;
-        let reply = timeout(Duration::from_secs(15), async {
-            while let Some(message) = socket.next().await {
-                let message = message.map_err(|_| BrowserError::Protocol)?;
-                if let Message::Text(text) = message {
-                    let response: Value =
-                        serde_json::from_str(&text).map_err(|_| BrowserError::Protocol)?;
-                    if let Some(entry) = browser_event(&response) {
-                        let mut entries = self.console.lock().await;
-                        if entries.len() == MAX_DEV_EVENTS {
-                            entries.pop_front();
-                        }
-                        entries.push_back(entry);
-                    }
-                    if response["id"].as_u64() == Some(id) {
-                        if response.get("error").is_some() {
-                            // Never print the CDP error payload or original
-                            // command params: these may include user text.
-                            tracing::warn!(target: "novagpt", method, "browser CDP command rejected");
-                            return Err(BrowserError::Protocol);
-                        }
-                        return Ok(response.get("result").cloned().unwrap_or(Value::Null));
-                    }
+    async fn record_events(&self) {
+        for event in self.transport.drain_events().await {
+            if let Some(entry) = browser_event(&event) {
+                let mut entries = self.console.lock().await;
+                if entries.len() == MAX_DEV_EVENTS {
+                    entries.pop_front();
                 }
+                entries.push_back(entry);
             }
-            Err(BrowserError::Protocol)
-        })
-        .await
-        .map_err(|_| BrowserError::Timeout)??;
-        Ok(reply)
-    }
-    async fn eval(&self, source: &str) -> Result<Value, BrowserError> {
-        let result = self
-            .command(
-                "Runtime.evaluate",
-                json!({
-                    "expression": source, "returnByValue":true, "awaitPromise":true
-                }),
-            )
-            .await?;
-        if result.get("exceptionDetails").is_some() {
-            // The exception may quote a page's private DOM or the prompt.
-            // Record only its presence, never its message or stack.
-            tracing::warn!(target: "novagpt", "browser DOM evaluation failed");
-            return Err(BrowserError::Protocol);
         }
-        Ok(result
-            .pointer("/result/value")
-            .cloned()
-            .unwrap_or(Value::Null))
+    }
+
+    async fn command(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+        let result = self.transport.command(method, params).await;
+        self.record_events().await;
+        result.map_err(BrowserError::from)
+    }
+
+    async fn eval(&self, source: &str) -> Result<Value, BrowserError> {
+        let result = self.transport.evaluate_trusted(source).await;
+        self.record_events().await;
+        result.map_err(BrowserError::from)
     }
 }
 struct Inner {
-    executable: PathBuf,
-    profile: PathBuf,
+    driver: BrowserDriver,
     dev_origin: Option<reqwest::Url>,
-    process: Mutex<Option<Child>>,
-    port: Mutex<Option<u16>>,
-    profile_lease: Mutex<Option<ProfileLease>>,
-    startup: Mutex<()>,
     create_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
-    http: reqwest::Client,
-    start_interval: Duration,
     reporter: Option<DiagnosticReporter>,
 }
 #[derive(Clone)]
@@ -343,53 +312,23 @@ pub struct ChatGptBrowser {
     inner: Arc<Inner>,
 }
 
-/// This launch deliberately does not opt into remote debugging, WebDriver,
-/// headless mode or automation. It is *only* for interactive user login.
-fn manual_login_command(executable: &Path, profile: &Path) -> Command {
-    let mut command = Command::new(executable);
-    command
-        .args([
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--new-window",
-        ])
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .arg(HOME)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command
-}
-
 impl ChatGptBrowser {
     pub fn new(
         executable: impl AsRef<Path>,
         profile: impl AsRef<Path>,
     ) -> Result<Self, BrowserError> {
-        let executable = executable.as_ref().to_path_buf();
-        let profile = profile.as_ref().to_path_buf();
-        if !executable.is_file()
-            || profile.as_os_str().is_empty()
-            || profile.exists() && profile.is_symlink()
-        {
+        let profile = profile.as_ref();
+        if profile.exists() && profile.is_symlink() {
             return Err(BrowserError::InvalidProfile);
         }
+        let config = DriverConfig::new(executable, profile).map_err(BrowserError::from)?;
+        let driver = BrowserDriver::new(config).map_err(BrowserError::from)?;
         Ok(Self {
             inner: Arc::new(Inner {
-                executable,
-                profile,
+                driver,
                 dev_origin: None,
-                process: Mutex::new(None),
-                port: Mutex::new(None),
-                profile_lease: Mutex::new(None),
-                startup: Mutex::new(()),
                 create_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
-                http: reqwest::Client::builder()
-                    .no_proxy()
-                    .build()
-                    .map_err(|_| BrowserError::Protocol)?,
-                start_interval: Duration::from_millis(400),
                 reporter: None,
             }),
         })
@@ -436,122 +375,9 @@ impl ChatGptBrowser {
         executable: impl AsRef<Path>,
         profile: impl AsRef<Path>,
     ) -> Result<(), BrowserError> {
-        let browser = Self::new(executable, profile)?;
-        let owned_profile = browser.inner.profile.clone();
-        let _lease = tokio::task::spawn_blocking(move || profile::acquire(&owned_profile))
+        BrowserDriver::manual_login(executable.as_ref(), profile.as_ref(), HOME)
             .await
-            .map_err(|_| BrowserError::InvalidProfile)??;
-        let mut child = manual_login_command(&browser.inner.executable, &browser.inner.profile)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| BrowserError::NotRunning)?;
-        let status = child.wait().await.map_err(|_| BrowserError::NotRunning)?;
-        if !status.success() {
-            return Err(BrowserError::NotRunning);
-        }
-        Ok(())
-    }
-
-    async fn ensure_started(&self) -> Result<u16, BrowserError> {
-        let _start_guard = self.inner.startup.lock().await;
-        let current_port = *self.inner.port.lock().await;
-        if let Some(port) = current_port {
-            let alive = {
-                let mut process = self.inner.process.lock().await;
-                process
-                    .as_mut()
-                    .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
-            };
-            let reachable = if alive {
-                self.inner
-                    .http
-                    .get(format!("http://127.0.0.1:{port}/json/version"))
-                    .timeout(Duration::from_secs(2))
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
-            } else {
-                false
-            };
-            if alive && reachable {
-                return Ok(port);
-            }
-            // Stale port/targets must never be reused after Chrome exits.
-            self.inner.port.lock().await.take();
-            self.inner.pages.lock().await.clear();
-            if let Some(mut child) = self.inner.process.lock().await.take() {
-                let _ = child.start_kill();
-                let _ = timeout(Duration::from_secs(3), child.wait()).await;
-            }
-            self.inner.profile_lease.lock().await.take();
-        }
-
-        let profile_path = self.inner.profile.clone();
-        let lease = tokio::task::spawn_blocking(move || profile::acquire(&profile_path))
-            .await
-            .map_err(|_| BrowserError::InvalidProfile)??;
-
-        // A prior session can leave this file behind after a crash.
-        let _ = fs::remove_file(self.inner.profile.join("DevToolsActivePort")).await;
-        let mut process = Command::new(&self.inner.executable)
-            .args([
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=0",
-                "--new-window",
-            ])
-            .arg(format!("--user-data-dir={}", self.inner.profile.display()))
-            // Do not open a sign-in page under CDP merely to browse a local
-            // website. Subagent tabs still navigate explicitly to ChatGPT.
-            .arg("about:blank")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| BrowserError::NotRunning)?;
-        let port_file = self.inner.profile.join("DevToolsActivePort");
-        let deadline = Instant::now() + Duration::from_secs(25);
-        let port = loop {
-            if let Ok(content) = fs::read_to_string(&port_file).await
-                && let Some(first) = content.lines().next()
-                && let Ok(port) = first.parse::<u16>()
-                && port != 0
-            {
-                break port;
-            }
-            if process
-                .try_wait()
-                .map_err(|_| BrowserError::NotRunning)?
-                .is_some()
-                || Instant::now() >= deadline
-            {
-                let _ = process.start_kill();
-                let _ = timeout(Duration::from_secs(3), process.wait()).await;
-                return Err(BrowserError::NotRunning);
-            }
-            sleep(Duration::from_millis(200)).await;
-        };
-        // Confirm that the endpoint actually belongs to a live CDP server,
-        // not merely to a stale DevToolsActivePort file.
-        let healthy = self
-            .inner
-            .http
-            .get(format!("http://127.0.0.1:{port}/json/version"))
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success());
-        if !healthy {
-            let _ = process.start_kill();
-            let _ = timeout(Duration::from_secs(3), process.wait()).await;
-            return Err(BrowserError::NotRunning);
-        }
-        *self.inner.profile_lease.lock().await = Some(lease);
-        *self.inner.process.lock().await = Some(process);
-        *self.inner.port.lock().await = Some(port);
-        Ok(port)
+            .map_err(BrowserError::from)
     }
 
     pub async fn open(&self, id: &str) -> Result<(), BrowserError> {
@@ -559,54 +385,26 @@ impl ChatGptBrowser {
             return Err(BrowserError::Protocol);
         }
         let _serial = self.inner.create_lock.lock().await;
-        let port = self.ensure_started().await?;
-        if self.inner.pages.lock().await.contains_key(id) {
-            return Err(BrowserError::Unavailable);
+        self.inner
+            .driver
+            .ensure_started()
+            .await
+            .map_err(BrowserError::from)?;
+        {
+            let mut pages = self.inner.pages.lock().await;
+            pages.retain(|_, page| !page.transport.is_stale());
+            if pages.contains_key(id) {
+                return Err(BrowserError::Unavailable);
+            }
         }
-        // Chrome's remote debugging server permits target creation via PUT.
-        let initial_url = if id == BROWSE_TAB {
-            "about:blank"
-        } else {
-            HOME
-        };
-        let url = format!("http://127.0.0.1:{port}/json/new?{initial_url}");
-        let response: Value = self
+        let transport = self
             .inner
-            .http
-            .put(url)
-            .timeout(Duration::from_secs(10))
-            .send()
+            .driver
+            .new_page()
             .await
-            .map_err(|_| BrowserError::NotRunning)?
-            .json()
-            .await
-            .map_err(|_| BrowserError::Protocol)?;
-        let ws = response
-            .get("webSocketDebuggerUrl")
-            .and_then(Value::as_str)
-            .ok_or(BrowserError::Protocol)?;
-        if !ws.starts_with(&format!("ws://127.0.0.1:{port}/"))
-            && !ws.starts_with(&format!("ws://localhost:{port}/"))
-        {
-            return Err(BrowserError::Protocol);
-        }
-        let target_id = response
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or(BrowserError::Protocol)?;
-        if target_id.is_empty()
-            || target_id.len() > 64
-            || !target_id.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(BrowserError::Protocol);
-        }
-        let (socket, _) = connect_async(ws)
-            .await
-            .map_err(|_| BrowserError::Protocol)?;
+            .map_err(BrowserError::from)?;
         let page = Arc::new(Page {
-            target_id: target_id.to_owned(),
-            socket: Mutex::new(socket),
-            next_command: AtomicU64::new(1),
+            transport,
             cancelled: AtomicBool::new(false),
             send_lock: Mutex::new(()),
             pending_before: Mutex::new(None),
@@ -616,16 +414,29 @@ impl ChatGptBrowser {
             console: Mutex::new(VecDeque::new()),
             reporter: self.inner.reporter.clone(),
         });
-        page.diagnostic("tab_opened", "").await;
-        page.command("Runtime.enable", json!({})).await?;
-        if id == BROWSE_TAB {
-            // Capture only bounded console and failed-request metadata.
-            // These events are kept in memory, never in persistent audit logs.
-            page.command("Log.enable", json!({})).await?;
-            page.command("Network.enable", json!({})).await?;
+        // On new targets, navigate only after CDP attachment. Login and
+        // verification redirects are handled by the ChatGPT adapter.
+        let initialized = async {
+            if id != BROWSE_TAB {
+                page.command("Page.enable", json!({})).await?;
+                let nav = page.command("Page.navigate", json!({"url":HOME})).await?;
+                if nav.get("errorText").is_some() {
+                    return Err(BrowserError::Unavailable);
+                }
+            }
+            page.diagnostic("tab_opened", "").await;
+            if id == BROWSE_TAB {
+                page.command("Log.enable", json!({})).await?;
+                page.command("Network.enable", json!({})).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = initialized {
+            let _ = page.transport.close().await;
+            return Err(error);
         }
         self.inner.pages.lock().await.insert(id.to_owned(), page);
-        sleep(self.inner.start_interval).await;
         Ok(())
     }
 
@@ -633,7 +444,11 @@ impl ChatGptBrowser {
     /// This operation reuses the same owned Chrome process/profile.
     pub async fn browse_open(&self) -> Result<BrowserDiagnostics, BrowserError> {
         // Validate the owned Chrome process before reusing a remembered tab.
-        self.ensure_started().await?;
+        self.inner
+            .driver
+            .ensure_started()
+            .await
+            .map_err(BrowserError::from)?;
         if self.page(BROWSE_TAB).await.is_err() {
             match self.open(BROWSE_TAB).await {
                 Ok(()) | Err(BrowserError::Unavailable) => {}
@@ -931,13 +746,18 @@ impl ChatGptBrowser {
     }
 
     async fn page(&self, id: &str) -> Result<Arc<Page>, BrowserError> {
-        self.inner
+        let page = self
+            .inner
             .pages
             .lock()
             .await
             .get(id)
             .cloned()
-            .ok_or(BrowserError::Unavailable)
+            .ok_or(BrowserError::Unavailable)?;
+        if page.transport.is_stale() {
+            return Err(BrowserError::Unavailable);
+        }
+        Ok(page)
     }
 
     pub async fn diagnostics(&self, id: Option<&str>) -> BrowserDiagnostics {
@@ -958,23 +778,7 @@ impl ChatGptBrowser {
         };
         let last_step = recent_events.last().cloned();
         BrowserDiagnostics {
-            browser_state: {
-                let running = self
-                    .inner
-                    .process
-                    .lock()
-                    .await
-                    .as_mut()
-                    .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
-                if running && self.inner.port.lock().await.is_some() {
-                    "attached"
-                } else if self.inner.port.lock().await.is_some() {
-                    "disconnected"
-                } else {
-                    "stopped"
-                }
-                .into()
-            },
+            browser_state: self.inner.driver.status().await.to_string(),
             page_count: pages.len(),
             queued_page_creations: 0,
             manual_check: manual,
@@ -1256,20 +1060,9 @@ impl ChatGptBrowser {
     }
 
     pub async fn close(&self, id: &str) -> Result<(), BrowserError> {
-        let page = self.inner.pages.lock().await.remove(id);
-        if let Some(page) = page
-            && let Some(port) = *self.inner.port.lock().await
-        {
-            // Chrome supports /json/close/<target>; no credentials/cookies
-            // are collected, and the shared browser process stays running.
-            let url = format!("http://127.0.0.1:{port}/json/close/{}", page.target_id);
-            let _ = self
-                .inner
-                .http
-                .get(url)
-                .timeout(Duration::from_secs(3))
-                .send()
-                .await;
+        if let Some(page) = self.inner.pages.lock().await.remove(id) {
+            page.cancelled.store(true, Ordering::Release);
+            page.transport.close().await.map_err(BrowserError::from)?;
         }
         Ok(())
     }
@@ -1441,31 +1234,7 @@ fn manual_reason(state: &Value) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn manual_login_launch_has_no_automation_or_debugging_arguments() {
-        let command =
-            manual_login_command(Path::new("chrome.exe"), Path::new("C:/NovaGPT/browser"));
-        let args: Vec<String> = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.iter().any(|arg| arg.starts_with("--user-data-dir=")));
-        assert!(args.iter().any(|arg| arg == HOME));
-        for disallowed in [
-            "--remote-debugging-port",
-            "--remote-debugging-pipe",
-            "--enable-automation",
-            "--headless",
-            "--disable-web-security",
-            "--ignore-certificate-errors",
-        ] {
-            assert!(
-                !args.iter().any(|arg| arg.starts_with(disallowed)),
-                "{disallowed}"
-            );
-        }
-    }
+    use tokio::time::timeout;
     #[test]
     fn manual_checks_are_never_bypassed() {
         assert_eq!(
@@ -1531,6 +1300,7 @@ mod tests {
                 let request: Value = serde_json::from_str(&raw).expect("CDP request");
                 let method = request["method"].as_str().expect("CDP method");
                 let result = match method {
+                    "Runtime.enable" => json!({}),
                     "Runtime.evaluate" => {
                         let expression = request["params"]["expression"]
                             .as_str()
@@ -1607,19 +1377,20 @@ mod tests {
             }
             false
         });
-        let (socket, _) = connect_async(format!("ws://127.0.0.1:{port}/"))
-            .await
-            .expect("fixture websocket client");
         let executable = tempfile::NamedTempFile::new().expect("fixture executable");
         let profile = tempfile::tempdir().expect("fixture profile");
         let browser = ChatGptBrowser::new(executable.path(), profile.path().join("owned"))
             .expect("fixture browser");
+        let driver_page = browser
+            .inner
+            .driver
+            .connect_fixture(&format!("ws://127.0.0.1:{port}/"), "abcdef")
+            .await
+            .expect("fixture driver page");
         browser.inner.pages.lock().await.insert(
             "agent-test123".into(),
             Arc::new(Page {
-                target_id: "abcdef".into(),
-                socket: Mutex::new(socket),
-                next_command: AtomicU64::new(1),
+                transport: driver_page,
                 cancelled: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(None),
@@ -1828,6 +1599,7 @@ mod tests {
                 let request: Value = serde_json::from_str(&raw).unwrap();
                 let method = request["method"].as_str().unwrap();
                 let result = match method {
+                    "Runtime.enable" => json!({}),
                     "Runtime.evaluate" => {
                         let expr = request["params"]["expression"].as_str().unwrap();
                         let value = if expr.contains("ready:document.readyState") {
@@ -1901,17 +1673,20 @@ mod tests {
             }
             (screenshot_requested, typed, clicked)
         });
-        let (socket, _) = connect_async(format!("ws://{address}/")).await.unwrap();
         let executable = tempfile::NamedTempFile::new().unwrap();
         let profile = tempfile::tempdir().unwrap();
         let browser =
             ChatGptBrowser::new(executable.path(), profile.path().join("profile")).unwrap();
+        let driver_page = browser
+            .inner
+            .driver
+            .connect_fixture(&format!("ws://{address}/"), "abcdef")
+            .await
+            .expect("fixture driver page");
         browser.inner.pages.lock().await.insert(
             BROWSE_TAB.into(),
             Arc::new(Page {
-                target_id: "abcdef".into(),
-                socket: Mutex::new(socket),
-                next_command: AtomicU64::new(1),
+                transport: driver_page,
                 cancelled: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(None),

@@ -1397,8 +1397,8 @@ dependencies = [
 name = "novagpt-browser"
 version = "0.2.2"
 dependencies = [
- "fs2",
  "futures-util",
+ "novagpt-browser-driver",
  "reqwest",
  "serde",
  "serde_json",
