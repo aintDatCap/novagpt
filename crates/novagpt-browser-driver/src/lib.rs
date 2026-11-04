@@ -4,6 +4,9 @@
 //! conversations, credentials or identity-provider policy.
 mod config;
 mod error;
+mod lifecycle;
+mod profile;
 
 pub use config::{DriverConfig, discover_chrome};
 pub use error::DriverError;
+pub use lifecycle::{BrowserDriver, TargetInfo};
