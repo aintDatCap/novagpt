@@ -1410,6 +1410,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "novagpt-browser-driver"
+version = "0.2.2"
+dependencies = [
+ "fs2",
+ "futures-util",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "novagpt-cli"
 version = "0.2.2"
 dependencies = [

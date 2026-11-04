@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/novagpt-core", "crates/novagpt-mcp", "crates/novagpt-cli", "crates/novagpt-vm", "crates/novagpt-agents", "crates/novagpt-browser"]
+members = ["crates/novagpt-core", "crates/novagpt-mcp", "crates/novagpt-cli", "crates/novagpt-vm", "crates/novagpt-agents", "crates/novagpt-browser", "crates/novagpt-browser-driver"]
 resolver = "2"
 
 [workspace.package]
