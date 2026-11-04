@@ -360,7 +360,7 @@ fn commands(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!(
                     "  {}  {}",
                     event.time.split_whitespace().next().unwrap_or(""),
-                    &event.english
+                    event.english
                 ),
                 Style::default().fg(color),
             )));
@@ -725,6 +725,7 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
                 }
                 Confirm::Save => Messages::save_settings_in_novagpt_config_json(lang),
                 Confirm::Import => Messages::confirm_import_port(lang),
+                Confirm::InstallNgrok => Messages::install_ngrok_confirm(lang),
                 Confirm::RemoveRoot => {
                     Messages::revoke_this_authorized_directory_from_the_draft(lang)
                 }

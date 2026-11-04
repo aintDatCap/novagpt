@@ -83,6 +83,10 @@ macro_rules! messages {
 
 messages! {
     static {
+        ngrok_missing_prompt: { en: "ngrok is not installed. Confirm to install it using your system package manager.", it: "ngrok non è installato. Conferma per installarlo tramite il gestore pacchetti di sistema." },
+        install_ngrok_confirm: { en: "Install ngrok now through your OS package manager? This may request system permissions. You must configure your ngrok account separately.", it: "Installare ngrok tramite il gestore pacchetti? Potrebbero servire permessi di sistema. Configura poi il tuo account ngrok separatamente." },
+        ngrok_install_requested: { en: "ngrok installation requested through a supported package manager.", it: "Installazione di ngrok richiesta tramite un gestore pacchetti supportato." },
+        ngrok_installed: { en: "ngrok installed. Configure your ngrok account, then select Start MCP + ngrok again.", it: "ngrok installato. Configura il tuo account ngrok e seleziona di nuovo Avvia MCP + ngrok." },
         auto_start_mcp: { en: "Start MCP automatically when NovaGPT opens", it: "Avvia MCP automaticamente all'apertura di NovaGPT" },
         auto_start_mcp_help: { en: "Start MCP when opening the TUI with novagpt. Setup mode never starts it automatically.", it: "Avvia MCP aprendo la TUI con novagpt. Il setup non lo avvia automaticamente." },
         auto_start_changed: { en: "Automatic MCP startup preference changed; save to apply.", it: "Preferenza di avvio automatico MCP modificata; salva per applicarla." },

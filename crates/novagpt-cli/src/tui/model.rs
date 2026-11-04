@@ -91,6 +91,7 @@ pub(super) enum Confirm {
     RemoveRoot,
     Discard,
     Stop,
+    InstallNgrok,
     Quit,
 }
 #[derive(Clone, Debug)]
@@ -111,6 +112,7 @@ pub(super) enum Effect {
     ShowConnectorUrl(u16),
     CopyConnectorUrl(String),
     Stop,
+    InstallNgrok,
     Diagnose(LocalSettings),
     Inventory,
     AddRoot(PathBuf),
@@ -133,6 +135,8 @@ pub(super) enum OperationEvent {
     Log(Level, String),
     Server(ServerState),
     TunnelReady,
+    NgrokMissing,
+    NgrokInstallFinished(Result<(), String>),
     RootAdded(Result<PathBuf, String>),
     ChromeChecked(bool),
     VmInventory(Result<usize, String>),
@@ -319,6 +323,20 @@ impl App {
                 }
             }
             OperationEvent::TunnelReady => self.tunnel_ready = true,
+            OperationEvent::NgrokMissing => {
+                self.server = ServerState::Stopped;
+                self.running_config = None;
+                self.tunnel_ready = false;
+                self.confirm(Confirm::InstallNgrok);
+                self.log_localized(Level::Warn, i18n::Messages::ngrok_missing_prompt);
+            }
+            OperationEvent::NgrokInstallFinished(result) => {
+                self.busy = false;
+                match result {
+                    Ok(()) => self.log_localized(Level::Success, i18n::Messages::ngrok_installed),
+                    Err(message) => self.log(Level::Error, message),
+                }
+            }
             OperationEvent::VmInventory(result) => {
                 self.busy = false;
                 match result {
@@ -795,6 +813,14 @@ impl App {
     }
     fn accepted(&mut self, action: Confirm) -> Option<Effect> {
         match action {
+            Confirm::InstallNgrok => {
+                if self.busy {
+                    return None;
+                }
+                self.busy = true;
+                self.log_localized(Level::Info, i18n::Messages::ngrok_install_requested);
+                Some(Effect::InstallNgrok)
+            }
             Confirm::Stop => {
                 self.server = ServerState::Stopped;
                 self.tunnel_ready = false;

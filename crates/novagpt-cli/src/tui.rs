@@ -337,6 +337,32 @@ mod tests {
         assert!(app.dirty());
     }
     #[test]
+    fn missing_ngrok_requires_explicit_install_confirmation() {
+        let mut app = app();
+        app.server = ServerState::Starting;
+        app.on_event(OperationEvent::NgrokMissing);
+        assert_eq!(app.server, ServerState::Stopped);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm(model::Confirm::InstallNgrok))
+        ));
+        assert!(!app.yes, "never default to installing software");
+        app.key(key(KeyCode::Enter)); // default No
+        assert!(!app.busy);
+        assert!(app.modal.is_none());
+        app.on_event(OperationEvent::NgrokMissing);
+        assert!(matches!(
+            app.key(key(KeyCode::Char('y'))),
+            Some(Effect::InstallNgrok)
+        ));
+        assert!(app.busy);
+        app.on_event(OperationEvent::NgrokInstallFinished(Ok(())));
+        assert!(!app.busy);
+        assert!(app.logs.back().unwrap().english.contains("ngrok installed"));
+        assert_eq!(app.server, ServerState::Stopped);
+    }
+
+    #[test]
     fn automatic_mcp_start_is_opt_in_and_never_runs_during_setup() {
         let mut disabled = app();
         assert!(disabled.start_on_launch().is_none());

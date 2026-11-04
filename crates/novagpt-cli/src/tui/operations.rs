@@ -17,6 +17,7 @@ pub(super) struct Controller {
     tx: UnboundedSender<OperationEvent>,
     server: Option<JoinHandle<()>>,
     browser_login: Option<JoinHandle<()>>,
+    installer: Option<JoinHandle<()>>,
 }
 impl Controller {
     pub fn new(runtime: Handle, tx: UnboundedSender<OperationEvent>) -> Self {
@@ -25,6 +26,7 @@ impl Controller {
             tx,
             server: None,
             browser_login: None,
+            installer: None,
         }
     }
     fn report(&self, level: Level, message: impl Into<String>) {
@@ -37,10 +39,27 @@ impl Controller {
                 if let Some(task) = self.browser_login.take() {
                     task.abort();
                 }
+                if let Some(task) = self.installer.take() {
+                    task.abort();
+                }
                 return false;
             }
             Effect::Start(settings) => self.start(root, settings, false),
             Effect::StartNgrok(settings) => self.start(root, settings, true),
+            Effect::InstallNgrok => {
+                if self
+                    .installer
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+                {
+                    return true;
+                }
+                let tx = self.tx.clone();
+                self.installer = Some(self.runtime.spawn(async move {
+                    let result = crate::ngrok_install::install().await.map_err(str::to_owned);
+                    let _ = tx.send(OperationEvent::NgrokInstallFinished(result));
+                }));
+            }
             Effect::ShowConnectorUrl(port) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn(async move {
@@ -285,6 +304,10 @@ impl Controller {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
         let tx = self.tx.clone();
         let task = self.runtime.spawn(async move {
+            if ngrok && !crate::ngrok_install::available().await {
+                let _ = tx.send(OperationEvent::NgrokMissing);
+                return;
+            }
             let tx_info = tx.clone();
             let ngrok_domain = config.ngrok_domain.clone();
             let setup = tokio::task::spawn_blocking(move || -> Result<_, String> {
@@ -480,6 +503,9 @@ impl Drop for Controller {
             task.abort();
         }
         if let Some(task) = self.browser_login.take() {
+            task.abort();
+        }
+        if let Some(task) = self.installer.take() {
             task.abort();
         }
     }

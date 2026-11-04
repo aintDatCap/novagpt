@@ -3,6 +3,7 @@ mod chrome;
 mod connection;
 mod i18n;
 mod logging;
+mod ngrok_install;
 mod settings;
 mod token;
 mod tui;
