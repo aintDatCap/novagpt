@@ -230,6 +230,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "reconnect_workspace",
         "codex_context",
         "server_config",
+        "debug_restart",
         "list_workspaces",
         "workspace_snapshot",
         "inspect_workspace",
@@ -270,7 +271,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 56);
+    assert_eq!(listed.len(), 57);
     // MCP server tool registration is distinct from the ChatGPT client's
     // selected connector schema. Ensure new callers can discover the actual
     // arguments needed for authenticated child preflight.

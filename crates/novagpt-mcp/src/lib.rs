@@ -537,6 +537,79 @@ where
     }
 }
 
+#[cfg(unix)]
+async fn send_dev_restart(path: &std::path::Path) -> NovaResult<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(path)
+            .await
+            .map_err(|_| NovaError::InvalidInput("Manual-restart supervisor unavailable".into()))?;
+        stream
+            .write_all(b"restart\n")
+            .await
+            .map_err(|_| NovaError::InvalidInput("Could not request manual restart".into()))?;
+        let mut response = Vec::with_capacity(16);
+        let mut reader = tokio::io::BufReader::new(stream.take(16));
+        reader
+            .read_until(b'\n', &mut response)
+            .await
+            .map_err(|_| NovaError::InvalidInput("No manual-restart acknowledgement".into()))?;
+        match response.as_slice() {
+            b"accepted\n" => Ok(serde_json::json!({
+                "scheduled": true,
+                "message": "Rebuild and graceful restart scheduled by the development supervisor"
+            })),
+            b"pending\n" => Ok(serde_json::json!({
+                "scheduled": false,
+                "message": "A manual restart is already scheduled"
+            })),
+            _ => Err(NovaError::InvalidInput(
+                "Invalid manual-restart acknowledgement".into(),
+            )),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), exchange)
+        .await
+        .map_err(|_| NovaError::InvalidInput("Manual-restart supervisor timed out".into()))?
+}
+
+#[cfg(all(test, unix))]
+mod debug_restart_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn socket_acknowledgements_are_checked() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let socket_path = directory.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
+        let worker = tokio::spawn(async move {
+            for response in [b"accepted\n".as_slice(), b"pending\n".as_slice()] {
+                let (mut stream, _) = listener.accept().await.expect("connection");
+                let mut command = [0; 8];
+                stream.read_exact(&mut command).await.expect("command");
+                assert_eq!(&command, b"restart\n");
+                stream.write_all(response).await.expect("reply");
+            }
+        });
+        let accepted = send_dev_restart(&socket_path).await.expect("accepted");
+        assert_eq!(accepted["scheduled"], true);
+        let pending = send_dev_restart(&socket_path).await.expect("pending");
+        assert_eq!(pending["scheduled"], false);
+        worker.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn missing_supervisor_returns_a_safe_error() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let error = send_dev_restart(&directory.path().join("missing.sock"))
+            .await
+            .expect_err("missing control socket must fail");
+        assert!(error.to_string().contains("supervisor unavailable"));
+    }
+}
+
 #[tool_router]
 impl NovaMcp {
     #[tool(
@@ -559,8 +632,29 @@ impl NovaMcp {
                 "audit_mode": self.extras.audit.snapshot(1).mode,
                 "write_mode": "workspace-guarded",
                 "transport_session_is_conversation_identity": false,
+                "debug_manual_restart_enabled": std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET").is_some(),
             }))),
         )
+    }
+
+    #[tool(
+        description = "Request a manual rebuild and graceful MCP restart from the external POSIX development supervisor started by script/dev.py. Source changes never restart it automatically. Unavailable outside this supervised development mode; the current MCP connection may disconnect after acknowledgement."
+    )]
+    async fn debug_restart(&self) -> CallToolResult {
+        #[cfg(unix)]
+        let result = match std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET") {
+            Some(socket) if std::path::Path::new(&socket).is_absolute() => {
+                send_dev_restart(std::path::Path::new(&socket)).await
+            }
+            _ => Err(NovaError::InvalidInput(
+                "Manual restart is unavailable; launch NovaGPT through script/dev.py".into(),
+            )),
+        };
+        #[cfg(not(unix))]
+        let result: NovaResult<serde_json::Value> = Err(NovaError::InvalidInput(
+            "Manual development restart is available only on POSIX".into(),
+        ));
+        self.observed("debug_restart", tool_reply(result))
     }
 
     #[tool(

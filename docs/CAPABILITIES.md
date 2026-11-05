@@ -12,6 +12,7 @@ This document tracks observable NovaGPT functionality and test coverage. Statuse
 | MCP stdio and Streamable HTTP | IMPLEMENTED / PARTIAL | Local POST/GET/SSE/DELETE, authorization, host validation, audit integration tests; full public client test needed |
 | HTTP private connector URLs | IMPLEMENTED | URL builder uses `novagpt_token`, token authorization tests cover query and bearer credentials; keep URLs secret |
 | ngrok CLI/TUI lifecycle | IMPLEMENTED / PARTIAL | Port ownership, public hostname matching, tunnel cleanup and mocked ngrok tests; live end-to-end public client behavior is environment dependent |
+| Debug-only manual MCP restart | IMPLEMENTED / PARTIAL | POSIX `script/dev.py` never restarts automatically; it exposes an owner-private Unix socket to its own child so authenticated `debug_restart` can schedule a controlled rebuild/restart. Unit tests cover accepted, duplicate, invalid and unavailable requests; live tunnel reconnect and process restart triggered from a ChatGPT client remain unverified. |
 | TUI setup, language, settings and auto-start | IMPLEMENTED | UI-model tests cover default Automatic locale, English fallback, explicit save, opt-in normal startup, no startup during setup |
 | ngrok installation consent | IMPLEMENTED / PARTIAL | TUI confirmation tests and deterministic package-manager selection; platform installers still need interactive OS tests |
 | HTTP token management, private audit | IMPLEMENTED / PARTIAL | Token migration/reuse, redaction and bounded log tests; platform ACL and abrupt-exit guarantees incomplete |
@@ -34,6 +35,6 @@ This document tracks observable NovaGPT functionality and test coverage. Statuse
 
 ## Verification process
 
-For Rust changes, run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace`, and `cargo test --workspace`. For the POSIX development watcher, also run `python3 -m unittest discover -s script -p 'test_dev.py'`.
+For Rust changes, run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace`, and `cargo test --workspace`. For the POSIX development supervisor, also run `python3 -m unittest discover -s script -p 'test_dev.py'`.
 
 When making a claim about a feature, record the executable test command, operating system, outcome and limits. Successful compilation alone is not validation of user-visible behavior. Consult [QUALITY_GATES.md](QUALITY_GATES.md) and [ARCHITECTURE.md](ARCHITECTURE.md) for security and release criteria.

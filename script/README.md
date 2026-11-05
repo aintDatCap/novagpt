@@ -1,5 +1,9 @@
 # Releases and installation
 
+## Local development supervisor
+
+Launch with `python3 script/dev.py`. It builds and starts NovaGPT once, then **never automatically rebuilds or restarts** when source files change or the server exits. After making edits, call the authenticated MCP tool `debug_restart` to request one rebuild and graceful restart. A failed build keeps the current server online; if the new binary fails readiness checks, the supervisor attempts to restore the previous working build. Duplicate requests are reported as pending. The MCP response acknowledges **scheduling**, not successful deployment. The restart briefly interrupts MCP connections and may change a dynamic tunnel URL. This POSIX-only supervisor uses an owner-private local Unix socket; ordinary/production and stdio MCP processes have no restart control. There is no auto-restart flag or mode. To upgrade an already running supervisor, stop it and relaunch the updated `script/dev.py`.
+
 ## GitHub Actions
 
 All workflow variants use Rust-version-aware dependency caching; the three native release targets also upload Cargo timing reports. Linux release builds use Clang + LLVM LLD where installed, with a system-linker fallback. See [build performance and per-target settings](../docs/BUILD_PERFORMANCE.md) for commands, trade-offs, and measurement limits.

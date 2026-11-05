@@ -4,7 +4,10 @@ from pathlib import Path
 import shutil
 import socket
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 from dev import Runner, sources, stop_owned
 
@@ -60,13 +63,95 @@ class DevRunnerTests(unittest.TestCase):
         path.chmod(0o700)
         return path
 
-    def test_watcher_tracks_sources_not_generated_files(self):
+    def test_build_snapshot_tracks_sources_not_generated_files(self):
         initial = sources(self.root)
         (self.root / "target").mkdir()
         (self.root / "target" / "generated.rs").write_text("changed", encoding="utf-8")
         self.assertEqual(initial, sources(self.root))
         (self.root / "crates" / "new.rs").write_text("different", encoding="utf-8")
         self.assertNotEqual(initial, sources(self.root))
+
+    def test_manual_restart_requires_an_explicit_socket_request(self):
+        self.runner.open_manual_control()
+        self.addCleanup(self.runner.close_manual_control)
+        path = self.runner.control_path
+        self.assertIsNotNone(path)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertIsNone(self.runner.restart_due_at)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1)
+            connection.connect(str(path))
+            connection.sendall(b"restart\n")
+            self.runner.poll_manual_control()
+            self.assertEqual(connection.recv(32), b"accepted\n")
+        self.assertIsNotNone(self.runner.restart_due_at)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as duplicate:
+            duplicate.settimeout(1)
+            duplicate.connect(str(path))
+            duplicate.sendall(b"restart\n")
+            self.runner.poll_manual_control()
+            self.assertEqual(duplicate.recv(32), b"pending\n")
+
+    def test_manual_restart_rejects_unknown_commands(self):
+        self.runner.open_manual_control()
+        self.addCleanup(self.runner.close_manual_control)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(1)
+            connection.connect(str(self.runner.control_path))
+            connection.sendall(b"not-restart\n")
+            self.runner.poll_manual_control()
+            self.assertEqual(connection.recv(32), b"invalid\n")
+        self.assertIsNone(self.runner.restart_due_at)
+
+    def test_manual_restart_is_available_by_default(self):
+        self.runner.open_manual_control()
+        self.addCleanup(self.runner.close_manual_control)
+        self.assertIsNotNone(self.runner.control_listener)
+        self.assertIsNotNone(self.runner.control_path)
+        self.assertEqual(self.runner.control_path.stat().st_mode & 0o777, 0o600)
+        self.assertIsNone(self.runner.restart_due_at)
+
+    def test_source_edit_does_not_restart_until_explicit_request(self):
+        builds = 0
+
+        def compile_fixture():
+            nonlocal builds
+            builds += 1
+            return self.binary(f"version-{builds}")
+
+        self.runner.compile = compile_fixture
+        with patch("dev.signal.signal"):
+            worker = threading.Thread(target=self.runner.run, daemon=True)
+            worker.start()
+            try:
+                deadline = time.monotonic() + 5
+                while (self.runner.process is None or self.runner.control_path is None) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertIsNotNone(self.runner.process)
+                first = self.runner.process
+                self.assertEqual(builds, 1)
+                (self.root / "crates" / "a.rs").write_text("fn edited() {}\n", encoding="utf-8")
+                time.sleep(0.7)
+                self.assertEqual(builds, 1, "source changes cannot trigger a rebuild")
+                self.assertIs(self.runner.process, first)
+                self.assertIsNone(first.poll())
+
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(2)
+                    connection.connect(str(self.runner.control_path))
+                    connection.sendall(b"restart\n")
+                    self.assertEqual(connection.recv(32), b"accepted\n")
+
+                deadline = time.monotonic() + 5
+                while (builds < 2 or self.runner.process is first) and time.monotonic() < deadline:
+                    time.sleep(0.03)
+                self.assertEqual(builds, 2)
+                self.assertIsNot(self.runner.process, first)
+                self.assertIsNotNone(first.poll())
+            finally:
+                self.runner.stopping = True
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive(), "development supervisor should stop cleanly")
 
     def test_failed_build_keeps_original_server_running(self):
         first = self.binary("first")

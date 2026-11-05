@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Hot-reload NovaGPT without replacing the last working server on build failure.
+"""Run NovaGPT in development; rebuild and restart only on explicit MCP request.
 
-Requires Python 3 and Cargo, no external file watcher. POSIX only: the owned
-server is given a process group so unexpected children can be stopped on timeout.
+Requires Python 3 and Cargo. POSIX only: the owned server runs in a process
+group so unexpected children can be stopped on timeout.
 """
 from __future__ import annotations
 
@@ -11,13 +11,15 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 
 def sources(root: Path) -> tuple[tuple[str, int, int], ...]:
-    """Watch Rust sources and Cargo configuration, never generated target files."""
+    """Snapshot Rust sources and Cargo configuration to detect a build race."""
     files = [root / "Cargo.toml", root / "Cargo.lock", root / "rust-toolchain.toml"]
     files.extend((root / "crates").rglob("*.rs"))
     files.extend((root / "crates").rglob("Cargo.toml"))
@@ -65,9 +67,63 @@ class Runner:
         self.build_process: subprocess.Popen[bytes] | None = None
         self.stopping = False
         self.counter = 0
+        self.control_directory: tempfile.TemporaryDirectory[str] | None = None
+        self.control_path: Path | None = None
+        self.control_listener: socket.socket | None = None
+        self.restart_due_at: float | None = None
 
     def request_stop(self, _signal: int, _frame: object) -> None:
         self.stopping = True
+
+    def open_manual_control(self) -> None:
+        """Create an owner-private local socket; only the owned MCP child gets its path."""
+        self.control_directory = tempfile.TemporaryDirectory(prefix="novagpt-dev-control-")
+        self.control_path = Path(self.control_directory.name) / "restart.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.control_path))
+            os.chmod(self.control_path, 0o600)
+            listener.listen(4)
+            listener.setblocking(False)
+        except OSError:
+            listener.close()
+            self.close_manual_control()
+            raise
+        self.control_listener = listener
+        print("[dev] restart only on explicit MCP debug_restart request", flush=True)
+
+    def close_manual_control(self) -> None:
+        if self.control_listener is not None:
+            self.control_listener.close()
+            self.control_listener = None
+        if self.control_directory is not None:
+            self.control_directory.cleanup()
+            self.control_directory = None
+        self.control_path = None
+
+    def poll_manual_control(self) -> None:
+        """Acknowledge a bounded local request before scheduling a graceful restart."""
+        if self.control_listener is None:
+            return
+        try:
+            connection, _ = self.control_listener.accept()
+        except BlockingIOError:
+            return
+        with connection:
+            connection.settimeout(0.25)
+            try:
+                command = connection.recv(32)
+                if command != b"restart\n":
+                    connection.sendall(b"invalid\n")
+                elif self.restart_due_at is not None:
+                    connection.sendall(b"pending\n")
+                else:
+                    # Let the MCP success response leave the process before stopping it.
+                    self.restart_due_at = time.monotonic() + 2.0
+                    connection.sendall(b"accepted\n")
+                    print("[dev] authenticated MCP requested a manual rebuild", flush=True)
+            except (OSError, TimeoutError):
+                pass
 
     def compile(self) -> Path | None:
         print("[dev] building novagpt-cli (current server stays online)...", flush=True)
@@ -102,7 +158,11 @@ class Runner:
         args.append("--ngrok" if self.ngrok else "--no-ngrok")
         if self.domain:
             args.extend(["--ngrok-domain", self.domain])
-        process = subprocess.Popen(args, cwd=self.root, start_new_session=True)
+        environment = os.environ.copy()
+        environment.pop("NOVAGPT_DEV_RESTART_SOCKET", None)
+        if self.control_path is not None:
+            environment["NOVAGPT_DEV_RESTART_SOCKET"] = str(self.control_path)
+        process = subprocess.Popen(args, cwd=self.root, env=environment, start_new_session=True)
         print(f"[dev] starting build {binary.name} on port {self.port}", flush=True)
         deadline = time.monotonic() + 16.0
         while not self.stopping and time.monotonic() < deadline:
@@ -139,10 +199,10 @@ class Runner:
                 candidate.unlink(missing_ok=True)
             return False
         if sources(self.root) != before:
-            print("[dev] sources changed during compilation; rebuilding latest revision", flush=True)
+            print("[dev] sources changed during compilation; skipping this build until the next explicit request", flush=True)
             if candidate:
                 candidate.unlink(missing_ok=True)
-            return True
+            return False
         if candidate is None:
             return False
         previous_binary = self.current_binary
@@ -168,33 +228,21 @@ class Runner:
     def run(self) -> None:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
-        last = sources(self.root)
         try:
-            needs_rebuild = True
+            self.open_manual_control()
+            self.rebuild()  # Startup build only; no automatic retries.
             while not self.stopping:
-                if needs_rebuild:
-                    needs_rebuild = self.rebuild()
-                    last = sources(self.root)
-                    continue
-                new = sources(self.root)
-                if new != last:
-                    last = new
-                    # Debounce editor save/rename bursts.
-                    quiet_until = time.monotonic() + 0.45
-                    while not self.stopping and time.monotonic() < quiet_until:
-                        time.sleep(0.15)
-                        current = sources(self.root)
-                        if current != last:
-                            last = current
-                            quiet_until = time.monotonic() + 0.45
-                    needs_rebuild = not self.stopping
+                self.poll_manual_control()
+                if self.restart_due_at is not None and time.monotonic() >= self.restart_due_at:
+                    self.restart_due_at = None
+                    self.rebuild()
                 elif self.process is not None and self.process.poll() is not None:
-                    print("[dev] server exited unexpectedly; waiting for a source change", flush=True)
+                    print("[dev] server exited unexpectedly; no automatic restart", flush=True)
                     self.process.wait()
                     self.process = None
-                else:
-                    time.sleep(0.4)
+                time.sleep(0.2)
         finally:
+            self.close_manual_control()
             if self.build_process is not None:
                 stop_owned(self.build_process, 2)
             if self.process is not None:
