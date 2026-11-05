@@ -29,6 +29,12 @@ jobs:
           cache-bin: "false"
           cache-on-failure: "true"
           key: ${{ matrix.os }}
+      - name: Check Windows PowerShell 5.1 installer architecture compatibility
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Windows PowerShell 5.x is required for this test.' }
+          .\script\test_install.ps1
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy

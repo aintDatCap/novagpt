@@ -49,6 +49,6 @@ powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -Version v0.1.1
 powershell -ExecutionPolicy Bypass -File .\script\install.ps1 -InstallDir "$env:LOCALAPPDATA\Programs\NovaGPT\bin"
 ```
 
-Downloads and verifies `novagpt-windows-x86_64.zip`, installs `novagpt.exe` under the user's `%LOCALAPPDATA%\Programs\NovaGPT\bin` by default, and appends that directory to the **user** PATH if absent. A new terminal is needed to pick up persistent PATH changes. Windows ARM64 does not have a published native release package in this matrix.
+Downloads and verifies `novagpt-windows-x86_64.zip`, installs `novagpt.exe` under the user's `%LOCALAPPDATA%\Programs\NovaGPT\bin` by default, and appends that directory to the **user** PATH if absent. A new terminal is needed to pick up persistent PATH changes. Windows ARM64 does not have a published native release package in this matrix. The Windows x64 installer uses an architecture check compatible with Windows PowerShell 5.1, including 32-bit PowerShell on x64 Windows; its native Windows test cases are configured to run in CI.
 
 Installers use `https://github.com/aintDatCap/novagpt/releases` and therefore require an **already published, accessible release** and GitHub download access; they do not build from source. This workflow no longer supplies a macOS release asset, so the Bash installer cannot install its generated releases on macOS. They never modify the machine-wide PATH or another user's installation.

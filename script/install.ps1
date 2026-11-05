@@ -14,8 +14,30 @@ $ErrorActionPreference = 'Stop'
 if (-not [System.IO.Path]::IsPathRooted($InstallDir)) {
     throw 'InstallDir must be an absolute path.'
 }
-if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne
-    [System.Runtime.InteropServices.Architecture]::X64) {
+# Windows PowerShell 5.1 runs on .NET Framework, where
+# RuntimeInformation.OSArchitecture is unavailable. PROCESSOR_ARCHITEW6432
+# reports the native OS architecture when PowerShell runs under WOW64.
+function Test-NovaWindowsX64 {
+    param(
+        [bool]$Is64BitOS,
+        [string]$ProcessArchitecture,
+        [string]$Wow64Architecture
+    )
+
+    if (-not $Is64BitOS) {
+        return $false
+    }
+    $nativeArchitecture = if ([string]::IsNullOrEmpty($Wow64Architecture)) {
+        $ProcessArchitecture
+    } else {
+        $Wow64Architecture
+    }
+    return [string]::Equals($nativeArchitecture, 'AMD64', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+if (-not (Test-NovaWindowsX64 -Is64BitOS ([Environment]::Is64BitOperatingSystem) `
+    -ProcessArchitecture $env:PROCESSOR_ARCHITECTURE `
+    -Wow64Architecture $env:PROCESSOR_ARCHITEW6432)) {
     throw 'This installer currently supports Windows x64. No Windows ARM64 release binary is published.'
 }
 
