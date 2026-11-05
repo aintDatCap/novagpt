@@ -398,16 +398,20 @@ impl AgentManager {
 
     /// The authenticated parent passes the display name shown by its selected
     /// connected app. MCP cannot discover a ChatGPT-side alias or namespace.
+    /// Read-only roles may omit it for clients with a stale tool schema; an
+    /// implementer still requires it for the write-capability preflight.
     pub async fn spawn_with_connector(
         &self,
         request: SpawnAgent,
         connector_name: Option<&str>,
     ) -> AgentResult<AgentInfo> {
-        let name = connector_name.ok_or(AgentError::ConnectorMissing)?;
-        if name.trim().is_empty() {
+        if connector_name.is_none() && request.role == AgentRole::Implementer {
             return Err(AgentError::ConnectorMissing);
         }
-        self.spawn_internal(request, Some(name)).await
+        if connector_name.is_some_and(|name| name.trim().is_empty()) {
+            return Err(AgentError::ConnectorMissing);
+        }
+        self.spawn_internal(request, connector_name).await
     }
 
     async fn spawn_internal(
@@ -1807,6 +1811,36 @@ mod tests {
             serde_json::json!({"ready":true})
         }
     }
+    #[tokio::test]
+    async fn unnamed_read_only_roles_can_spawn_from_legacy_mcp_clients() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            Arc::new(FakeBackend),
+        );
+        for role in [AgentRole::Explorer, AgentRole::Reviewer, AgentRole::Tester] {
+            let info = manager
+                .spawn_with_connector(
+                    SpawnAgent {
+                        workspace_id: None,
+                        task: "inspect without changing files".into(),
+                        role,
+                        paths: vec![],
+                        context: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("read-only spawn without client-owned alias");
+            assert_eq!(info.connector_name, None);
+            assert_eq!(info.capability_status, "unchecked");
+            let finished = manager.wait(&info.id, 2).await.expect("worker result");
+            assert!(!finished.timed_out);
+            assert_eq!(finished.agent.state, AgentState::Completed);
+            assert!(!finished.agent.result.expect("result").applied_to_workspace);
+        }
+    }
+
     #[tokio::test]
     async fn spawn_status_message_and_untrusted_result() {
         let dir = tempfile::tempdir().expect("fixture");

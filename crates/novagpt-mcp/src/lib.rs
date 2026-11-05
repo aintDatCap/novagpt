@@ -1280,7 +1280,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Spawn a persistent asynchronous untrusted subagent. Required connector_name is the EXACT display name of the NovaGPT connected app selected by this parent ChatGPT conversation; never guess from a tool namespace. Roles: explorer, reviewer, tester, implementer. An implementer coding task is withheld until the new worker completes authenticated no-write subagent_progress, subagent_apply_patch(probe=true), and subagent_create_file(probe=true) checks. If its connector is unavailable, the task is NOT sent and recovery diagnostics are returned; no text-only auto-apply."
+        description = "Spawn a persistent asynchronous untrusted subagent. connector_name is the EXACT display name of the NovaGPT connected app selected by this parent ChatGPT conversation; never guess from a tool namespace. For legacy clients the name may be omitted for read-only explorer, reviewer and tester roles, but is required for implementer. An implementer coding task is withheld until the new worker completes authenticated no-write subagent_progress, subagent_apply_patch(probe=true), and subagent_create_file(probe=true) checks. If its connector is unavailable, the task is NOT sent and recovery diagnostics are returned; no text-only auto-apply."
     )]
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
         let response = async {
@@ -1298,16 +1298,9 @@ impl NovaMcp {
                     )));
                 }
             };
-            // ChatGPT's connector display alias lives on the client. The
-            // authenticated parent supplies the actual selected app name;
-            // guessing it from the MCP server's product name is incorrect.
-            if args
-                .connector_name
-                .as_deref()
-                .is_none_or(|name| name.trim().is_empty())
-            {
-                return external_reply::<(), _>(Err(novagpt_agents::AgentError::ConnectorMissing));
-            }
+            // ChatGPT's selected connector alias is client-owned metadata.
+            // Never invent it from the MCP server name: a missing alias is
+            // tolerated only for read-only roles by the agent manager.
             external_reply(
                 manager
                     .spawn_with_connector(
