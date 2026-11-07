@@ -96,6 +96,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[cfg(all(debug_assertions, unix))]
+    /// Explicitly request a rebuild/restart of the supervised development server.
+    /// Uses authenticated loopback MCP, not the supervisor socket directly.
+    DebugRestart {
+        /// Explicit HTTP port, otherwise the configured workspace port.
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Show safe Git status without a raw diff or a repository write.
     Review {
         #[arg(long)]
@@ -342,6 +350,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("No ngrok tunnel active on this port")?;
                 // Secret revealed only by an explicit user command. No clipboard automation.
                 println!("{}", tunnel::connector_url(&endpoint, &resolved.value)?);
+                return Ok(());
+            }
+            #[cfg(all(debug_assertions, unix))]
+            Command::DebugRestart { port } => {
+                let token = token::resolve()?.value;
+                match connection::restart(port.unwrap_or(local.port), &token).await? {
+                    connection::RestartStatus::Scheduled => println!(
+                        "Development rebuild and graceful restart scheduled. The MCP connection will briefly disconnect."
+                    ),
+                    connection::RestartStatus::AlreadyPending => {
+                        println!("A development rebuild is already scheduled.")
+                    }
+                }
                 return Ok(());
             }
             Command::ConnectionTest { port, json } => {
@@ -647,6 +668,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             | Command::BrowserLogin,
         ) => {
             unreachable!("read-only commands handled above")
+        }
+        #[cfg(all(debug_assertions, unix))]
+        Some(Command::DebugRestart { .. }) => {
+            unreachable!("debug restart was handled above")
         }
         None => unreachable!("TUI was handled before server startup"),
     }

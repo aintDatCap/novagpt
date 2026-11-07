@@ -237,7 +237,6 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "reconnect_workspace",
         "codex_context",
         "server_config",
-        "debug_restart",
         "list_workspaces",
         "workspace_snapshot",
         "inspect_workspace",
@@ -278,7 +277,13 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 58);
+    let development_only = cfg!(all(debug_assertions, unix));
+    assert_eq!(
+        listed.iter().any(|tool| tool["name"] == "debug_restart"),
+        development_only,
+        "debug_restart must not exist in production tool discovery"
+    );
+    assert_eq!(listed.len(), if development_only { 58 } else { 57 });
     // MCP server tool registration is distinct from the ChatGPT client's
     // selected connector schema. Ensure new callers can discover the actual
     // arguments needed for authenticated child preflight.
@@ -475,4 +480,19 @@ fn legacy_bash_mode_cli_option_is_removed() {
         .expect("invoke CLI");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+}
+
+#[test]
+fn local_debug_restart_command_is_absent_from_release_help() {
+    let output = Command::new(env!("CARGO_BIN_EXE_novagpt"))
+        .arg("--help")
+        .output()
+        .expect("NovaGPT CLI help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert_eq!(
+        help.contains("debug-restart"),
+        cfg!(all(debug_assertions, unix)),
+        "release builds must not expose the debug-restart command"
+    );
 }

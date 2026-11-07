@@ -53,6 +53,18 @@ pub struct NovaMcp {
 }
 
 impl NovaMcp {
+    /// The release router contains no reference to the debug-only handler.
+    fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        #[cfg(all(debug_assertions, unix))]
+        {
+            Self::tool_router() + Self::debug_tool_router()
+        }
+        #[cfg(not(all(debug_assertions, unix)))]
+        {
+            Self::tool_router()
+        }
+    }
+
     pub fn new(workspaces: WorkspaceRegistry) -> Self {
         Self {
             workspaces,
@@ -546,7 +558,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(debug_assertions, unix))]
 async fn send_dev_restart(path: &std::path::Path) -> NovaResult<serde_json::Value> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
@@ -583,7 +595,7 @@ async fn send_dev_restart(path: &std::path::Path) -> NovaResult<serde_json::Valu
         .map_err(|_| NovaError::InvalidInput("Manual-restart supervisor timed out".into()))?
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, debug_assertions, unix))]
 mod debug_restart_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -641,29 +653,10 @@ impl NovaMcp {
                 "audit_mode": self.extras.audit.snapshot(1).mode,
                 "write_mode": "workspace-guarded",
                 "transport_session_is_conversation_identity": false,
-                "debug_manual_restart_enabled": std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET").is_some(),
+                "debug_manual_restart_enabled": cfg!(all(debug_assertions, unix))
+                    && std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET").is_some(),
             }))),
         )
-    }
-
-    #[tool(
-        description = "Request a manual rebuild and graceful MCP restart from the external POSIX development supervisor started by script/dev.py. Source changes never restart it automatically. Unavailable outside this supervised development mode; the current MCP connection may disconnect after acknowledgement."
-    )]
-    async fn debug_restart(&self) -> CallToolResult {
-        #[cfg(unix)]
-        let result = match std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET") {
-            Some(socket) if std::path::Path::new(&socket).is_absolute() => {
-                send_dev_restart(std::path::Path::new(&socket)).await
-            }
-            _ => Err(NovaError::InvalidInput(
-                "Manual restart is unavailable; launch NovaGPT through script/dev.py".into(),
-            )),
-        };
-        #[cfg(not(unix))]
-        let result: NovaResult<serde_json::Value> = Err(NovaError::InvalidInput(
-            "Manual development restart is available only on POSIX".into(),
-        ));
-        self.observed("debug_restart", tool_reply(result))
     }
 
     #[tool(
@@ -1660,7 +1653,27 @@ impl NovaMcp {
     }
 }
 
+#[cfg(all(debug_assertions, unix))]
+#[tool_router(router = debug_tool_router)]
+impl NovaMcp {
+    #[tool(
+        description = "Request a manual rebuild and graceful MCP restart from the external POSIX development supervisor started by script/dev.py. Source changes never restart it automatically. Unavailable outside this supervised development mode; the current MCP connection may disconnect after acknowledgement."
+    )]
+    async fn debug_restart(&self) -> CallToolResult {
+        let result = match std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET") {
+            Some(socket) if std::path::Path::new(&socket).is_absolute() => {
+                send_dev_restart(std::path::Path::new(&socket)).await
+            }
+            _ => Err(NovaError::InvalidInput(
+                "Manual restart is unavailable; launch NovaGPT through script/dev.py".into(),
+            )),
+        };
+        self.observed("debug_restart", tool_reply(result))
+    }
+}
+
 #[tool_handler(
+    router = Self::configured_tool_router(),
     name = "novagpt",
     instructions = "Use workspace_id explicitly for non-default roots; these are guarded local coding tools."
 )]
