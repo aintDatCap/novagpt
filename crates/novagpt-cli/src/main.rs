@@ -195,6 +195,12 @@ enum LogsCommand {
         #[arg(long, default_value_t = 50)]
         lines: usize,
     },
+    /// Write sanitized audit metadata into a shareable zstd archive.
+    Export {
+        /// New path; never overwrite an existing file.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 /// Register shutdown before creating public tunnel resources. The same future
@@ -273,8 +279,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let directory = logging::audit_directory(&root)?;
         match action {
             LogsCommand::Path => println!("{}", directory.display()),
+            LogsCommand::Export { output } => {
+                let destination = output.clone();
+                let (count, path) = tokio::task::spawn_blocking(move || {
+                    novagpt_mcp::AuditTrail::export_compressed(&directory, &destination)
+                        .map(|count| (count, destination))
+                })
+                .await??;
+                println!("Exported {count} audit events to {}.", path.display());
+            }
             LogsCommand::Tail { lines } => {
-                let count = (*lines).clamp(1, 128);
+                let count = (*lines).clamp(1, 20_000);
                 let snapshot = tokio::task::spawn_blocking(move || {
                     novagpt_mcp::AuditTrail::persisted_snapshot(&directory, count)
                 })
