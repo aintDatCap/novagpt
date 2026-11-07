@@ -163,6 +163,14 @@ impl ChromeOptions {
             "--no-default-browser-check".to_owned(),
             "--new-window".to_owned(),
             format!("--lang={language}"),
+            // Chrome sets Blink's AutomationControlled feature whenever the
+            // browser exposes a remote-debugging port, which makes every page
+            // report navigator.webdriver === true. NovaGPT launches Chrome
+            // itself with that port so ChromeDriver can attach, so the feature
+            // must be disabled explicitly. This is a launch-time Blink feature
+            // switch: no JavaScript getter is patched and no challenge is
+            // solved.
+            "--disable-blink-features=AutomationControlled".to_owned(),
             "--window-size=1920,1080".to_owned(),
             "--log-level=0".to_owned(),
         ];
@@ -342,6 +350,12 @@ mod tests {
         assert!(args.contains(&"--headless=new".to_owned()));
         assert!(!args.iter().any(|arg| arg == "--no-sandbox"));
         assert!(!args.iter().any(|arg| arg == "--enable-automation"));
+        // Remote debugging alone sets navigator.webdriver on current Chrome;
+        // the launch must explicitly clear Blink's automation feature.
+        assert!(
+            args.contains(&"--disable-blink-features=AutomationControlled".to_owned()),
+            "{args:?}"
+        );
         assert!(!args.iter().any(|arg| arg == "--start-maximized"));
         assert!(!args.iter().any(|arg| arg.contains("always-on-top")));
         assert!(!args.iter().any(|arg| arg.contains("window-position")));

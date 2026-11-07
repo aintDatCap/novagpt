@@ -110,6 +110,7 @@ mechanism; **not implemented** = consciously omitted, with reason.
 | `Chrome.find_elements_recursive` | Generator over main frame and iframes, restoring the default frame. | `WebDriverTab::find_elements_recursive` | Returns a bounded `Vec`; documented staleness after frame changes. | `webdriver.rs` | parity, API difference |
 | `keep_alive` | Selenium remote connection keep-alive. | `WebDriverClient` reqwest pool | HTTP connection reuse is the client default; no toggle. | real test | parity, different mechanism |
 | `suppress_welcome` / `log_level` | Launch flags. | `ChromeOptions::launch_arguments` | Fixed `--no-first-run`, `--no-default-browser-check`, `--log-level=0`; welcome suppression is always on. | `options.rs` | parity, fixed policy |
+| Browser automation flag | Upstream relies on the patched CDriver injection and, in headless mode, rewrites `navigator.webdriver` from JavaScript. | `ChromeOptions::launch_arguments` | Chrome is started with `--disable-blink-features=AutomationControlled`. Current Chrome sets Blink's automation feature for any remote-debugging launch, so the `{window.cdc…}` patch alone leaves `navigator.webdriver === true`; the launch switch clears it without patching JavaScript. | `options.rs` | parity, launch-time mechanism |
 | `advanced_elements` | Select `UCWebElement` with `attrs`. | `WebElement::attrs` | Attribute snapshot available on every element. | `webdriver.rs` | parity |
 | `Chrome.get` | Selenium navigation. | `WebDriverTab::goto` | Restricts to http(s)/`about:blank`, no credentials/controls. | `webdriver.rs` | parity, safer URL policy |
 | `Chrome.debug` method wrapper | Logs every method call/args. | — | **Not implemented**, to avoid leaking prompts, URLs and DOM data. | — | not implemented (security) |
@@ -278,7 +279,10 @@ an engineering/legal-risk summary, not legal advice.
    the binaries in its source tree.
 6. **Purpose and provider terms.** The patch removes ChromeDriver's
    automation signal; that is an evasion mechanism and may conflict with
-   provider terms or local law depending on use. NovaGPT does not solve
+   provider terms or local law depending on use. The launch also disables
+   Blink's `AutomationControlled` feature because current Chrome sets it for
+   any remote-debugging browser; without it the page reports
+   `navigator.webdriver === true` before any input. NovaGPT does not solve
    CAPTCHAs, bypass interactive verification, or hide IP addresses, and the
    ChatGPT adapter now uses this transport by default.
 
