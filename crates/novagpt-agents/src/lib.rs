@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
@@ -18,6 +21,11 @@ use uuid::Uuid;
 
 const MAX_AGENTS: usize = 6;
 const MAX_RECORDS: usize = 64;
+/// Completed conversations stay open for follow-up messages, but the Chrome
+/// window must not accumulate one tab per agent forever. The oldest completed
+/// tab is closed when the cap is reached; a later follow-up then opens a new
+/// conversation instead of reusing the evicted tab.
+const MAX_LIVE_TABS: usize = 8;
 const MAX_ACTIVITY_EVENTS: usize = 32;
 const MAX_ACTIVITY_REPORTS: u8 = 64;
 const MAX_TASK: usize = 50_000;
@@ -331,6 +339,8 @@ struct Entry {
     probe_progress: bool,
     task_prompt: Option<String>,
     waiting_manual: bool,
+    /// 0 until the execution completes; higher means completed later.
+    completed_seq: u64,
     updates: watch::Sender<AgentInfo>,
 }
 
@@ -375,6 +385,9 @@ struct Inner {
     workspaces: WorkspaceRegistry,
     entries: Mutex<HashMap<String, Entry>>,
     max_agents: usize,
+    max_live_tabs: usize,
+    /// Monotonic completion order for bounded tab eviction.
+    next_completed_seq: AtomicU64,
 }
 #[derive(Clone)]
 pub struct AgentManager {
@@ -389,8 +402,18 @@ impl AgentManager {
                 workspaces,
                 entries: Mutex::new(HashMap::new()),
                 max_agents: MAX_AGENTS,
+                max_live_tabs: MAX_LIVE_TABS,
+                next_completed_seq: AtomicU64::new(1),
             }),
         }
+    }
+
+    #[cfg(test)]
+    fn with_live_tab_cap(mut self, cap: usize) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.max_live_tabs = cap.max(1);
+        }
+        self
     }
 
     /// Legacy trusted in-process interface for embedders and test fixtures.
@@ -563,6 +586,7 @@ impl AgentManager {
                     probe_progress: false,
                     task_prompt: probe_pending.then_some(task_prompt),
                     waiting_manual: false,
+                    completed_seq: 0,
                     updates,
                 },
             );
@@ -576,6 +600,7 @@ impl AgentManager {
         tokio::spawn(async move {
             let outcome = async {
                 if must_create {
+                    manager.evict_completed_tabs().await;
                     manager.inner.backend.create(&id).await?;
                 }
                 manager.mark_ready(&id, epoch).await;
@@ -637,6 +662,10 @@ impl AgentManager {
                                 Some("Subagent response exceeded the output bound".into());
                         } else {
                             entry.info.state = AgentState::Completed;
+                            entry.completed_seq = manager
+                                .inner
+                                .next_completed_seq
+                                .fetch_add(1, Ordering::AcqRel);
                             entry.info.result = Some(AgentOutput {
                                 raw_response: result,
                                 untrusted: true,
@@ -673,7 +702,18 @@ impl AgentManager {
                 }
                 entry.updates.send_replace(entry.info.clone());
             }
+            let failed_tab = agents
+                .get(&id)
+                .is_some_and(|entry| entry.ready && entry.info.state == AgentState::Failed);
+            if failed_tab && let Some(entry) = agents.get_mut(&id) {
+                // A failed execution has no usable continuation; close its tab
+                // instead of leaving it open for the life of the process.
+                entry.ready = false;
+            }
             drop(agents);
+            if failed_tab {
+                manager.inner.backend.close(&id).await;
+            }
             if let Some(prompt) = next_prompt {
                 // The probe browser reply finished before the actual coding
                 // prompt is sent to this same tab. No tool-text is trusted.
@@ -698,6 +738,33 @@ impl AgentManager {
         {
             entry.ready = true;
         }
+    }
+
+    /// Close the oldest completed worker tab when the live-tab cap is reached.
+    /// Running and waiting agents are never evicted.
+    async fn evict_completed_tabs(&self) {
+        let mut entries = self.inner.entries.lock().await;
+        let live = entries.values().filter(|entry| entry.ready).count();
+        if live < self.inner.max_live_tabs {
+            return;
+        }
+        let candidate = entries
+            .values()
+            .filter(|entry| {
+                entry.ready && entry.info.state == AgentState::Completed && entry.completed_seq > 0
+            })
+            .min_by_key(|entry| entry.completed_seq)
+            .map(|entry| entry.info.id.clone());
+        let Some(id) = candidate else {
+            return;
+        };
+        if let Some(entry) = entries.get_mut(&id) {
+            // `ready = false` makes a later follow-up create a new
+            // tab/conversation instead of targeting a closed tab.
+            entry.ready = false;
+        }
+        drop(entries);
+        self.inner.backend.close(&id).await;
     }
 
     async fn patch_gate(&self, id: &str) -> AgentResult<Arc<Mutex<()>>> {
@@ -824,6 +891,7 @@ impl AgentManager {
         entry.epoch += 1;
         entry.info.epoch = entry.epoch;
         let epoch = entry.epoch;
+        entry.completed_seq = 0;
         entry.info.state = AgentState::Running;
         entry.waiting_manual = false;
         entry.info.error = None;
@@ -852,6 +920,7 @@ impl AgentManager {
             entry.epoch += 1; // invalidates any pending backend completion
             entry.info.epoch = entry.epoch;
             entry.info.state = AgentState::Cancelled;
+            entry.ready = false;
             entry.pending_prompt.clear();
             entry.updates.send_replace(entry.info.clone());
             entry.info.clone()
@@ -932,6 +1001,7 @@ impl AgentManager {
         }
         entry.completion_claimed = false;
         entry.info.state = AgentState::Completed;
+        entry.completed_seq = self.inner.next_completed_seq.fetch_add(1, Ordering::AcqRel);
         entry.updates.send_replace(entry.info.clone());
         Ok(AgentCompletionAck {
             id: entry.info.id.clone(),
@@ -3326,6 +3396,110 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&sentinel).expect("source"),
             "user-owned source is unchanged"
+        );
+    }
+
+    struct TabLifecycle {
+        closed: Mutex<Vec<String>>,
+        fail_send: bool,
+    }
+
+    #[async_trait]
+    impl AgentBackend for TabLifecycle {
+        fn name(&self) -> &'static str {
+            "tab-fixture"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            id: &str,
+            _prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            if self.fail_send {
+                Err(BackendFailure::Unavailable)
+            } else {
+                Ok((format!("response for {id}"), None))
+            }
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn close(&self, id: &str) {
+            self.closed.lock().await.push(id.to_owned());
+        }
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    fn tab_task(index: usize) -> SpawnAgent {
+        SpawnAgent {
+            workspace_id: None,
+            task: format!("tab lifecycle task {index}"),
+            role: AgentRole::Reviewer,
+            paths: vec![],
+            context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_tabs_are_evicted_at_the_live_cap_and_failed_tabs_close() {
+        let root = tempfile::tempdir().expect("owned test workspace");
+        let backend = Arc::new(TabLifecycle {
+            closed: Mutex::new(Vec::new()),
+            fail_send: false,
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(root.path(), &[]).expect("workspace"),
+            backend.clone(),
+        )
+        .with_live_tab_cap(2);
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let info = manager.spawn(tab_task(index)).await.expect("spawn");
+            let wait = manager.wait(&info.id, 3).await.expect("wait");
+            assert_eq!(wait.agent.state, AgentState::Completed);
+            ids.push(info.id);
+            if index < 2 {
+                assert!(
+                    backend.closed.lock().await.is_empty(),
+                    "tabs stay open below the cap"
+                );
+            }
+        }
+        assert_eq!(
+            backend.closed.lock().await.as_slice(),
+            std::slice::from_ref(&ids[0]),
+            "the oldest completed tab is evicted at the cap"
+        );
+        // A follow-up to an evicted conversation must create a new tab rather
+        // than targeting the closed one; the agent still completes.
+        let reopened = manager
+            .message(&ids[0], "follow up")
+            .await
+            .expect("message");
+        assert_eq!(reopened.state, AgentState::Running);
+        let wait = manager.wait(&ids[0], 3).await.expect("follow-up");
+        assert_eq!(wait.agent.state, AgentState::Completed);
+
+        let failing = Arc::new(TabLifecycle {
+            closed: Mutex::new(Vec::new()),
+            fail_send: true,
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(root.path(), &[]).expect("workspace"),
+            failing.clone(),
+        );
+        let info = manager.spawn(tab_task(9)).await.expect("spawn");
+        let wait = manager.wait(&info.id, 3).await.expect("wait");
+        assert_eq!(wait.agent.state, AgentState::Failed);
+        assert_eq!(
+            failing.closed.lock().await.as_slice(),
+            std::slice::from_ref(&info.id),
+            "a failed execution closes its tab"
         );
     }
 }
