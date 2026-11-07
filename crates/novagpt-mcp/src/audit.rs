@@ -27,6 +27,8 @@ pub struct AuditEvent {
     pub unix_seconds: u64,
     pub tool: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,8 +116,18 @@ fn checked_file(path: &Path) -> io::Result<Option<u64>> {
 
 const ACTIVE_LOG: &str = "audit.log";
 
+fn valid_agent_id(value: &str) -> bool {
+    value.strip_prefix("agent-").is_some_and(|suffix| {
+        suffix.len() == 8
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 fn valid_record(event: &AuditEvent) -> bool {
     event.sequence > 0
+        && event.agent_id.as_deref().is_none_or(valid_agent_id)
         && matches!(event.status.as_str(), "ok" | "error")
         && !event.tool.is_empty()
         && event.tool.len() <= 64
@@ -128,8 +140,15 @@ fn valid_record(event: &AuditEvent) -> bool {
 /// Plain English-readable audit format, with fixed labels and bounded fields.
 fn format_event(event: &AuditEvent) -> String {
     format!(
-        "event={} timestamp_unix={} tool={} status={}\n",
-        event.sequence, event.unix_seconds, event.tool, event.status
+        "event={} timestamp_unix={} tool={} status={}{}\n",
+        event.sequence,
+        event.unix_seconds,
+        event.tool,
+        event.status,
+        event
+            .agent_id
+            .as_ref()
+            .map_or(String::new(), |id| format!(" agent_id={id}"))
     )
 }
 
@@ -146,6 +165,10 @@ fn parse_event(line: &[u8]) -> Option<AuditEvent> {
         .ok()?;
     let tool = fields.next()?.strip_prefix("tool=")?.to_string();
     let status = fields.next()?.strip_prefix("status=")?.to_string();
+    let agent_id = match fields.next() {
+        Some(field) => Some(field.strip_prefix("agent_id=")?.to_owned()),
+        None => None,
+    };
     if fields.next().is_some() {
         return None;
     }
@@ -154,6 +177,7 @@ fn parse_event(line: &[u8]) -> Option<AuditEvent> {
         unix_seconds,
         tool,
         status,
+        agent_id,
     };
     valid_record(&event).then_some(event)
 }
@@ -248,6 +272,17 @@ impl AuditTrail {
     }
 
     pub fn record(&self, tool: &'static str, failed: bool) {
+        self.record_with_agent(tool, failed, None);
+    }
+
+    /// Server-owned lifecycle event, tagged with a validated opaque agent ID.
+    pub fn record_agent(&self, tool: &'static str, failed: bool, agent_id: &str) {
+        if valid_agent_id(agent_id) {
+            self.record_with_agent(tool, failed, Some(agent_id));
+        }
+    }
+
+    fn record_with_agent(&self, tool: &'static str, failed: bool, agent_id: Option<&str>) {
         // Only internal static tool identifiers are accepted, never user-controlled strings.
         if tool.is_empty()
             || tool.len() > 64
@@ -266,6 +301,7 @@ impl AuditTrail {
                     .map_or(0, |value| value.as_secs()),
                 tool: tool.to_string(),
                 status: if failed { "error" } else { "ok" }.to_string(),
+                agent_id: agent_id.map(str::to_owned),
             };
             if state.events.len() == MAX_EVENTS {
                 state.events.pop_front();
@@ -340,19 +376,20 @@ impl AuditTrail {
                 .iter()
                 .map(|item| {
                     format!(
-                        "Event #{} at UNIX timestamp {}: tool {} completed with status {}.",
-                        item.sequence, item.unix_seconds, item.tool, item.status
+                        "Event #{} at UNIX timestamp {}: tool {} completed with status {}.{}",
+                        item.sequence,
+                        item.unix_seconds,
+                        item.tool,
+                        item.status,
+                        item.agent_id
+                            .as_ref()
+                            .map_or(String::new(), |id| format!(" Agent {id}."))
                     )
                 })
                 .collect(),
             llm: entries
                 .iter()
-                .map(|entry| {
-                    format!(
-                        "event={} timestamp_unix={} tool={} status={}",
-                        entry.sequence, entry.unix_seconds, entry.tool, entry.status
-                    )
-                })
+                .map(|entry| format_event(entry).trim_end().to_owned())
                 .collect(),
         }
     }
@@ -439,6 +476,47 @@ mod tests {
         assert!(!text.contains("root"));
     }
 
+    #[tokio::test]
+    async fn agent_lifecycle_events_keep_only_verified_opaque_ids() {
+        let home = tempfile::tempdir().expect("private fixture");
+        let dir = home.path().join("NovaGPT").join("logs").join("agent_test");
+        let audit = AuditTrail::persistent(dir.clone()).expect("audit");
+        audit.record_agent("agent_browser_create_failed", true, "agent-f6475a38");
+        audit.record_agent("agent_completed", false, "agent-61be21ce");
+        audit.record_agent(
+            "agent_completed",
+            false,
+            "agent-f6475a38 credential=do-not-log",
+        );
+        audit.snapshot_flushed(50).await;
+        let data = fs::read_to_string(dir.join("audit.log")).expect("audit file");
+        assert!(data.contains("agent_id=agent-f6475a38"));
+        assert!(data.contains("agent_id=agent-61be21ce"));
+        assert_eq!(
+            data.lines().count(),
+            2,
+            "invalid agent ids must be rejected"
+        );
+        assert!(!data.contains("credential"));
+        assert!(!data.contains("do-not-log"));
+        assert!(
+            parse_event(
+                b"event=1 timestamp_unix=1 tool=agent_failed status=error agent_id=agent-f6475a38"
+            )
+            .is_some()
+        );
+        assert!(parse_event(b"event=1 timestamp_unix=1 tool=agent_failed status=error agent_id=agent-f6475a38 extra=secret").is_none());
+        assert!(
+            parse_event(
+                b"event=1 timestamp_unix=1 tool=agent_failed status=error agent_id=agent-nothex"
+            )
+            .is_none()
+        );
+        let recovered = AuditTrail::persisted_snapshot(&dir, 5).expect("saved history");
+        assert_eq!(recovered.returned_events, 2);
+        assert!(recovered.llm[0].contains("agent_id=agent-f6475a38"));
+    }
+
     #[test]
     fn flushing_reports_disk_sync_errors() {
         let home = tempfile::tempdir().expect("fixture");
@@ -473,6 +551,7 @@ mod tests {
                     unix_seconds: 0,
                     tool: "read".to_string(),
                     status: "ok".to_string(),
+                    agent_id: None,
                 },
             )
             .expect("write audit event");

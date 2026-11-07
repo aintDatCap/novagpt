@@ -262,12 +262,14 @@ mod tests {
                 unix_seconds: 3601,
                 tool: "subagent_spawn".into(),
                 status: "error".into(),
+                agent_id: None,
             },
             novagpt_mcp::AuditEvent {
                 sequence: 28,
                 unix_seconds: 3602,
                 tool: "read".into(),
                 status: "ok".into(),
+                agent_id: None,
             },
         ])));
         assert!(a.audit_view);

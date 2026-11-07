@@ -8,7 +8,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -93,6 +93,41 @@ pub enum AgentRole {
     Reviewer,
     Tester,
     Implementer,
+}
+
+/// Fixed, server-observed subagent lifecycle stages; no worker free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentLogStage {
+    Created,
+    BrowserCreated,
+    BrowserCreateFailed,
+    BrowserReplyReceived,
+    BrowserReplyFailed,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+impl AgentLogStage {
+    pub const fn audit_name(self) -> &'static str {
+        match self {
+            Self::Created => "agent_created",
+            Self::BrowserCreated => "agent_browser_created",
+            Self::BrowserCreateFailed => "agent_browser_create_failed",
+            Self::BrowserReplyReceived => "agent_browser_reply_received",
+            Self::BrowserReplyFailed => "agent_browser_reply_failed",
+            Self::Waiting => "agent_waiting",
+            Self::Completed => "agent_completed",
+            Self::Failed => "agent_failed",
+        }
+    }
+
+    pub const fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::BrowserCreateFailed | Self::BrowserReplyFailed | Self::Failed
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +415,8 @@ impl Entry {
     }
 }
 
+type AgentDiagnosticReporter = Arc<dyn Fn(&str, AgentLogStage) + Send + Sync>;
+
 struct Inner {
     backend: Arc<dyn AgentBackend>,
     workspaces: WorkspaceRegistry,
@@ -388,6 +425,7 @@ struct Inner {
     max_live_tabs: usize,
     /// Monotonic completion order for bounded tab eviction.
     next_completed_seq: AtomicU64,
+    reporter: OnceLock<AgentDiagnosticReporter>,
 }
 #[derive(Clone)]
 pub struct AgentManager {
@@ -404,7 +442,24 @@ impl AgentManager {
                 max_agents: MAX_AGENTS,
                 max_live_tabs: MAX_LIVE_TABS,
                 next_completed_seq: AtomicU64::new(1),
+                reporter: OnceLock::new(),
             }),
+        }
+    }
+
+    /// Configure one optional fixed-schema diagnostic observer before spawning agents.
+    /// No tasks, prompts, browser text, paths or private callback codes are emitted.
+    pub fn with_diagnostic_reporter(
+        self,
+        reporter: impl Fn(&str, AgentLogStage) + Send + Sync + 'static,
+    ) -> Self {
+        let _ = self.inner.reporter.set(Arc::new(reporter));
+        self
+    }
+
+    fn emit(&self, id: &str, stage: AgentLogStage) {
+        if let Some(report) = self.inner.reporter.get() {
+            report(id, stage);
         }
     }
 
@@ -591,6 +646,7 @@ impl AgentManager {
                 },
             );
         }
+        self.emit(&id, AgentLogStage::Created);
         self.start(id, prompt, true, 1);
         Ok(info)
     }
@@ -601,14 +657,32 @@ impl AgentManager {
             let outcome = async {
                 if must_create {
                     manager.evict_completed_tabs().await;
-                    manager.inner.backend.create(&id).await?;
+                    let created = manager.inner.backend.create(&id).await;
+                    manager.emit(
+                        &id,
+                        if created.is_ok() {
+                            AgentLogStage::BrowserCreated
+                        } else {
+                            AgentLogStage::BrowserCreateFailed
+                        },
+                    );
+                    created?;
                 }
                 manager.mark_ready(&id, epoch).await;
                 if !manager.is_active(&id, epoch).await {
                     manager.inner.backend.close(&id).await;
                     return Err(BackendFailure::Unavailable);
                 }
-                manager.inner.backend.send(&id, &prompt).await
+                let reply = manager.inner.backend.send(&id, &prompt).await;
+                manager.emit(
+                    &id,
+                    if reply.is_ok() {
+                        AgentLogStage::BrowserReplyReceived
+                    } else {
+                        AgentLogStage::BrowserReplyFailed
+                    },
+                );
+                reply
             }
             .await;
             // Serialize completion with an in-flight file patch for this agent.
@@ -710,7 +784,14 @@ impl AgentManager {
                 // instead of leaving it open for the life of the process.
                 entry.ready = false;
             }
+            let terminal = agents.get(&id).map(|entry| entry.info.state);
             drop(agents);
+            match terminal {
+                Some(AgentState::Completed) => manager.emit(&id, AgentLogStage::Completed),
+                Some(AgentState::Failed) => manager.emit(&id, AgentLogStage::Failed),
+                Some(AgentState::Waiting) => manager.emit(&id, AgentLogStage::Waiting),
+                _ => {}
+            }
             if failed_tab {
                 manager.inner.backend.close(&id).await;
             }
@@ -1003,10 +1084,13 @@ impl AgentManager {
         entry.info.state = AgentState::Completed;
         entry.completed_seq = self.inner.next_completed_seq.fetch_add(1, Ordering::AcqRel);
         entry.updates.send_replace(entry.info.clone());
-        Ok(AgentCompletionAck {
+        let ack = AgentCompletionAck {
             id: entry.info.id.clone(),
             state: AgentState::Completed,
-        })
+        };
+        drop(agents);
+        self.emit(&ack.id, AgentLogStage::Completed);
+        Ok(ack)
     }
 
     /// Report one safe, authenticated event for a ready, nonterminal execution.
@@ -1832,6 +1916,57 @@ mod tests {
         async fn diagnostics(&self, _id: &str) -> serde_json::Value {
             serde_json::json!({})
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_observer_reports_minted_id_and_browser_failure_stage() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let reported = Arc::new(std::sync::Mutex::new(Vec::<(String, AgentLogStage)>::new()));
+        let recorded = reported.clone();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            Arc::new(BlockedBackend),
+        )
+        .with_diagnostic_reporter(move |id, stage| {
+            recorded
+                .lock()
+                .expect("report mutex")
+                .push((id.to_owned(), stage));
+        });
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                role: AgentRole::Reviewer,
+                task: "check source".into(),
+                context: Some("private fixture not logged".into()),
+                paths: vec![],
+            })
+            .await
+            .expect("spawn");
+        let completed = manager.wait(&info.id, 2).await.expect("wait");
+        assert_eq!(completed.agent.state, AgentState::Failed);
+        let events = reported.lock().expect("diagnostics").clone();
+        assert!(events.iter().all(|(id, _)| id == &info.id));
+        assert!(
+            events
+                .iter()
+                .any(|(_, stage)| *stage == AgentLogStage::Created)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(_, stage)| *stage == AgentLogStage::BrowserCreated)
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(_, stage)| *stage == AgentLogStage::BrowserReplyFailed)
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(_, stage)| stage.audit_name().contains("private"))
+        );
     }
 
     #[tokio::test]

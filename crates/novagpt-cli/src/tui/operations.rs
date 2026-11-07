@@ -357,11 +357,19 @@ impl Controller {
                 } else {
                     None
                 };
+                let audit = novagpt_mcp::AuditTrail::persistent(
+                    crate::logging::audit_directory(&root)
+                        .map_err(|_| "Invalid audit directory.".to_string())?,
+                )
+                .map_err(|_| "Audit storage unavailable or unsafe.".to_string())?;
                 let agents = browser.as_ref().map(|browser| {
+                    let agent_audit = audit.clone();
                     novagpt_agents::AgentManager::new(
                         workspaces.clone(),
                         Arc::new(novagpt_agents::ChatGptBackend::new(browser.clone())),
-                    )
+                    ).with_diagnostic_reporter(move |id, stage| {
+                        agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+                    })
                 });
                 let resolved = token::resolve()
                     .map_err(|err| format!("HTTP token unavailable: {err}"))?;
@@ -375,11 +383,7 @@ impl Controller {
                         browser_bridge: None,
                         output_store: novagpt_mcp::OutputStore::default(),
                         http_public_hostname: None,
-                        audit: novagpt_mcp::AuditTrail::persistent(
-                            crate::logging::audit_directory(&root)
-                                .map_err(|_| "Invalid audit directory.".to_string())?,
-                        )
-                        .map_err(|_| "Audit storage unavailable or unsafe.".to_string())?,
+                        audit,
                     },
                     resolved.value,
                 ))

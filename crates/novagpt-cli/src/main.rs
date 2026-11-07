@@ -480,11 +480,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
     };
+    let audit = novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?;
     let agents = browser.as_ref().map(|browser| {
+        let agent_audit = audit.clone();
         AgentManager::new(
             workspaces.clone(),
             Arc::new(ChatGptBackend::new(browser.clone())),
         )
+        .with_diagnostic_reporter(move |id, stage| {
+            agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+        })
     });
     let browser_bridge = match (
         cli.browser_bridge_port,
@@ -504,7 +509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser,
         browser_bridge,
         output_store: novagpt_mcp::OutputStore::default(),
-        audit: novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?,
+        audit,
         http_public_hostname: None,
     };
     match cli.command {

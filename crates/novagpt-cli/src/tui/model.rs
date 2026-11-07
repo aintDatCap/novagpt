@@ -345,8 +345,9 @@ impl App {
                                     seconds / 3600, seconds / 60 % 60, seconds % 60),
                                 level: if event.status == "error" { Level::Error } else { Level::Info },
                                 english: format!(
-                                    "Event #{} at UNIX timestamp {}: tool {} completed with status {}.",
-                                    event.sequence, event.unix_seconds, event.tool, event.status
+                                    "Event #{} at UNIX timestamp {}: tool {} completed with status {}.{}",
+                                    event.sequence, event.unix_seconds, event.tool, event.status,
+                                    event.agent_id.map_or(String::new(), |id| format!(" Agent {id}."))
                                 ),
                             }
                         }).collect();
