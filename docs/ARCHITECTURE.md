@@ -28,6 +28,8 @@ Canonical workspace roots and path guards reject disallowed paths and selected s
 
 The MCP HTTP server binds to loopback and requires the shared user token. It accepts a bearer header or the private URL query parameter `novagpt_token`; the query secret is removed before MCP protocol handling. The token is private user state outside the repository. A previously issued query key is accepted temporarily for existing private connections, but is not emitted in new URLs.
 
+When the enabled MCP server is running, the TUI can explicitly raise one owned subagent Chrome tab (or a separate blank browsing tab when no subagent is open). This user-initiated action reuses the server's browser handle and never navigates a worker tab. The manual-login Chrome flow still requires stopping MCP to avoid sharing an occupied browser profile.
+
 The CLI/TUI can manage its own ngrok process and verify the matching upstream port and hostname before disclosing the HTTPS endpoint. The ngrok inspector and tunnel logs are disabled. The full connector URL is shown only on user request. Credentials and full URLs are not written to audit logs.
 
 **Host-shell execution is not sandboxed.** A client with the full private connector URL can run commands with the server user's OS permissions. Explicitly allowed workspaces are not a sandbox around shell commands. Browser, VM and subagent features are opt-in.

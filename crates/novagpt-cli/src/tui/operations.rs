@@ -7,7 +7,7 @@ use crate::{connection, tunnel};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::JoinHandle};
@@ -17,6 +17,7 @@ pub(super) struct Controller {
     tx: UnboundedSender<OperationEvent>,
     server: Option<JoinHandle<()>>,
     browser_login: Option<JoinHandle<()>>,
+    agent_browser: Arc<Mutex<Option<novagpt_browser::ChatGptBrowser>>>,
     installer: Option<JoinHandle<()>>,
 }
 impl Controller {
@@ -26,6 +27,7 @@ impl Controller {
             tx,
             server: None,
             browser_login: None,
+            agent_browser: Arc::new(Mutex::new(None)),
             installer: None,
         }
     }
@@ -98,6 +100,22 @@ impl Controller {
                             .to_string()
                     });
                     let _ = tx.send(OperationEvent::NovaSourceLoaded(result));
+                });
+            }
+            Effect::ShowSubagentChrome => {
+                // Borrow only a cloned handle: no lock is held during Chrome I/O.
+                let browser = self
+                    .agent_browser
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                let tx = self.tx.clone();
+                self.runtime.spawn(async move {
+                    let result = match browser {
+                        Some(browser) => browser.show_subagent_chrome().await.map_err(|_| ()),
+                        None => Err(()),
+                    };
+                    let _ = tx.send(OperationEvent::BrowserShowFinished(result));
                 });
             }
             Effect::OpenAgentBrowser(config) => {
@@ -269,6 +287,7 @@ impl Controller {
         }
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
         let tx = self.tx.clone();
+        let agent_browser = Arc::clone(&self.agent_browser);
         let task = self.runtime.spawn(async move {
             if ngrok && !crate::ngrok_install::available().await {
                 let _ = tx.send(OperationEvent::NgrokMissing);
@@ -346,6 +365,9 @@ impl Controller {
             .await;
             match setup {
                 Ok(Ok((workspaces, mut extras, token))) => {
+                    if let Ok(mut handle) = agent_browser.lock() {
+                        *handle = extras.browser.clone();
+                    }
                     let tx_check = tx.clone();
                     let probe_token = token.clone();
                     let probe = tokio::spawn(async move {
@@ -425,6 +447,9 @@ impl Controller {
                         novagpt_mcp::run_http_with(workspaces, address, token, extras).await
                     };
                     probe.abort();
+                    if let Ok(mut handle) = agent_browser.lock() {
+                        *handle = None;
+                    }
                     if result.is_err() {
                         let _ = tx.send(OperationEvent::Server(ServerState::Failed));
                         let _ = tx.send(OperationEvent::Log(
@@ -456,6 +481,9 @@ impl Controller {
         self.server = Some(task);
     }
     fn stop(&mut self) {
+        if let Ok(mut handle) = self.agent_browser.lock() {
+            *handle = None;
+        }
         if let Some(task) = self.server.take() {
             task.abort();
             self.report(Level::Info, "HTTP stop requested (task cancelled).");
@@ -465,6 +493,9 @@ impl Controller {
 }
 impl Drop for Controller {
     fn drop(&mut self) {
+        if let Ok(mut handle) = self.agent_browser.lock() {
+            *handle = None;
+        }
         if let Some(task) = self.server.take() {
             task.abort();
         }

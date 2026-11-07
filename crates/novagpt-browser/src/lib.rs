@@ -807,6 +807,28 @@ impl ChatGptBrowser {
         Ok(self.diagnostics(Some(BROWSE_TAB)).await)
     }
 
+    /// Explicit user request to show the Chrome owned by subagents. Reuse an
+    /// existing agent tab without navigating it or interrupting its worker.
+    /// When no agent tab exists, open a separate blank browsing tab instead.
+    pub async fn show_subagent_chrome(&self) -> Result<(), BrowserError> {
+        let agent_page = {
+            let pages = self.inner.pages.lock().await;
+            pages
+                .iter()
+                .filter(|(id, page)| id.as_str() != BROWSE_TAB && !page.transport.is_closed())
+                .min_by(|left, right| left.0.cmp(right.0))
+                .map(|(_, page)| Arc::clone(page))
+        };
+        let page = match agent_page {
+            Some(page) => page,
+            None => {
+                self.browse_open().await?;
+                self.page(BROWSE_TAB).await?
+            }
+        };
+        page.ensure_interactive().await
+    }
+
     /// Navigate the dedicated browsing tab. No arbitrary JavaScript is accepted
     /// through MCP. Subagent pages and their conversations are unaffected.
     pub async fn browse_navigate(&self, url: &str) -> Result<BrowsedPage, BrowserError> {
@@ -2314,6 +2336,21 @@ mod tests {
         WebDriverSession::create(client, json!({"browserName":"chrome"}))
             .await
             .expect("session")
+    }
+
+    #[tokio::test]
+    async fn user_can_show_owned_subagent_chrome_without_changing_tabs() {
+        let (port, state, server) = spawn_mock().await;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-visible").await.expect("agent tab");
+        let before = state.lock().await.handles.clone();
+        browser
+            .show_subagent_chrome()
+            .await
+            .expect("raise existing tab");
+        assert_eq!(state.lock().await.handles, before);
+        browser.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]

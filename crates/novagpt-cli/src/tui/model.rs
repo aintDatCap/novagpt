@@ -20,6 +20,7 @@ pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
         7 => i18n::Messages::start_mcp_ngrok(lang),
         8 => i18n::Messages::show_chatgpt_url(lang),
         9 => i18n::Messages::open_agent_browser(lang),
+        10 => i18n::Messages::show_subagent_chrome(lang),
         _ => "",
     }
 }
@@ -121,6 +122,7 @@ pub(super) enum Effect {
     EnsureToken,
     LoadNovaSource(PathBuf),
     OpenAgentBrowser(LocalSettings),
+    ShowSubagentChrome,
     Quit,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +148,7 @@ pub(super) enum OperationEvent {
     CopyFinished(Result<(), String>),
     NovaSourceLoaded(Result<ImportProfile, String>),
     BrowserLoginFinished(Result<(), BrowserOpenFailure>),
+    BrowserShowFinished(Result<(), ()>),
     Saved {
         settings: LocalSettings,
         outcome: Result<String, String>,
@@ -412,6 +415,17 @@ impl App {
                         .log_localized(Level::Error, i18n::Messages::agent_browser_launch_failed),
                 }
             }
+            OperationEvent::BrowserShowFinished(result) => {
+                self.busy = false;
+                match result {
+                    Ok(()) => {
+                        self.log_localized(Level::Success, i18n::Messages::subagent_chrome_shown)
+                    }
+                    Err(()) => {
+                        self.log_localized(Level::Warn, i18n::Messages::subagent_chrome_unavailable)
+                    }
+                }
+            }
             OperationEvent::TokenPresent(message) => {
                 self.auth_state = AuthState::Ready;
                 self.log(Level::Info, message);
@@ -494,7 +508,11 @@ impl App {
     }
     pub fn visible_commands(&self) -> Vec<usize> {
         let mut commands = if matches!(self.server, ServerState::Running | ServerState::Starting) {
-            vec![8, 1, 2]
+            if self.persisted.browser_enabled {
+                vec![8, 10, 1, 2]
+            } else {
+                vec![8, 1, 2]
+            }
         } else {
             vec![0, 7, 9, 2]
         };
@@ -643,6 +661,17 @@ impl App {
                     return Some(Effect::OpenAgentBrowser(self.persisted.clone()));
                 }
                 None
+            }
+            10 => {
+                if self.server != ServerState::Running || !self.persisted.browser_enabled {
+                    self.log_localized(Level::Warn, i18n::Messages::subagent_chrome_unavailable);
+                    None
+                } else if self.busy {
+                    None
+                } else {
+                    self.busy = true;
+                    Some(Effect::ShowSubagentChrome)
+                }
             }
             _ => None,
         }

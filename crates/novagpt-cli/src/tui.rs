@@ -600,6 +600,31 @@ mod tests {
     }
 
     #[test]
+    fn running_mcp_exposes_user_requested_subagent_chrome() {
+        let settings = LocalSettings {
+            browser_enabled: true,
+            ..LocalSettings::default()
+        };
+        let mut app = App::new(PathBuf::from("."), settings, false, vec![]);
+        app.on_event(OperationEvent::Server(ServerState::Running));
+        assert_eq!(app.visible_commands(), vec![8, 10, 1, 2]);
+        app.command = 10;
+        assert!(matches!(
+            app.key(key(KeyCode::Enter)),
+            Some(Effect::ShowSubagentChrome)
+        ));
+        assert!(app.busy);
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        app.on_event(OperationEvent::BrowserShowFinished(Ok(())));
+        assert!(!app.busy);
+        app.on_event(OperationEvent::Server(ServerState::Stopped));
+        assert!(!app.visible_commands().contains(&10));
+        app.command = 10;
+        assert!(app.key(key(KeyCode::Enter)).is_none());
+        assert!(!app.busy);
+    }
+
+    #[test]
     fn agent_browser_requires_saved_opt_in_and_mcp_stopped() {
         let mut app = app();
         app.command = 9;

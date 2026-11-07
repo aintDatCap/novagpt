@@ -23,6 +23,7 @@ NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **
 - **Stop MCP HTTP:** Stop the server owned by this TUI instance, after confirmation.
 - **Show / copy ChatGPT URL:** Reveal the complete private URL only after the server and tunnel are ready. Press **C** in the dialog to copy it. NovaGPT selects Wayland (`wl-copy`), X11 (`xclip`/`xsel`), WSL (`clip.exe`), macOS (`pbcopy`) or Windows (`clip.exe`) as appropriate. On Linux, install the appropriate clipboard utility if it is absent; the dialog displays an error instead of reporting a false success.
 - **Diagnostics and optional tools:** Verify workspace status, inspect VM images when enabled, or launch the dedicated browser login flow.
+- **Show subagent Chrome:** When MCP is running with ChatGPT Browser enabled, explicitly bring one existing subagent tab to the foreground without navigating or changing its work. If none exists, open a separate blank browsing tab in the same owned Chrome. This requires the desktop to allow window focus; it never opens a second browser profile. The separate manual-login action remains available only while MCP is stopped.
 
 If ngrok is **missing** when starting a tunnel, NovaGPT asks whether to install it using an available supported system package manager. The confirmation defaults to **No**. The installer needs the user's explicit consent, and ngrok account authentication remains a separate manual step. See the [ngrok setup guide](INSTALLATION.md#configure-ngrok-for-chatgpt-access).
 
