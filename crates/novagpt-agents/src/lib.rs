@@ -100,6 +100,8 @@ pub enum AgentLogStage {
     BrowserCreated,
     BrowserCreateFailed,
     BrowserReplyReceived,
+    PreflightIdleConfirmed,
+    PreflightVerified,
     BrowserReplyFailed,
     BrowserReplyUncertain,
     BrowserReplyBlocked,
@@ -116,6 +118,8 @@ impl AgentLogStage {
             Self::BrowserCreated => "agent_browser_created",
             Self::BrowserCreateFailed => "agent_browser_create_failed",
             Self::BrowserReplyReceived => "agent_browser_reply_received",
+            Self::PreflightIdleConfirmed => "agent_preflight_idle_confirmed",
+            Self::PreflightVerified => "agent_preflight_verified",
             Self::BrowserReplyFailed => "agent_browser_reply_failed",
             Self::BrowserReplyUncertain => "agent_browser_reply_uncertain",
             Self::BrowserReplyBlocked => "agent_browser_reply_blocked",
@@ -292,6 +296,11 @@ pub trait AgentBackend: Send + Sync {
     async fn cancel(&self, id: &str);
     /// Stop awaiting an already acknowledged response without closing its tab.
     async fn complete(&self, _id: &str) {}
+    /// True only if an already-submitted preflight turn is visibly idle.
+    /// Never infer browser idleness from authenticated callbacks alone.
+    async fn preflight_idle(&self, _id: &str) -> bool {
+        false
+    }
     async fn close(&self, _id: &str) {}
     async fn diagnostics(&self, id: &str) -> serde_json::Value;
 }
@@ -333,6 +342,9 @@ impl AgentBackend for ChatGptBackend {
     async fn complete(&self, id: &str) {
         let _ = self.browser.complete(id).await;
     }
+    async fn preflight_idle(&self, id: &str) -> bool {
+        self.browser.preflight_idle(id).await.unwrap_or(false)
+    }
     async fn diagnostics(&self, id: &str) -> serde_json::Value {
         serde_json::to_value(self.browser.diagnostics(Some(id)).await).unwrap_or_default()
     }
@@ -348,6 +360,9 @@ fn map_browser(error: BrowserError) -> BackendFailure {
         }
         BrowserError::InteractionBlocked => BackendFailure::Blocked(
             "ChatGPT tab could not be made visible and focused; no prompt submitted",
+        ),
+        BrowserError::SendUnavailable => BackendFailure::Blocked(
+            "ChatGPT send control stayed unavailable after previous submission; coding task NOT sent",
         ),
         BrowserError::AmbiguousSubmission => BackendFailure::Uncertain(
             "Chrome disconnected after possible submission; no prompt replay. Authenticated callbacks remain available",
@@ -661,6 +676,96 @@ impl AgentManager {
         Ok(info)
     }
 
+    fn probe_entry_active(entry: &Entry, epoch: u64) -> bool {
+        entry.epoch == epoch
+            && entry.probe_pending
+            && entry.info.state == AgentState::Running
+            && !entry.completion_claimed
+    }
+
+    async fn probe_active(&self, id: &str, epoch: u64) -> bool {
+        self.inner
+            .entries
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|entry| Self::probe_entry_active(entry, epoch))
+    }
+
+    async fn probes_received(&self, id: &str, epoch: u64) -> bool {
+        self.inner
+            .entries
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|entry| {
+                Self::probe_entry_active(entry, epoch)
+                    && entry.probe_patch
+                    && entry.probe_create
+                    && entry.probe_progress
+            })
+    }
+
+    /// The browser may never produce a textual assistant reply after all three
+    /// authenticated callbacks. Continue only after the backend independently
+    /// observes an idle submitted turn and the old send poller has exited.
+    /// An unreachable/busy tab is NOT an authorization to send another prompt.
+    async fn send_preflight(
+        &self,
+        id: &str,
+        prompt: &str,
+        epoch: u64,
+    ) -> Result<(String, Option<String>), BackendFailure> {
+        let mut updates = {
+            let entries = self.inner.entries.lock().await;
+            entries
+                .get(id)
+                .ok_or(BackendFailure::Unavailable)?
+                .updates
+                .subscribe()
+        };
+        let mut receipts = self.probes_received(id, epoch).await;
+        let mut sent = Box::pin(self.inner.backend.send(id, prompt));
+        loop {
+            tokio::select! {
+                reply = &mut sent => {
+                    // A disconnect after a possible submission may still leave
+                    // an independently observable idle tab. Never replay it.
+                    if reply.is_err()
+                        && self.probes_received(id, epoch).await
+                        && self.inner.backend.preflight_idle(id).await
+                    {
+                        self.inner.backend.complete(id).await;
+                        return Ok((String::new(), None));
+                    }
+                    return reply;
+                }
+                update = updates.changed(), if !receipts => {
+                    if update.is_err() {
+                        return Err(BackendFailure::Unavailable);
+                    }
+                    receipts = self.probes_received(id, epoch).await;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(500)), if receipts => {
+                    if !self.probes_received(id, epoch).await {
+                        return Err(BackendFailure::Unavailable);
+                    }
+                    if self.inner.backend.preflight_idle(id).await {
+                        self.inner.backend.complete(id).await;
+                        // Do not start the coding turn while the old sender
+                        // still owns its tab lock (or a pending browser read).
+                        if timeout(Duration::from_secs(5), &mut sent).await.is_err() {
+                            return Err(BackendFailure::Uncertain(
+                                "Preflight browser poller did not stop; coding task NOT sent",
+                            ));
+                        }
+                        return Ok((String::new(), None));
+                    }
+                }
+            }
+        }
+    }
+
     fn start(&self, id: String, prompt: String, must_create: bool, epoch: u64) {
         let manager = self.clone();
         tokio::spawn(async move {
@@ -683,8 +788,16 @@ impl AgentManager {
                     manager.inner.backend.close(&id).await;
                     return Err(BackendFailure::Unavailable);
                 }
-                let reply = manager.inner.backend.send(&id, &prompt).await;
+                let is_preflight = manager.probe_active(&id, epoch).await;
+                let reply = if is_preflight {
+                    manager.send_preflight(&id, &prompt, epoch).await
+                } else {
+                    manager.inner.backend.send(&id, &prompt).await
+                };
                 let stage = match &reply {
+                    Ok((content, _)) if is_preflight && content.is_empty() => {
+                        AgentLogStage::PreflightIdleConfirmed
+                    }
                     Ok(_) => AgentLogStage::BrowserReplyReceived,
                     Err(BackendFailure::Uncertain(_)) => AgentLogStage::BrowserReplyUncertain,
                     Err(BackendFailure::Blocked(_)) => AgentLogStage::BrowserReplyBlocked,
@@ -806,7 +919,9 @@ impl AgentManager {
                 manager.inner.backend.close(&id).await;
             }
             if let Some(prompt) = next_prompt {
-                // The probe browser reply finished before the actual coding
+                manager.emit(&id, AgentLogStage::PreflightVerified);
+                // The probe browser turn finished or was independently
+                // confirmed idle before the actual coding
                 // prompt is sent to this same tab. No tool-text is trusted.
                 manager.start(id, prompt, false, epoch);
             }
@@ -1312,6 +1427,11 @@ impl AgentManager {
             }
             _ => return Err(AgentError::Invalid),
         };
+        // Wake the preflight observer when the last authenticated receipt
+        // arrives, including when progress was reported before both probes.
+        if entry.probe_patch && entry.probe_create && entry.probe_progress {
+            entry.updates.send_replace(entry.info.clone());
+        }
         Ok(AgentToolProbe {
             id: id.to_owned(),
             capability,
@@ -1558,6 +1678,8 @@ mod tests {
         entered: tokio::sync::Notify,
         release_probe: tokio::sync::Notify,
         release_task: tokio::sync::Notify,
+        idle: std::sync::atomic::AtomicBool,
+        fail_probe: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1584,7 +1706,11 @@ mod tests {
             self.entered.notify_one();
             if number == 1 {
                 self.release_probe.notified().await;
-                Ok(("preflight complete".into(), None))
+                if self.fail_probe.load(Ordering::Acquire) {
+                    Err(BackendFailure::Uncertain("Submission outcome uncertain"))
+                } else {
+                    Ok(("preflight complete".into(), None))
+                }
             } else {
                 self.release_task.notified().await;
                 Ok(("task reply".into(), None))
@@ -1592,7 +1718,14 @@ mod tests {
         }
         async fn cancel(&self, _id: &str) {}
         async fn complete(&self, _id: &str) {
-            self.release_task.notify_one();
+            if self.prompts.lock().await.len() == 1 {
+                self.release_probe.notify_one();
+            } else {
+                self.release_task.notify_one();
+            }
+        }
+        async fn preflight_idle(&self, _id: &str) -> bool {
+            self.idle.load(Ordering::Acquire)
         }
         async fn diagnostics(&self, _id: &str) -> serde_json::Value {
             serde_json::json!({})
@@ -1605,7 +1738,348 @@ mod tests {
             entered: tokio::sync::Notify::new(),
             release_probe: tokio::sync::Notify::new(),
             release_task: tokio::sync::Notify::new(),
+            idle: std::sync::atomic::AtomicBool::new(true),
+            fail_probe: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    #[tokio::test]
+    async fn authenticated_preflight_advances_without_a_textual_browser_reply() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = probe_backend();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            backend.clone(),
+        );
+        let info = manager
+            .spawn_with_connector(
+                SpawnAgent {
+                    workspace_id: None,
+                    role: AgentRole::Implementer,
+                    task: "Read-only diagnostic assignment".into(),
+                    paths: vec![],
+                    context: None,
+                },
+                Some("NovaGPT Laptop"),
+            )
+            .await
+            .expect("spawn");
+        backend.entered.notified().await;
+        let code = manager.inner.entries.lock().await[&info.id]
+            .completion_code
+            .clone();
+        manager
+            .progress(&info.id, &code, "working")
+            .await
+            .expect("progress");
+        manager
+            .probe_tool(&info.id, &code, "subagent_apply_patch")
+            .await
+            .expect("patch probe");
+        manager
+            .probe_tool(&info.id, &code, "subagent_create_file")
+            .await
+            .expect("create probe");
+
+        // The first browser send never returns until explicitly released. The
+        // three authenticated receipts must still advance a demonstrably idle
+        // preflight tab, rather than waiting for a textual ChatGPT response.
+        timeout(Duration::from_secs(2), backend.entered.notified())
+            .await
+            .expect("coding task should be dispatched after receipts");
+        let status = manager.status(Some(&info.id)).await.expect("status");
+        assert_eq!(status.agents[0].capability_status, "verified");
+        assert_eq!(backend.prompts.lock().await.len(), 2);
+        manager
+            .finished(&info.id, &code, "Diagnostic completed")
+            .await
+            .expect("finished");
+    }
+
+    #[tokio::test]
+    async fn uncertain_browser_result_after_probes_can_advance_only_with_idle_confirmation() {
+        for idle in [true, false] {
+            let dir = tempfile::tempdir().expect("fixture");
+            let backend = probe_backend();
+            backend.idle.store(idle, Ordering::Release);
+            backend.fail_probe.store(true, Ordering::Release);
+            let manager = AgentManager::new(
+                WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+                backend.clone(),
+            );
+            let info = manager
+                .spawn_with_connector(
+                    SpawnAgent {
+                        workspace_id: None,
+                        role: AgentRole::Implementer,
+                        task: "DIAGNOSTIC ONLY".into(),
+                        paths: vec![],
+                        context: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("spawn");
+            backend.entered.notified().await;
+            let code = manager.inner.entries.lock().await[&info.id]
+                .completion_code
+                .clone();
+            manager
+                .progress(&info.id, &code, "working")
+                .await
+                .expect("progress");
+            manager
+                .probe_tool(&info.id, &code, "subagent_apply_patch")
+                .await
+                .expect("patch probe");
+            manager
+                .probe_tool(&info.id, &code, "subagent_create_file")
+                .await
+                .expect("create probe");
+            backend.release_probe.notify_one();
+            if idle {
+                timeout(Duration::from_secs(2), backend.entered.notified())
+                    .await
+                    .expect("idle tab can accept coding assignment");
+                let status = manager.status(Some(&info.id)).await.expect("status");
+                assert_eq!(status.agents[0].capability_status, "verified");
+                assert_eq!(backend.prompts.lock().await.len(), 2);
+                manager
+                    .finished(&info.id, &code, "Done")
+                    .await
+                    .expect("finish");
+            } else {
+                let status = manager.wait(&info.id, 2).await.expect("wait");
+                assert_eq!(status.agent.state, AgentState::Waiting);
+                assert_eq!(status.agent.capability_status, "probing");
+                assert_eq!(backend.prompts.lock().await.len(), 1);
+                assert!(matches!(
+                    manager.resume(&info.id, true).await,
+                    Err(AgentError::NotWaiting)
+                ));
+                manager.cancel(&info.id).await.expect("cancel");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_probe_prevents_late_receipts_and_task_delivery() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = probe_backend();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            backend.clone(),
+        );
+        let info = manager
+            .spawn_with_connector(
+                SpawnAgent {
+                    workspace_id: None,
+                    role: AgentRole::Implementer,
+                    task: "Never send after cancellation".into(),
+                    paths: vec![],
+                    context: None,
+                },
+                None,
+            )
+            .await
+            .expect("spawn");
+        backend.entered.notified().await;
+        let code = manager.inner.entries.lock().await[&info.id]
+            .completion_code
+            .clone();
+        manager
+            .progress(&info.id, &code, "working")
+            .await
+            .expect("progress");
+        manager
+            .probe_tool(&info.id, &code, "subagent_apply_patch")
+            .await
+            .expect("patch probe");
+        manager.cancel(&info.id).await.expect("cancel");
+        assert!(matches!(
+            manager
+                .probe_tool(&info.id, &code, "subagent_create_file")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        backend.release_probe.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            manager.status(Some(&info.id)).await.expect("status").agents[0].state,
+            AgentState::Cancelled
+        );
+        assert_eq!(backend.prompts.lock().await.len(), 1);
+    }
+
+    struct ParallelProbeBackend {
+        prompts: Mutex<HashMap<String, Vec<String>>>,
+        releases: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    }
+
+    #[async_trait]
+    impl AgentBackend for ParallelProbeBackend {
+        fn name(&self) -> &'static str {
+            "parallel-fixture"
+        }
+        fn model(&self) -> &'static str {
+            "fixture"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            id: &str,
+            prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            let release = {
+                self.releases
+                    .lock()
+                    .await
+                    .entry(id.to_owned())
+                    .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                    .clone()
+            };
+            self.prompts
+                .lock()
+                .await
+                .entry(id.to_owned())
+                .or_default()
+                .push(prompt.to_owned());
+            release.notified().await;
+            Ok(("fixture acknowledgement".into(), None))
+        }
+        async fn cancel(&self, id: &str) {
+            self.complete(id).await;
+        }
+        async fn complete(&self, id: &str) {
+            if let Some(release) = self.releases.lock().await.get(id) {
+                release.notify_one();
+            }
+        }
+        async fn preflight_idle(&self, _id: &str) -> bool {
+            true
+        }
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_preflights_do_not_release_another_agents_task() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let backend = Arc::new(ParallelProbeBackend {
+            prompts: Mutex::new(HashMap::new()),
+            releases: Mutex::new(HashMap::new()),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            backend.clone(),
+        );
+        let mut ids = Vec::new();
+        let mut codes = Vec::new();
+        for _ in 0..2 {
+            let info = manager
+                .spawn_with_connector(
+                    SpawnAgent {
+                        workspace_id: None,
+                        role: AgentRole::Implementer,
+                        task: "Independent diagnostic".into(),
+                        paths: vec![],
+                        context: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("spawn");
+            codes.push(
+                manager.inner.entries.lock().await[&info.id]
+                    .completion_code
+                    .clone(),
+            );
+            ids.push(info.id);
+        }
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if backend.prompts.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both tabs submitted");
+        let callbacks = |id: String, code: String, manager: AgentManager| async move {
+            manager
+                .progress(&id, &code, "working")
+                .await
+                .expect("progress");
+            manager
+                .probe_tool(&id, &code, "subagent_apply_patch")
+                .await
+                .expect("patch probe");
+            manager
+                .probe_tool(&id, &code, "subagent_create_file")
+                .await
+                .expect("create probe");
+        };
+        callbacks(ids[0].clone(), codes[0].clone(), manager.clone()).await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if backend
+                    .prompts
+                    .lock()
+                    .await
+                    .get(&ids[0])
+                    .is_some_and(|p| p.len() == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first task dispatched");
+        assert_eq!(backend.prompts.lock().await[&ids[1]].len(), 1);
+        assert_eq!(
+            manager.status(Some(&ids[1])).await.expect("status").agents[0].capability_status,
+            "probing"
+        );
+
+        callbacks(ids[1].clone(), codes[1].clone(), manager.clone()).await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if backend
+                    .prompts
+                    .lock()
+                    .await
+                    .get(&ids[1])
+                    .is_some_and(|p| p.len() == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("second task dispatched");
+        assert!(matches!(
+            manager
+                .probe_tool(&ids[0], &codes[0], "subagent_create_file")
+                .await,
+            Err(AgentError::PatchDenied)
+        ));
+        for i in 0..2 {
+            assert_eq!(
+                manager.status(Some(&ids[i])).await.expect("status").agents[0].capability_status,
+                "verified"
+            );
+            assert_eq!(backend.prompts.lock().await[&ids[i]].len(), 2);
+            manager
+                .finished(&ids[i], &codes[i], "done")
+                .await
+                .expect("finish");
+        }
     }
 
     #[tokio::test]

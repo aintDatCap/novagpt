@@ -107,6 +107,8 @@ pub enum BrowserError {
     NavigationTimeout,
     #[error("ChatGPT tab could not be made visible and focused; no prompt was submitted")]
     InteractionBlocked,
+    #[error("ChatGPT send control did not become available; no prompt was submitted")]
+    SendUnavailable,
     #[error("ChatGPT composer unavailable after waiting; no prompt was submitted")]
     ComposerUnavailable,
     #[error("Chrome disconnected after possible prompt submission; no automatic replay")]
@@ -244,6 +246,12 @@ struct Page {
     cancelled: AtomicBool,
     // A crashed tab must never cause automatic replay after a send event.
     submission_attempted: AtomicBool,
+    // Permanent tab history: never recreate an already-used conversation if
+    // its driver target becomes unavailable, even after the poller resets.
+    ever_submitted: AtomicBool,
+    // Once this page has shown an actual Send button, its later absence is
+    // treated as a busy/disabled composer, not as permission to press Enter.
+    send_button_seen: AtomicBool,
     // A challenge observed in this attempt must suppress automatic recovery.
     verification_seen: AtomicBool,
     send_lock: Mutex<()>,
@@ -778,6 +786,8 @@ impl ChatGptBrowser {
             pacing: self.inner.pacing,
             cancelled: AtomicBool::new(false),
             submission_attempted: AtomicBool::new(false),
+            ever_submitted: AtomicBool::new(false),
+            send_button_seen: AtomicBool::new(false),
             verification_seen: AtomicBool::new(false),
             send_lock: Mutex::new(()),
             pending_before: Mutex::new(None),
@@ -1207,7 +1217,13 @@ impl ChatGptBrowser {
                 .get(id)
                 .is_some_and(|page| page.submission_attempted.load(Ordering::Acquire));
             if attempted {
-                return Err(BrowserError::AmbiguousSubmission);
+                // A response timeout is not evidence of a Chrome disconnect.
+                // Both remain uncertain and neither permits prompt replay.
+                return if matches!(outcome, Err(BrowserError::Timeout)) {
+                    Err(BrowserError::Timeout)
+                } else {
+                    Err(BrowserError::AmbiguousSubmission)
+                };
             }
             // No possible submission occurred. Recover the driver/session and
             // retry the unsent prompt exactly once; this is the only automatic
@@ -1222,7 +1238,11 @@ impl ChatGptBrowser {
                     .get(id)
                     .is_some_and(|page| page.submission_attempted.load(Ordering::Acquire));
                 if attempted && outcome.is_err() {
-                    return Err(BrowserError::AmbiguousSubmission);
+                    return if matches!(outcome, Err(BrowserError::Timeout)) {
+                        Err(BrowserError::Timeout)
+                    } else {
+                        Err(BrowserError::AmbiguousSubmission)
+                    };
                 }
             }
         }
@@ -1245,7 +1265,9 @@ impl ChatGptBrowser {
             Err(error) => {
                 let stale = self.inner.pages.lock().await.get(id).cloned();
                 if let Some(stale) = stale {
-                    if stale.submission_attempted.load(Ordering::Acquire) {
+                    if stale.submission_attempted.load(Ordering::Acquire)
+                        || stale.ever_submitted.load(Ordering::Acquire)
+                    {
                         stale.diagnostic("recovery_blocked_after_send", "").await;
                         return Err(BrowserError::AmbiguousSubmission);
                     }
@@ -1418,11 +1440,19 @@ impl ChatGptBrowser {
             // is only sent when the button is the topmost element at its own
             // centre, so a challenge overlay or dialog cannot be clicked
             // blindly.
-            // Retry briefly for React to enable the button after typing.
-            let mut button = Value::Null;
+            // A Send button already used in this tab must reappear before
+            // another submission. After a callback-heavy preflight, a missing
+            // button can mean that ChatGPT is STILL processing the prior turn,
+            // even when its Stop control is absent. Never treat that as a
+            // fallback invitation to press Enter into a busy composer.
             let mut obscured = false;
-            for _ in 0..8 {
-                button = page
+            let send_ready_deadline = Instant::now() + Duration::from_secs(45);
+            let mut attempts = 0;
+            let button = loop {
+                if page.cancelled.load(Ordering::Acquire) {
+                    return Err(BrowserError::Cancelled);
+                }
+                let candidate = page
                     .eval(&ui_expression(
                         r#"const el = findSendButton();
                         if (!el) return null;
@@ -1433,20 +1463,40 @@ impl ChatGptBrowser {
                         return {x, y, clear: !!hit && (hit === el || el.contains(hit))};"#,
                     ))
                     .await?;
-                if button.is_object() {
-                    obscured = button["clear"] != true;
-                    break;
+                if candidate.is_object() {
+                    obscured = candidate["clear"] != true;
+                    break candidate;
                 }
-                sleep(Duration::from_millis(125)).await;
-            }
+                attempts += 1;
+                if !page.send_button_seen.load(Ordering::Acquire) && attempts >= 8 {
+                    // Some layouts genuinely have no Send button at all.
+                    break Value::Null;
+                }
+                if Instant::now() >= send_ready_deadline {
+                    page.diagnostic("send_control_unavailable", "").await;
+                    return Err(BrowserError::SendUnavailable);
+                }
+                if attempts % 8 == 0 {
+                    let state = self.dom_state(&page).await?;
+                    page.note_state(&state).await;
+                    if let Some(manual) = manual_reason(&state) {
+                        *page.manual.lock().await = Some(manual.to_owned());
+                        page.diagnostic("manual_before_submit", manual).await;
+                        return Err(BrowserError::Manual(manual));
+                    }
+                }
+                sleep(Duration::from_millis(250)).await;
+            };
             if obscured {
                 page.diagnostic("send_button_obscured", "").await;
                 return Err(BrowserError::InteractionBlocked);
             }
             if let (Some(x), Some(y)) = (button["x"].as_f64(), button["y"].as_f64()) {
+                page.send_button_seen.store(true, Ordering::Release);
                 page.diagnostic("send_button_found", "").await;
                 // ChromeDriver can fail after the first event with unknown outcome.
                 page.submission_attempted.store(true, Ordering::Release);
+                page.ever_submitted.store(true, Ordering::Release);
                 page.click_at(x, y).await?;
                 page.diagnostic("send_mouse_dispatched", "").await;
             } else {
@@ -1455,6 +1505,7 @@ impl ChatGptBrowser {
                 // The send button is absent in some ChatGPT layouts; Enter is
                 // the fallback after filling the editor.
                 page.submission_attempted.store(true, Ordering::Release);
+                page.ever_submitted.store(true, Ordering::Release);
                 page.press_enter().await?;
                 page.diagnostic("send_enter_dispatched", "").await;
             }
@@ -1552,15 +1603,47 @@ impl ChatGptBrowser {
             const assistants = [...document.querySelectorAll({})];
             const last = assistants[assistants.length - 1];
             const content = last?.querySelector('.markdown, [data-message-content], .prose') || last;
-            const stop = !!document.querySelector('[data-testid="stop-button"]');
+            const stop = [...document.querySelectorAll('[data-testid="stop-button"]')].some(isVisible);
             const copy = !!last?.querySelector('[data-testid="copy-turn-action-button"]');
             return {{url:location.href, title, page_kind:'chatgpt',
                 composer:!!editor, challenge, login,
                 assistant_count:assistants.length, last_text:content?.innerText || '',
-                complete:copy || !stop}};"#,
+                complete:copy || !stop,
+                preflight_idle:!!editor && editorText(editor).trim() === '' && !stop}};"#,
             json!(ASSISTANTS)
         ));
         page.eval(&expression).await
+    }
+
+    /// Independently confirm that an already-submitted capability preflight
+    /// is no longer generating. A missing assistant message is not enough,
+    /// and authenticated callbacks alone do not prove the UI is idle.
+    /// Keep the original send poller alive unless this check succeeds.
+    pub async fn preflight_idle(&self, id: &str) -> Result<bool, BrowserError> {
+        let page = self.page(id).await?;
+        if !page.submission_attempted.load(Ordering::Acquire)
+            || page.pending_before.lock().await.is_none()
+        {
+            return Ok(false);
+        }
+        for sample in 0..4 {
+            if page.cancelled.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let state = self.dom_state(&page).await?;
+            page.note_state(&state).await;
+            if manual_reason(&state).is_some()
+                || page_phase(&state) != PagePhase::Ready
+                || state["preflight_idle"] != true
+            {
+                return Ok(false);
+            }
+            if sample < 3 {
+                sleep(Duration::from_millis(350)).await;
+            }
+        }
+        page.diagnostic("preflight_idle_confirmed", "").await;
+        Ok(true)
     }
 
     /// A completion callback already contains the trusted-by-transport but
@@ -2080,6 +2163,7 @@ mod tests {
         initial_blank: usize,
         verified: bool,
         reply_ready: bool,
+        generating: bool,
         inserted: usize,
         inserted_text: String,
         keys: usize,
@@ -2087,6 +2171,7 @@ mod tests {
         not_visible: bool,
         not_focused: bool,
         obscured: bool,
+        send_missing: bool,
         pressed: bool,
         released: bool,
         clicks: usize,
@@ -2225,18 +2310,24 @@ mod tests {
                 } else if state.reply_ready {
                     json!({"url":"https://chatgpt.com/c/mock","page_kind":"chatgpt",
                         "composer":true,"challenge":false,"login":false,
-                        "assistant_count":1,"last_text":"Fixture answer","complete":true})
+                        "assistant_count":1,"last_text":"Fixture answer","complete":true,
+                        "preflight_idle":!state.generating})
                 } else {
                     json!({"url":"https://chatgpt.com/","page_kind":"chatgpt",
                         "composer":true,"challenge":false,"login":false,
-                        "assistant_count":0,"last_text":"","complete":true})
+                        "assistant_count":0,"last_text":"","complete":true,
+                        "preflight_idle":!state.generating})
                 }
             } else if script.contains("document.activeElement === el") {
                 json!(true)
             } else if script.contains("return editorText(findEditor())") {
                 json!(state.inserted_text)
             } else if script.contains("elementFromPoint") {
-                json!({"x":100.0,"y":40.0,"clear":!state.obscured})
+                if state.send_missing {
+                    Value::Null
+                } else {
+                    json!({"x":100.0,"y":40.0,"clear":!state.obscured})
+                }
             } else if script.contains("document.visibilityState") {
                 json!({"visible":!state.not_visible,"focused":!state.not_focused})
             } else if script.contains("ready:document.readyState") {
@@ -2349,6 +2440,68 @@ mod tests {
             .await
             .expect("raise existing tab");
         assert_eq!(state.lock().await.handles, before);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn preflight_idle_requires_submitted_prompt_and_stable_idle_ui() {
+        let (port, state, server) = spawn_mock().await;
+        state.lock().await.verified = true;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-idle").await.expect("open");
+        assert!(!browser.preflight_idle("agent-idle").await.expect("unsent"));
+
+        let page = browser.page("agent-idle").await.expect("page");
+        page.submission_attempted.store(true, Ordering::Release);
+        *page.pending_before.lock().await = Some(0);
+        state.lock().await.generating = true;
+        assert!(!browser.preflight_idle("agent-idle").await.expect("busy"));
+        state.lock().await.generating = false;
+        assert!(browser.preflight_idle("agent-idle").await.expect("idle"));
+        browser.complete("agent-idle").await.expect("stop polling");
+        assert!(
+            !browser
+                .preflight_idle("agent-idle")
+                .await
+                .expect("completed")
+        );
+
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_waits_for_known_control_instead_of_enter_during_previous_turn() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.verified = true;
+            mock.send_missing = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-sendwait").await.expect("open");
+        // A prior confirmed Send button prevents Enter fallback on the
+        // existing conversation when the UI is temporarily busy.
+        let page = browser.page("agent-sendwait").await.expect("page");
+        page.send_button_seen.store(true, Ordering::Release);
+        let child = browser.clone();
+        let sending =
+            tokio::spawn(async move { child.send("agent-sendwait", "Read only follow-up").await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        {
+            let mock = state.lock().await;
+            assert_eq!(mock.clicks, 0);
+            assert!(!mock.reply_ready, "missing Send cannot submit by Enter");
+        }
+        state.lock().await.send_missing = false;
+        let reply = timeout(Duration::from_secs(8), sending)
+            .await
+            .expect("send settled")
+            .expect("join")
+            .expect("result");
+        assert_eq!(reply.content, "Fixture answer");
+        assert!(state.lock().await.released, "real Send was clicked");
         browser.shutdown().await;
         server.abort();
     }
@@ -2486,6 +2639,8 @@ mod tests {
                 pacing: InteractionPacing::instant(),
                 cancelled: AtomicBool::new(false),
                 submission_attempted: AtomicBool::new(true),
+                ever_submitted: AtomicBool::new(true),
+                send_button_seen: AtomicBool::new(false),
                 verification_seen: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(Some(0)),
@@ -2598,6 +2753,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_preflight_cannot_recreate_a_lost_conversation() {
+        let (port, state, server) = spawn_mock().await;
+        let session = test_session(port).await;
+        let tab = session.first_tab().await.expect("tab");
+        let browser = ChatGptBrowser::with_test_session(session.clone());
+        browser.inner.pages.lock().await.insert(
+            "agent-used-tab".into(),
+            Arc::new(Page {
+                transport: tab,
+                background: None,
+                pacing: InteractionPacing::instant(),
+                cancelled: AtomicBool::new(false),
+                submission_attempted: AtomicBool::new(false),
+                ever_submitted: AtomicBool::new(true),
+                send_button_seen: AtomicBool::new(true),
+                verification_seen: AtomicBool::new(false),
+                send_lock: Mutex::new(()),
+                pending_before: Mutex::new(None),
+                manual: Mutex::new(None),
+                recent_events: Mutex::new(VecDeque::new()),
+                previous_state: Mutex::new(None),
+                console: Mutex::new(VecDeque::new()),
+                console_seen: Mutex::new(VecDeque::new()),
+                reporter: None,
+            }),
+        );
+        session.close().await.expect("expired driver target");
+        assert!(matches!(
+            browser
+                .send("agent-used-tab", "Do not send to a new tab")
+                .await,
+            Err(BrowserError::AmbiguousSubmission)
+        ));
+        assert_eq!(state.lock().await.inserted, 0);
+        assert_eq!(state.lock().await.handles.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_seen_verification_suppresses_automatic_recovery() {
         let (port, _state, server) = spawn_mock().await;
         let session = test_session(port).await;
@@ -2611,6 +2805,8 @@ mod tests {
                 pacing: InteractionPacing::instant(),
                 cancelled: AtomicBool::new(false),
                 submission_attempted: AtomicBool::new(false),
+                ever_submitted: AtomicBool::new(false),
+                send_button_seen: AtomicBool::new(false),
                 verification_seen: AtomicBool::new(true),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(None),
