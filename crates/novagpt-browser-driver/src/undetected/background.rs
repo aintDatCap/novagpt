@@ -156,6 +156,14 @@ impl BackgroundTarget {
             .ok_or(UpstreamError::Protocol)
     }
 
+    /// Raise and focus exactly this tab. Only input that a human would see
+    /// may request activation; ordinary observation must not.
+    pub async fn bring_to_front(&self) -> Result<(), UpstreamError> {
+        self.command("Page.bringToFront", json!({}))
+            .await
+            .map(|_| ())
+    }
+
     pub async fn evaluate(&self, expression: &str) -> Result<Value, UpstreamError> {
         if expression.is_empty()
             || expression.len() > MAX_EXPRESSION_BYTES
@@ -356,6 +364,50 @@ mod tests {
         );
         driver.shutdown().await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn background_target_can_raise_its_own_tab() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("mock");
+        let port = listener.local_addr().expect("port").port();
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("HTTP");
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.expect("read");
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /json/list"));
+            let body = json!([
+                {"id":"ABCDEF","type":"page","webSocketDebuggerUrl":format!("ws://127.0.0.1:{port}/devtools/page/ABCDEF")}
+            ]).to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+            drop(stream);
+            let (stream, _) = listener.accept().await.expect("WS");
+            let mut socket = accept_async(stream).await.expect("accept");
+            let frame = socket.next().await.expect("frame").expect("valid");
+            let data: Value = serde_json::from_str(frame.to_text().expect("text")).expect("JSON");
+            assert_eq!(data["method"], "Page.bringToFront");
+            socket
+                .send(Message::Text(
+                    json!({"id":1,"result":{}}).to_string().into(),
+                ))
+                .await
+                .expect("respond");
+        });
+        let target = BackgroundTarget::new(port, "CDwindow-ABCDEF").expect("target");
+        target.bring_to_front().await.expect("activate");
+        fixture.await.expect("fixture");
     }
 
     #[tokio::test]
