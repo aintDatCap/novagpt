@@ -184,12 +184,15 @@ mechanism; **not implemented** = consciously omitted, with reason.
   switches to the tab's exact window handle, and then issues the command.
   This remains useful for setup and manual navigation but was responsible for
   repeated Chrome foreground activation when used during 300-ms worker polls.
-  Ordinary ChatGPT subagent read/poll/input now uses `BackgroundTarget` in the
-  browser-driver layer: a specific tab ID is matched to the owned loopback
-  Chrome DevTools target and addressed via its own page WebSocket, without a
-  WebDriver window switch or `Page.bringToFront`. Mouse/key pairs are kept
-  ordered on the same socket. Concurrent workers cannot switch one another's
-  current target or mix DOM results.
+  Ordinary ChatGPT subagent reads and response polling use `BackgroundTarget`
+  in the browser-driver layer: a specific tab ID is matched to the owned
+  loopback Chrome DevTools target and addressed via its own page WebSocket,
+  without a WebDriver window switch. Observation never requests
+  `Page.bringToFront`. Immediately before composer input the adapter raises
+  that exact tab and requires a visible, focused document; a compositor that
+  refuses focus produces `InteractionBlocked` rather than hidden input.
+  Mouse/key pairs are kept ordered on the same socket. Concurrent workers
+  cannot switch one another's current target or mix DOM results.
 - `reconnect()` stops and restarts ChromeDriver, creates a new WebDriver
   session, increments the epoch, and invalidates the old session and all old
   tabs. It never re-navigates or replays input. If Chrome is still alive,
@@ -225,6 +228,20 @@ mechanism; **not implemented** = consciously omitted, with reason.
   stop the workflow and require human inspection. A manual verification
   interstitial can resume the retained unsent prompt only because no input
   was dispatched before it.
+- Interaction policy: before input the adapter raises its exact tab
+  (`Page.bringToFront`) and requires `visibilityState === "visible"` and
+  `document.hasFocus()`. Short ASCII prompts are typed as paced key events
+  (`Shift+Enter` for newlines), long or non-ASCII prompts are inserted as one
+  trusted text event, the pointer follows a short jittered path, and the page,
+  editor focus and topmost element at the click point are re-checked
+  immediately before submitting. Delays are bounded by
+  `InteractionPacing`; tests use an instant policy.
+- Verification detection recognizes localized interstitial titles and
+  structural Cloudflare markers (`window._cf_chl_opt`, the challenge
+  running/form/stage/error elements, `cf-chl-widget-*`) in addition to a
+  visible widget. Structural markers count even over a rendered composer; a
+  hidden widget alone does not. A tab last seen on a challenge is never
+  recreated automatically, and a seen challenge suppresses recovery.
 
 ## 6. Security boundaries
 
@@ -294,12 +311,13 @@ Deterministic suite (2026-11-04):
 cargo fmt --all -- --check                         passed
 cargo clippy --workspace --all-targets -- -D warnings   passed
 cargo check --workspace                            passed
-cargo test --workspace                             201 passed, 0 failed, 2 ignored
+cargo test --workspace                             224 passed, 0 failed, 3 ignored
 ```
 
-Crate-level breakdown: `novagpt-browser-driver` 39 passed, `novagpt-browser`
-15, `novagpt-agents` 18, plus core/MCP/CLI/VM suites. The two ignored tests
-are the opt-in real ChromeDriver and real adapter browsing tests.
+Crate-level breakdown: `novagpt-browser-driver` 42 passed, `novagpt-browser`
+23, `novagpt-agents` 28, plus core/MCP/CLI/VM suites. The three ignored tests
+are the opt-in real ChromeDriver, real adapter browsing, and niri focus
+tests.
 
 Real-browser, disposable profile, loopback HTML fixture, Linux:
 
@@ -322,6 +340,14 @@ The real ChromeDriver test additionally covers native WebDriver evaluation,
 CDP passthrough, driver reconnect, Chrome crash/relaunch, and a separate
 application launch against the same profile. The real adapter test covers
 the ChatGPT adapter's loopback browsing path over the same transport.
+
+A direct fingerprint read of the production launch path (Chrome 156, the
+patched 156 driver, the fixed launch arguments, a disposable profile and a
+loopback page) reported `navigator.webdriver === false`, `navigator.languages
+=== ["it-IT"]` with `--accept-lang`, no `cdc_*` properties, a normal
+non-headless user agent, `window.chrome` present, and five plugins. Before
+the launch switch the same path reported `navigator.webdriver === true`
+immediately after navigation, even before any WebDriver session was created.
 
 The CLI was exercised manually against the real environment:
 `novagpt chrome-driver status`, `install --milestone 156`, and a repeat

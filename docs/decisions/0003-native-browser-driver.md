@@ -39,7 +39,11 @@ browser-protocol adjustments are not evidence of any bypass guarantee.
 order, navigation readiness semantics, browser version and profile state
 may affect session compatibility. Cloudflare behavior has not been
 experimentally compared on a live account. No bypass, cookie transfer,
-CAPTCHA solving, or stealth/fingerprint changes will be implemented.
+CAPTCHA solving, or JavaScript identity rewriting will be implemented.
+A later managed-backend change added exactly one documented launch switch,
+`--disable-blink-features=AutomationControlled`, because current Chrome sets
+`navigator.webdriver` for any remote-debugging launch; see the deliberate
+differences below.
 
 ## Decision
 
@@ -151,6 +155,8 @@ The source demonstrates a **Selenium/WebDriver** wrapper: a patcher downloads an
 - `force_kill_instances` is not ported; it can kill unrelated browser automation.
 - A temporary profile is never created implicitly; only a persistent, NovaGPT-owned dedicated profile is accepted.
 - Headless identity rewriting (`navigator.webdriver`, user agent, `window.chrome`, permissions/`toString`) is not implemented. It falsifies browser identity, conflicts with the visible human-verification workflow, and cannot be validated without provider interaction. Headless mode is available but no stealth guarantee is made.
+- Chrome is launched with `--disable-blink-features=AutomationControlled`, because current Chrome sets Blink's automation feature for any remote-debugging launch and every page then reports `navigator.webdriver === true`. This is a launch-time Blink switch, not a JavaScript getter patch; it does not rewrite the user agent, WebGL, plugins or permissions, and it does not solve challenges.
+- Composer input raises the exact worker tab and requires a visible, focused document; hidden background input is refused with `InteractionBlocked`. Prompts are paced and re-checked before submission rather than pasted and sent immediately.
 - The Reactor is replaced by bounded pull-based performance-log draining; `click_safe` and hidden reconnect-after-click are replaced by explicit `reconnect()`.
 - `find_elements_recursive` returns a bounded `Vec` (with documented staleness) instead of a Python generator.
 
