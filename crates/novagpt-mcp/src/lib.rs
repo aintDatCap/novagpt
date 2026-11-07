@@ -142,6 +142,15 @@ struct SearchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GrepArgs {
+    #[serde(default)]
+    workspace_id: Option<String>,
+    pattern: String,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WriteArgs {
     #[serde(default)]
     workspace_id: Option<String>,
@@ -758,6 +767,21 @@ impl NovaMcp {
                 args.path.as_deref().unwrap_or("."),
                 args.max_depth.unwrap_or(3),
                 args.max_entries.unwrap_or(250),
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Search safe workspace text files with a ripgrep-style regular expression, respecting .gitignore and .ignore"
+    )]
+    async fn grep(&self, Parameters(args): Parameters<GrepArgs>) -> CallToolResult {
+        let state = self.workspaces.clone();
+        self.observed_compute("grep", move || {
+            state.grep(
+                args.workspace_id.as_deref(),
+                &args.pattern,
+                args.max_results.unwrap_or(100),
             )
         })
         .await

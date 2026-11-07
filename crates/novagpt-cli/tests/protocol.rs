@@ -119,6 +119,12 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
                 "name":"read","arguments":{"path":"hello.txt"}
             }}),
+            json!({"jsonrpc":"2.0","id":55,"method":"tools/call","params":{
+                "name":"grep","arguments":{"pattern":"test\\s+text","max_results":5}
+            }}),
+            json!({"jsonrpc":"2.0","id":56,"method":"tools/call","params":{
+                "name":"grep","arguments":{"pattern":"("}
+            }}),
             json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
                 "name":"read","arguments":{"path":".env"}
             }}),
@@ -214,6 +220,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         .expect("tools/list array");
     for name in [
         "read",
+        "grep",
         "write",
         "view_image",
         "git",
@@ -271,7 +278,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    assert_eq!(listed.len(), 57);
+    assert_eq!(listed.len(), 58);
     // MCP server tool registration is distinct from the ChatGPT client's
     // selected connector schema. Ensure new callers can discover the actual
     // arguments needed for authenticated child preflight.
@@ -303,6 +310,14 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     assert_eq!(by_id(13)["result"]["isError"], true);
     assert_eq!(by_id(14)["result"]["isError"], true);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
+    assert_eq!(by_id(55)["result"]["isError"], false);
+    let grep_hits = by_id(55)["result"]["structuredContent"]
+        .as_array()
+        .expect("grep returns structured hits");
+    assert_eq!(grep_hits.len(), 1);
+    assert_eq!(grep_hits[0]["path"], "hello.txt");
+    assert_eq!(grep_hits[0]["line"], 1);
+    assert_eq!(by_id(56)["result"]["isError"], true);
     assert_eq!(
         by_id(7)["result"]["structuredContent"]["mime_type"],
         "image/png"

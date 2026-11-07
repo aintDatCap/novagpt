@@ -13,6 +13,11 @@ sha2.workspace = true
 hex.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+# Reuse ripgrep's search engine and ignore-aware file walker. Pin pre-2026
+# compatible releases to preserve the workspace's Rust 1.88 MSRV.
+grep-regex = "=0.1.13"
+grep-searcher = "=0.1.16"
+ignore = "=0.4.25"
 
 [dev-dependencies]
 tempfile = "3"

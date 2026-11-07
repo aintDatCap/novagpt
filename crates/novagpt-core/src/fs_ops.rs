@@ -1,4 +1,7 @@
 use crate::workspace::{NovaError, NovaResult, WorkspaceRegistry, blocked};
+use grep_regex::RegexMatcher;
+use grep_searcher::{SearcherBuilder, sinks::UTF8};
+use ignore::WalkBuilder;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -222,6 +225,96 @@ impl WorkspaceRegistry {
             &mut result,
         )?;
         Ok(result)
+    }
+
+    /// Regex search using ripgrep's matcher, searcher and ignore-aware walker.
+    /// Unlike the existing literal search, this respects .gitignore/.ignore
+    /// and skips hidden files. All matches are still bounded by core guards.
+    pub fn grep(
+        &self,
+        id: Option<&str>,
+        pattern: &str,
+        max_results: usize,
+    ) -> NovaResult<Vec<SearchHit>> {
+        if pattern.is_empty() || pattern.len() > 4096 {
+            return Err(NovaError::InvalidInput(
+                "regex pattern must be 1..=4096 bytes".into(),
+            ));
+        }
+        let matcher = RegexMatcher::new_line_matcher(pattern)
+            .map_err(|_| NovaError::InvalidInput("invalid regex pattern".into()))?;
+        let root = self.workspace(id)?.root;
+        let limit = max_results.clamp(1, 2000);
+        let max_bytes = self.max_read_bytes();
+        let mut hits = Vec::new();
+        let mut walker = WalkBuilder::new(&root);
+        walker
+            .max_depth(Some(12))
+            .follow_links(false)
+            .require_git(false);
+        for entry in walker.build().take(15_000) {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let Ok(relative) = entry.path().strip_prefix(&root) else {
+                continue;
+            };
+            if blocked(relative) {
+                continue;
+            }
+            let Some(relative_str) = relative.to_str() else {
+                continue;
+            };
+            let Ok(path) = self.resolve(id, relative_str, false) else {
+                continue;
+            };
+            if !fs::metadata(&path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= max_bytes as u64)
+            {
+                continue;
+            }
+            // A bounded pre-read prevents binary or invalid UTF-8 matches from
+            // being reported before a later NUL/invalid byte is encountered.
+            let mut bytes = Vec::new();
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            if file
+                .take((max_bytes + 1) as u64)
+                .read_to_end(&mut bytes)
+                .is_err()
+                || bytes.len() > max_bytes
+                || bytes.contains(&0)
+                || std::str::from_utf8(&bytes).is_err()
+            {
+                continue;
+            }
+            let mut searcher = SearcherBuilder::new().line_number(true).build();
+            let result = searcher.search_slice(
+                &matcher,
+                &bytes,
+                UTF8(|line, text| {
+                    hits.push(SearchHit {
+                        path: relative_str.to_owned(),
+                        line: line as usize,
+                        text: text
+                            .trim_end_matches(['\r', '\n'])
+                            .chars()
+                            .take(400)
+                            .collect(),
+                    });
+                    Ok(hits.len() < limit)
+                }),
+            );
+            if result.is_err() {
+                continue;
+            }
+            if hits.len() >= limit {
+                break;
+            }
+        }
+        Ok(hits)
     }
 
     pub fn search(
@@ -504,5 +597,58 @@ mod tests {
         let results = r.search(None, "alpha", 20).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line, 1);
+    }
+
+    #[test]
+    fn grep_matches_regex_with_ignores_and_bounded_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = WorkspaceRegistry::new(tmp.path(), &[]).unwrap();
+        fs::write(tmp.path().join(".gitignore"), "skip.txt\n").unwrap();
+        fs::write(tmp.path().join(".ignore"), "also_skip.txt\n").unwrap();
+        fs::write(tmp.path().join("hello.rs"), "hello world\nHELLO rust\n").unwrap();
+        fs::write(tmp.path().join("skip.txt"), "hello ignored\n").unwrap();
+        fs::write(tmp.path().join("also_skip.txt"), "hello ignored\n").unwrap();
+        fs::write(tmp.path().join(".env"), "hello secret\n").unwrap();
+        fs::write(tmp.path().join(".hidden.txt"), "hello hidden\n").unwrap();
+        fs::write(tmp.path().join("binary.txt"), b"hello before\n\0after").unwrap();
+        fs::write(tmp.path().join("huge.txt"), vec![b'a'; 180_001]).unwrap();
+        let results = r.grep(None, "(?i)hello", 100).unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "ignored, binary and hidden files must be skipped"
+        );
+        assert_eq!(results[0].path, "hello.rs");
+        assert_eq!(results[0].line, 1);
+        assert_eq!(results[1].line, 2);
+        assert_eq!(r.grep(None, "hello", 1).unwrap().len(), 1);
+        assert!(matches!(
+            r.grep(None, "(", 5),
+            Err(NovaError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            r.grep(None, "", 5),
+            Err(NovaError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            r.grep(None, &"a".repeat(4097), 5),
+            Err(NovaError::InvalidInput(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grep_does_not_follow_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("private.txt"), "hello secret").unwrap();
+        symlink(
+            outside.path().join("private.txt"),
+            workspace.path().join("linked.txt"),
+        )
+        .unwrap();
+        let r = WorkspaceRegistry::new(workspace.path(), &[]).unwrap();
+        assert!(r.grep(None, "hello", 10).unwrap().is_empty());
     }
 }

@@ -13,7 +13,7 @@ novagpt-cli
   └─ novagpt-core
 ```
 
-- **novagpt-core:** owned workspaces, allowed-root and path guards, file reads and writes, optimistic SHA-256 updates, safe Git operations, commands and structured workspace operations. It must not depend on CLI, HTTP or MCP.
+- **novagpt-core:** owned workspaces, allowed-root and path guards, file reads and writes, optimistic SHA-256 updates, safe Git operations, commands and structured workspace operations. The MCP `grep` tool uses ripgrep's `grep-regex`, `grep-searcher` and `ignore` crates for bounded regex matching and ignore-aware traversal; the existing literal `search` contract is unchanged. These dependencies are pinned to Rust 1.88-compatible releases. It must not depend on CLI, HTTP or MCP.
 - **novagpt-mcp:** tools, schemas, protocol dispatch, stdio and HTTP transport, and request authentication through the official Rust MCP SDK (`rmcp`).
 - **novagpt-cli:** argument parsing, shared private per-user configuration and token, terminal UI, process ownership, ngrok tunnel management, and optional integrations.
 - **novagpt-vm:** optional approved VM images and platform-specific VM controls; real guest execution support is incomplete.

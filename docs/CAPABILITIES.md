@@ -7,7 +7,7 @@ This document tracks observable NovaGPT functionality and test coverage. Statuse
 | Area | Current status | Evidence and open questions |
 | --- | --- | --- |
 | Multiple MCP clients, shared workspace | IMPLEMENTED / PARTIAL | Real two-client HTTP tests cover isolated sessions, shared files, CAS conflicts, explicit root IDs; restart, load and TTL need further testing |
-| File reads, tree/search, guarded writes | IMPLEMENTED / PARTIAL | Unit and stdio/HTTP fixtures; cross-platform crash-atomicity and TOCTOU protection incomplete |
+| File reads, tree/search/grep, guarded writes | IMPLEMENTED / PARTIAL | Bounded regex grep via ripgrep crates with ignore rules; regex, ignore and stdio contract tests; cross-platform crash-atomicity and TOCTOU protection incomplete |
 | Git status/diff, selected index and worktree operations | IMPLEMENTED / PARTIAL | Temporary Git tests including concurrency and denial; state ownership after crashes requires improvement |
 | MCP stdio and Streamable HTTP | IMPLEMENTED / PARTIAL | Local POST/GET/SSE/DELETE, authorization, host validation, audit integration tests; full public client test needed |
 | HTTP private connector URLs | IMPLEMENTED | URL builder uses `novagpt_token`, token authorization tests cover query and bearer credentials; keep URLs secret |
