@@ -1,10 +1,12 @@
 //! Bounded persistent metadata-only audit. No tool arguments, paths, prompts,
 //! returned data or credentials enter the event schema or the disk writer.
+#[path = "audit_archive.rs"]
+mod archive;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -15,7 +17,8 @@ use std::{
 };
 
 const MAX_EVENTS: usize = 128;
-const MAX_FILE_BYTES: u64 = 64 * 1024;
+const MAX_FILE_BYTES: u64 = 512 * 1024;
+const MAX_HISTORY_RESULTS: usize = 20_000;
 const MAX_FILES: usize = 4;
 const QUEUE_CAPACITY: usize = 512;
 
@@ -163,53 +166,8 @@ fn parse_event(line: &[u8]) -> Option<AuditEvent> {
     valid_record(&event).then_some(event)
 }
 
-/// Loads at most 4 x 64 KiB, without following symlinks or trusting disk records
-/// to be displayed without schema validation.
-fn history(dir: &Path) -> io::Result<AuditState> {
-    let mut state = AuditState::default();
-    for index in (0..MAX_FILES).rev() {
-        let path = dir.join(file_name(index));
-        let Some(len) = checked_file(&path)? else {
-            continue;
-        };
-        let mut bytes = Vec::with_capacity(len as usize);
-        fs::File::open(&path)?
-            .take(MAX_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_FILE_BYTES {
-            return Err(invalid("Audit file exceeded read bound"));
-        }
-        for line in bytes.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(event) = parse_event(line) {
-                state.count = state.count.max(event.sequence);
-                if state.events.len() == MAX_EVENTS {
-                    state.events.pop_front();
-                }
-                state.events.push_back(event);
-            }
-        }
-    }
-    Ok(state)
-}
-
 fn rotate(dir: &Path) -> io::Result<()> {
-    for index in 0..MAX_FILES {
-        checked_file(&dir.join(file_name(index)))?;
-    }
-    let oldest = dir.join(file_name(MAX_FILES - 1));
-    if checked_file(&oldest)?.is_some() {
-        fs::remove_file(&oldest)?;
-    }
-    for index in (1..MAX_FILES).rev() {
-        let from = dir.join(file_name(index - 1));
-        if checked_file(&from)?.is_some() {
-            fs::rename(from, dir.join(file_name(index)))?;
-        }
-    }
-    Ok(())
+    archive::rotate(dir)
 }
 
 fn append(dir: &Path, event: &AuditEvent) -> io::Result<()> {
@@ -284,7 +242,7 @@ impl AuditTrail {
         private_dir(grandparent)?;
         private_dir(parent)?;
         private_dir(&directory)?;
-        let initial = history(&directory)?;
+        let initial = archive::initialize(&directory)?;
         let (writer, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let errors = Arc::new(AtomicU64::new(0));
         let worker_errors = errors.clone();
@@ -374,7 +332,7 @@ impl AuditTrail {
             .events
             .iter()
             .rev()
-            .take(limit.clamp(1, MAX_EVENTS))
+            .take(limit.clamp(1, MAX_HISTORY_RESULTS))
             .rev()
             .cloned()
             .collect();
@@ -420,7 +378,7 @@ impl AuditTrail {
         private_dir(app)?;
         private_dir(parent)?;
         private_dir(directory)?;
-        let state = history(directory)?;
+        let state = archive::recent(directory, limit.clamp(1, MAX_HISTORY_RESULTS))?;
         let audit = Self {
             state: Arc::new(Mutex::new(state)),
             writer: None,
@@ -486,7 +444,7 @@ mod tests {
         let home = tempfile::tempdir().expect("fixture");
         let dir = home.path().join("logs");
         fs::create_dir(&dir).expect("audit directory");
-        for sequence in 1..=2100 {
+        for sequence in 1..=16000 {
             append(
                 &dir,
                 &AuditEvent {
@@ -498,15 +456,19 @@ mod tests {
             )
             .expect("write audit event");
         }
-        assert!(dir.join("audit.1.log").is_file(), "rotation must occur");
+        assert!(archive::recent(&dir, 1).expect("rotated audit").count == 16000);
+        assert!(
+            fs::read_dir(&dir).expect("archives").count() > 1,
+            "rotation must occur"
+        );
         sync_files(&dir).expect("synchronize current and rotated segments");
         for index in 0..MAX_FILES {
             if let Some(len) = checked_file(&dir.join(file_name(index))).expect("safe log") {
                 assert!(len <= MAX_FILE_BYTES);
             }
         }
-        let persisted = history(&dir).expect("read after flush");
-        assert_eq!(persisted.count, 2100);
+        let persisted = archive::recent(&dir, MAX_EVENTS).expect("read after flush");
+        assert_eq!(persisted.count, 16000);
     }
 
     #[tokio::test]
@@ -530,7 +492,7 @@ mod tests {
         assert!(persisted.total_calls > 0);
         assert!(fs::metadata(dir.join("audit.log")).expect("log").len() <= MAX_FILE_BYTES);
         let limit_files = fs::read_dir(&dir).expect("dir").count();
-        assert!(limit_files <= MAX_FILES);
+        assert!(limit_files <= MAX_FILES + 1);
     }
 
     #[tokio::test]
