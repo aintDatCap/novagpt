@@ -276,16 +276,22 @@ pub(super) fn export_compressed(dir: &Path, destination: &Path) -> io::Result<us
 }
 
 fn prune_to(dir: &Path, budget: u64, now: SystemTime) -> io::Result<()> {
+    prune_to_limit(dir, budget, now, MAX_ARCHIVES)
+}
+
+fn prune_to_limit(dir: &Path, budget: u64, now: SystemTime, max_files: usize) -> io::Result<()> {
     let segments = archives(dir)?;
     let mut total: u64 = segments.iter().map(|s| s.len).sum();
+    let mut remaining = segments.len();
     for seg in segments {
         let expired = now
             .duration_since(seg.modified)
             .is_ok_and(|age| age > RETENTION);
-        if expired || total > budget {
+        if expired || total > budget || remaining > max_files {
             checked_archive(&seg.path)?;
             fs::remove_file(&seg.path)?;
             total = total.saturating_sub(seg.len);
+            remaining = remaining.saturating_sub(1);
         }
     }
     Ok(())
@@ -414,6 +420,32 @@ mod tests {
             dir.join("audit.1.log").exists(),
             "no automatic deletion of user history"
         );
+    }
+
+    #[test]
+    fn count_retention_eviction_keeps_the_newest_archives() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let dir = temp.path();
+        for sequence in 1..=4 {
+            let path = dir.join(archive_name(sequence, 0));
+            fs::write(
+                &path,
+                zstd::stream::encode_all(&b"event=1 timestamp_unix=1 tool=read status=ok\n"[..], 1)
+                    .expect("test compression"),
+            )
+            .expect("archived segment");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .expect("private archive");
+            }
+        }
+        prune_to_limit(dir, MAX_TOTAL_BYTES, SystemTime::now(), 2).expect("prune to count cap");
+        let remaining = archives(dir).expect("safe archives");
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].sequence, 3);
+        assert_eq!(remaining[1].sequence, 4);
     }
 
     #[test]
