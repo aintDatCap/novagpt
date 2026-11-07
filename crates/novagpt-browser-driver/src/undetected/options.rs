@@ -163,6 +163,10 @@ impl ChromeOptions {
             "--no-default-browser-check".to_owned(),
             "--new-window".to_owned(),
             format!("--lang={language}"),
+            // `--lang` only selects the browser UI language on Linux; the
+            // web-facing locale (navigator.languages and Accept-Language)
+            // comes from the accept-language list. Keep both consistent.
+            format!("--accept-lang={language}"),
             // Chrome sets Blink's AutomationControlled feature whenever the
             // browser exposes a remote-debugging port, which makes every page
             // report navigator.webdriver === true. NovaGPT launches Chrome
@@ -356,6 +360,8 @@ mod tests {
             args.contains(&"--disable-blink-features=AutomationControlled".to_owned()),
             "{args:?}"
         );
+        assert!(args.contains(&"--lang=en-US".to_owned()), "{args:?}");
+        assert!(args.contains(&"--accept-lang=en-US".to_owned()), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--start-maximized"));
         assert!(!args.iter().any(|arg| arg.contains("always-on-top")));
         assert!(!args.iter().any(|arg| arg.contains("window-position")));
