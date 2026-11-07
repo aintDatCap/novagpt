@@ -244,6 +244,8 @@ struct Page {
     cancelled: AtomicBool,
     // A crashed tab must never cause automatic replay after a send event.
     submission_attempted: AtomicBool,
+    // A challenge observed in this attempt must suppress automatic recovery.
+    verification_seen: AtomicBool,
     send_lock: Mutex<()>,
     pending_before: Mutex<Option<usize>>,
     manual: Mutex<Option<String>>,
@@ -294,6 +296,9 @@ impl Page {
             state["assistant_count"].as_u64().unwrap_or(0).min(10_000),
             state["complete"] == true,
         );
+        if state["challenge"] == true || page_phase(state) == PagePhase::Verification {
+            self.verification_seen.store(true, Ordering::Release);
+        }
         let mut previous = self.previous_state.lock().await;
         if previous.as_deref() != Some(flags.as_str()) {
             *previous = Some(flags.clone());
@@ -773,6 +778,7 @@ impl ChatGptBrowser {
             pacing: self.inner.pacing,
             cancelled: AtomicBool::new(false),
             submission_attempted: AtomicBool::new(false),
+            verification_seen: AtomicBool::new(false),
             send_lock: Mutex::new(()),
             pending_before: Mutex::new(None),
             manual: Mutex::new(None),
@@ -1144,6 +1150,25 @@ impl ChatGptBrowser {
         if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT {
             return Err(BrowserError::TooLarge);
         }
+        // Recreating a tab that was last seen showing a challenge would
+        // silently reconnect through the interstitial. Ask for the visible
+        // human step instead; a ready composer clears the marker below.
+        let challenged = self
+            .inner
+            .pages
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .filter(|page| {
+                page.verification_seen.load(Ordering::Acquire) && page.transport.is_closed()
+            });
+        if let Some(page) = challenged {
+            *page.manual.lock().await = Some("verification".to_owned());
+            page.diagnostic("recovery_blocked_by_verification", "")
+                .await;
+            return Err(BrowserError::Manual("verification"));
+        }
         let mut outcome = self.send_inner(id, prompt).await;
         if matches!(
             outcome,
@@ -1268,6 +1293,9 @@ impl ChatGptBrowser {
             return Err(BrowserError::Manual(manual));
         }
         *page.manual.lock().await = None;
+        // A ready composer proves the earlier challenge is gone; later
+        // failures may use the normal bounded recovery path again.
+        page.verification_seen.store(false, Ordering::Release);
         page.diagnostic("composer_ready", "").await;
         let pending = *page.pending_before.lock().await;
         let before = if let Some(before) = pending {
@@ -1486,10 +1514,16 @@ impl ChatGptBrowser {
             }}
             const editor = findEditor();
             // Hidden verification/login widgets are common in an authenticated
-            // session. Only a *visible* challenge requires human intervention.
-            const challenge = [...document.querySelectorAll(
-                'iframe[src*="challenges.cloudflare.com"], [class*="cf-turnstile"], #challenge-running, #challenge-form'
+            // session, so a widget alone only counts when it is visible.
+            // Structural Cloudflare markers exist only on an interstitial and
+            // can sit under an overlay while the composer is still rendered,
+            // so they count regardless of visibility.
+            const widget = [...document.querySelectorAll(
+                'iframe[src*="challenges.cloudflare.com"], [class*="cf-turnstile"], [id^="cf-chl-widget-"]'
             )].some(isVisible);
+            const structural = typeof window._cf_chl_opt !== 'undefined' ||
+                !!document.querySelector('#challenge-running, #challenge-form, #challenge-stage, #challenge-error-text');
+            const challenge = widget || structural;
             const login = [...document.querySelectorAll(
                 '[data-testid="login-button"], a[href*="/auth/login"]'
             )].some(isVisible);
@@ -1670,12 +1704,54 @@ impl PagePhase {
 }
 
 fn verification_title(title: &str) -> bool {
-    // Some Cloudflare interstitials show no visible Turnstile element.
-    let title = title.trim().to_ascii_lowercase();
-    matches!(
-        title.as_str(),
-        "just a moment..." | "just a moment…" | "attention required! | cloudflare"
-    )
+    // Some Cloudflare interstitials show no visible Turnstile element. The
+    // page title is localized, so match the known title cores rather than only
+    // the English spelling. Trailing dots/ellipses are presentation.
+    let title = title.trim().to_lowercase();
+    let title = title
+        .trim_end_matches(['.', '…', '!', ' '])
+        .trim_end()
+        .to_owned();
+    if title.starts_with("attention required") {
+        return true;
+    }
+    const CORES: &[&str] = &[
+        "just a moment",
+        "einen moment",
+        "un instant",
+        "un momento",
+        "um momento",
+        "een ogenblik geduld",
+        "минуточку",
+        "минутку",
+        "пожалуйста, подождите",
+        "хвилинку",
+        "chwileczkę",
+        "chvilku strpení",
+        "bir dakika",
+        "o clipă",
+        "μια στιγμή",
+        "少し時間がかかります",
+        "잠시만요",
+        "잠시 기다려주세요",
+        "请稍候",
+        "請稍候",
+        "เดี๋ยวก่อน",
+        "vui lòng chờ",
+        "chờ một chút",
+        "tunggu sebentar",
+        "لحظة من فضلك",
+        "الرجاء الانتظار",
+        "רק רגע",
+        "ett ögonblick",
+        "et øjeblik",
+        "et øyeblikk",
+        "hetkinen",
+        "pikainen hetki",
+        "egy pillanat",
+        "моля, изчакайте",
+    ];
+    CORES.iter().any(|core| title == *core)
 }
 
 fn page_phase(state: &Value) -> PagePhase {
@@ -1762,6 +1838,10 @@ mod tests {
             "Just a moment...",
             "Just a moment…",
             " ATTENTION REQUIRED! | CLOUDFLARE ",
+            "Un momento...",
+            "Einen Moment…",
+            "Un instant...",
+            "请稍候…",
         ] {
             let state = json!({"page_kind":"chatgpt", "title":title, "composer":false});
             assert_eq!(page_phase(&state), PagePhase::Verification);
@@ -1800,6 +1880,32 @@ mod tests {
             page_phase(&json!({"page_kind":"chatgpt", "challenge":true, "composer":true})),
             PagePhase::Verification,
             "a visible challenge takes priority over an editor"
+        );
+    }
+
+    #[test]
+    fn verification_titles_cover_localized_interstitials_without_false_positives() {
+        for title in [
+            "Just a moment...",
+            "Un momento…",
+            "Einen Moment...",
+            "Un instant...",
+            "Um momento...",
+            "Een ogenblik geduld...",
+            "Минуточку…",
+        ] {
+            assert!(verification_title(title), "{title}");
+        }
+        for title in ["ChatGPT", "Just a moment in history", "Ace Blocker", ""] {
+            assert!(!verification_title(title), "{title}");
+        }
+        assert_eq!(
+            page_phase(&json!({
+                "page_kind":"chatgpt", "title":"ChatGPT", "composer":true,
+                "challenge":true, "login":false
+            })),
+            PagePhase::Verification,
+            "structural Cloudflare markers take priority over a rendered composer"
         );
     }
 
@@ -2343,6 +2449,7 @@ mod tests {
                 pacing: InteractionPacing::instant(),
                 cancelled: AtomicBool::new(false),
                 submission_attempted: AtomicBool::new(true),
+                verification_seen: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(Some(0)),
                 manual: Mutex::new(None),
@@ -2450,6 +2557,50 @@ mod tests {
         let state = state.lock().await;
         assert!(!state.pressed, "a covered button must not be clicked");
         assert_eq!(state.inserted, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_seen_verification_suppresses_automatic_recovery() {
+        let (port, _state, server) = spawn_mock().await;
+        let session = test_session(port).await;
+        let tab = session.first_tab().await.expect("tab");
+        let browser = ChatGptBrowser::with_test_session(session.clone());
+        browser.inner.pages.lock().await.insert(
+            "agent-verify".into(),
+            Arc::new(Page {
+                transport: tab,
+                background: None,
+                pacing: InteractionPacing::instant(),
+                cancelled: AtomicBool::new(false),
+                submission_attempted: AtomicBool::new(false),
+                verification_seen: AtomicBool::new(true),
+                send_lock: Mutex::new(()),
+                pending_before: Mutex::new(None),
+                manual: Mutex::new(None),
+                recent_events: Mutex::new(VecDeque::new()),
+                previous_state: Mutex::new(None),
+                console: Mutex::new(VecDeque::new()),
+                console_seen: Mutex::new(VecDeque::new()),
+                reporter: None,
+            }),
+        );
+        session.close().await.expect("close session");
+        let outcome = browser
+            .send("agent-verify", "Never retry through a challenge")
+            .await;
+        assert!(
+            matches!(outcome, Err(BrowserError::Manual("verification"))),
+            "{outcome:?}"
+        );
+        let diagnostics = browser.diagnostics(Some("agent-verify")).await;
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|event| event == "recovery_blocked_by_verification")
+        );
+        assert_eq!(diagnostics.manual_check.as_deref(), Some("verification"));
         server.abort();
     }
 
