@@ -70,6 +70,16 @@ impl TerminalGuard {
     }
 }
 
+/// Preparing the shared HTTP token is safe and idempotent on every launch.
+/// Guided setup still never starts an MCP server automatically.
+fn initial_effects(app: &mut model::App) -> Vec<model::Effect> {
+    let mut effects = vec![model::Effect::EnsureToken];
+    if let Some(effect) = app.start_on_launch() {
+        effects.push(effect);
+    }
+    effects
+}
+
 pub fn run(
     root: PathBuf,
     settings: LocalSettings,
@@ -87,7 +97,7 @@ pub fn run(
     let mut app = model::App::new(root, settings, setup, profiles);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut controller = operations::Controller::new(handle, tx);
-    if let Some(effect) = app.start_on_launch() {
+    for effect in initial_effects(&mut app) {
         controller.execute(effect, app.root.clone());
     }
     loop {
@@ -128,6 +138,30 @@ mod tests {
     fn app() -> App {
         App::new(PathBuf::from("."), LocalSettings::default(), false, vec![])
     }
+    #[test]
+    fn initial_launch_prepares_token_without_user_action() {
+        let mut regular = app();
+        assert!(matches!(
+            initial_effects(&mut regular).as_slice(),
+            [Effect::EnsureToken]
+        ));
+        let autostart = LocalSettings {
+            auto_start_mcp: true,
+            ..LocalSettings::default()
+        };
+        let mut regular = App::new(PathBuf::from("."), autostart.clone(), false, vec![]);
+        assert!(matches!(
+            initial_effects(&mut regular).as_slice(),
+            [Effect::EnsureToken, Effect::Start(_)]
+        ));
+        let mut setup = App::new(PathBuf::from("."), autostart, true, vec![]);
+        assert!(matches!(
+            initial_effects(&mut setup).as_slice(),
+            [Effect::EnsureToken]
+        ));
+        assert_eq!(setup.server, ServerState::Stopped);
+    }
+
     #[test]
     fn navigation_and_selection_and_number_shortcuts() {
         let mut a = app();

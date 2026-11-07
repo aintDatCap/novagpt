@@ -29,7 +29,7 @@ If ngrok is **missing** when starting a tunnel, NovaGPT asks whether to install 
 
 ## Settings
 
-Settings are shared across the current operating-system user, regardless of the selected workspace. The configuration is stored under the user's private NovaGPT state directory, not inside the project.
+Settings are shared across the current operating-system user, regardless of the selected workspace. The configuration is stored under the user's private NovaGPT state directory, not inside the project. On the first interactive launch, NovaGPT automatically creates the shared HTTP token in private user state if it does not already exist; subsequent launches reuse it. No token value appears in Activity or the terminal, and this does not start MCP or ngrok during setup.
 
 - **Interface language:** Automatic (default), English or Italian. Automatic follows the system locale when Italian is detected, otherwise falls back to English. Missing language preferences also default to Automatic.
 - **HTTP port:** Defaults to `8787`.
