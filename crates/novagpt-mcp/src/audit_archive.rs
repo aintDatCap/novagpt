@@ -2,7 +2,7 @@
 //! closed segments use zstd, with a hard total storage budget and 90-day expiry.
 //! All reads validate private regular files and the canonical event grammar.
 use super::{
-    AuditEvent, AuditState, MAX_EVENTS, MAX_FILE_BYTES, MAX_FILES, checked_file, file_name,
+    ACTIVE_LOG, AuditEvent, AuditState, MAX_EVENTS, MAX_FILE_BYTES, checked_file, format_event,
     invalid, parse_event,
 };
 use std::{
@@ -14,7 +14,7 @@ use std::{
 };
 
 pub(super) const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
-const ARCHIVE_BUDGET: u64 = MAX_TOTAL_BYTES - MAX_FILE_BYTES * MAX_FILES as u64;
+const ARCHIVE_BUDGET: u64 = MAX_TOTAL_BYTES - MAX_FILE_BYTES - MAX_ARCHIVE_FILE_BYTES;
 const MAX_ARCHIVE_FILE_BYTES: u64 = MAX_FILE_BYTES + 16 * 1024;
 const MAX_ARCHIVES: usize = 4096;
 const RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -155,7 +155,7 @@ pub(super) fn recent(dir: &Path, limit: usize) -> io::Result<AuditState> {
         }
     }
     push_recent(
-        plain_events(&dir.join(file_name(0)))?,
+        plain_events(&dir.join(ACTIVE_LOG))?,
         &mut newest,
         &mut count,
         limit,
@@ -166,17 +166,6 @@ pub(super) fn recent(dir: &Path, limit: usize) -> io::Result<AuditState> {
         }
         push_recent(
             compressed_events(&segment.path)?,
-            &mut newest,
-            &mut count,
-            limit,
-        );
-    }
-    for index in 1..MAX_FILES {
-        if newest.len() >= limit {
-            break;
-        }
-        push_recent(
-            plain_events(&dir.join(file_name(index)))?,
             &mut newest,
             &mut count,
             limit,
@@ -196,7 +185,7 @@ pub(super) fn initialize(dir: &Path) -> io::Result<AuditState> {
 }
 
 fn publish_archive(dir: &Path) -> io::Result<()> {
-    let active = dir.join(file_name(0));
+    let active = dir.join(ACTIVE_LOG);
     let Some(len) = checked_file(&active)? else {
         return Ok(());
     };
@@ -242,10 +231,48 @@ pub(super) fn rotate(dir: &Path) -> io::Result<()> {
     prune(dir)
 }
 
-/// Keep compressed segments within the budget, reserving room for active and
-/// legacy text files. This enforces 100 MiB total even when audit.log fills.
+/// Keep compressed segments within the budget, reserving room for the active
+/// plain-text file and one temporary compression file. This bounds
+/// active and archived disk usage even during rotation.
 pub(super) fn prune(dir: &Path) -> io::Result<()> {
     prune_to(dir, ARCHIVE_BUDGET, SystemTime::now())
+}
+
+/// Export only validated records as a shareable zstd stream (not raw files).
+pub(super) fn export_compressed(dir: &Path, destination: &Path) -> io::Result<usize> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let output = options.open(destination)?;
+    let result = (|| -> io::Result<usize> {
+        let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
+        let mut last_sequence = 0;
+        let mut written = 0usize;
+        let mut add = |events: Vec<AuditEvent>| -> io::Result<()> {
+            for event in events {
+                if event.sequence > last_sequence {
+                    encoder.write_all(format_event(&event).as_bytes())?;
+                    last_sequence = event.sequence;
+                    written = written.saturating_add(1);
+                }
+            }
+            Ok(())
+        };
+        for segment in archives(dir)? {
+            add(compressed_events(&segment.path)?)?;
+        }
+        add(plain_events(&dir.join(ACTIVE_LOG))?)?;
+        encoder.finish()?.sync_all()?;
+        Ok(written)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
 }
 
 fn prune_to(dir: &Path, budget: u64, now: SystemTime) -> io::Result<()> {
@@ -314,6 +341,81 @@ mod tests {
             assert!(archives(temp.path()).is_err());
         }
     }
+
+    #[test]
+    fn exported_bundle_contains_only_valid_metadata_and_will_not_overwrite() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let dir = temp.path().join("logs");
+        fs::create_dir(&dir).expect("log folder");
+        let active = dir.join("audit.log");
+        let mut contents: String = (1..=600)
+            .map(|sequence| format!("event={sequence} timestamp_unix=1 tool=read status=ok\n"))
+            .collect();
+        contents.push_str("event=601 timestamp_unix=1 tool=read status=ok token=not-for-export\n");
+        fs::write(&active, contents).expect("events");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&active, fs::Permissions::from_mode(0o600)).expect("private");
+        }
+        rotate(&dir).expect("close segment");
+        let destination = temp.path().join("support.log.zst");
+        let count = export_compressed(&dir, &destination).expect("export");
+        assert_eq!(count, 600);
+        let bytes = fs::read(&destination).expect("bundle");
+        let decoded = zstd::stream::decode_all(&bytes[..]).expect("decode");
+        let text = String::from_utf8(decoded).expect("metadata ascii");
+        assert!(text.contains("event=1 timestamp_unix=1 tool=read status=ok"));
+        assert!(text.contains("event=600 timestamp_unix=1 tool=read status=ok"));
+        assert!(!text.contains("not-for-export"));
+        assert!(
+            export_compressed(&dir, &destination).is_err(),
+            "no overwrite"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&destination)
+                .expect("bundle")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+    }
+    #[test]
+    fn old_rotated_plain_logs_are_not_loaded_or_exported() {
+        let tmp = tempfile::tempdir().expect("fixture");
+        let dir = tmp.path();
+        fs::write(
+            dir.join("audit.1.log"),
+            "event=1 timestamp_unix=1 tool=read status=ok\n",
+        )
+        .expect("old rotated file");
+        fs::write(
+            dir.join(ACTIVE_LOG),
+            "event=2 timestamp_unix=2 tool=write status=error\n",
+        )
+        .expect("current active file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join(ACTIVE_LOG), fs::Permissions::from_mode(0o600))
+                .expect("private active file");
+        }
+        let result = recent(dir, 50).expect("new format only");
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].sequence, 2);
+        let export = tmp.path().join("support.zst");
+        assert_eq!(export_compressed(dir, &export).expect("export"), 1);
+        let decoded =
+            zstd::stream::decode_all(&fs::read(export).expect("bundle")[..]).expect("decode");
+        assert!(!String::from_utf8_lossy(&decoded).contains("event=1 "));
+        assert!(
+            dir.join("audit.1.log").exists(),
+            "no automatic deletion of user history"
+        );
+    }
+
     #[test]
     fn stale_archives_are_expired() {
         let temp = tempfile::tempdir().expect("fixture");

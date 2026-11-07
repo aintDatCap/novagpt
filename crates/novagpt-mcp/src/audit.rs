@@ -19,7 +19,6 @@ use std::{
 const MAX_EVENTS: usize = 128;
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_HISTORY_RESULTS: usize = 20_000;
-const MAX_FILES: usize = 4;
 const QUEUE_CAPACITY: usize = 512;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,14 +112,7 @@ fn checked_file(path: &Path) -> io::Result<Option<u64>> {
     }
 }
 
-fn file_name(index: usize) -> &'static str {
-    match index {
-        0 => "audit.log",
-        1 => "audit.1.log",
-        2 => "audit.2.log",
-        _ => "audit.3.log",
-    }
-}
+const ACTIVE_LOG: &str = "audit.log";
 
 fn valid_record(event: &AuditEvent) -> bool {
     event.sequence > 0
@@ -172,7 +164,7 @@ fn rotate(dir: &Path) -> io::Result<()> {
 
 fn append(dir: &Path, event: &AuditEvent) -> io::Result<()> {
     let line = format_event(event).into_bytes();
-    let current = dir.join(file_name(0));
+    let current = dir.join(ACTIVE_LOG);
     if checked_file(&current)?
         .unwrap_or(0)
         .saturating_add(line.len() as u64)
@@ -194,18 +186,16 @@ fn append(dir: &Path, event: &AuditEvent) -> io::Result<()> {
     Ok(())
 }
 
-/// Flush every bounded log segment: rotation may have moved recently written
-/// events out of audit.log before a caller requests a durable snapshot.
+/// Durably synchronize the active audit file. Closed segments are already synced
+/// before their Zstandard archive is published.
 fn sync_files(dir: &Path) -> io::Result<()> {
-    for index in 0..MAX_FILES {
-        let path = dir.join(file_name(index));
-        if checked_file(&path)?.is_some() {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?
-                .sync_data()?;
-        }
+    let path = dir.join(ACTIVE_LOG);
+    if checked_file(&path)?.is_some() {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_data()?;
     }
     Ok(())
 }
@@ -367,6 +357,21 @@ impl AuditTrail {
         }
     }
 
+    /// Export validated audit metadata as a standalone zstd text file.
+    /// The destination must not exist and is created with private permissions.
+    pub fn export_compressed(directory: &Path, destination: &Path) -> io::Result<usize> {
+        let parent = directory
+            .parent()
+            .ok_or_else(|| invalid("Missing audit parent"))?;
+        let app = parent
+            .parent()
+            .ok_or_else(|| invalid("Missing application state"))?;
+        private_dir(app)?;
+        private_dir(parent)?;
+        private_dir(directory)?;
+        archive::export_compressed(directory, destination)
+    }
+
     /// Local inspection, no writer or service startup. Rejects symlinked log directories.
     pub fn persisted_snapshot(directory: &Path, limit: usize) -> io::Result<AuditSnapshot> {
         let parent = directory
@@ -424,7 +429,7 @@ mod tests {
         let dir = home.path().join("logs");
         fs::create_dir(&dir).expect("audit directory");
         // A directory masquerading as a log segment is never followed or synced.
-        fs::create_dir(dir.join("audit.1.log")).expect("unsafe segment");
+        fs::create_dir(dir.join(ACTIVE_LOG)).expect("unsafe active log");
         let (tx, rx) = mpsc::sync_channel(2);
         let errors = Arc::new(AtomicU64::new(0));
         let worker_errors = errors.clone();
@@ -462,10 +467,8 @@ mod tests {
             "rotation must occur"
         );
         sync_files(&dir).expect("synchronize current and rotated segments");
-        for index in 0..MAX_FILES {
-            if let Some(len) = checked_file(&dir.join(file_name(index))).expect("safe log") {
-                assert!(len <= MAX_FILE_BYTES);
-            }
+        if let Some(len) = checked_file(&dir.join(ACTIVE_LOG)).expect("safe log") {
+            assert!(len <= MAX_FILE_BYTES);
         }
         let persisted = archive::recent(&dir, MAX_EVENTS).expect("read after flush");
         assert_eq!(persisted.count, 16000);
@@ -492,7 +495,7 @@ mod tests {
         assert!(persisted.total_calls > 0);
         assert!(fs::metadata(dir.join("audit.log")).expect("log").len() <= MAX_FILE_BYTES);
         let limit_files = fs::read_dir(&dir).expect("dir").count();
-        assert!(limit_files <= MAX_FILES + 1);
+        assert!(limit_files <= 2);
     }
 
     #[tokio::test]
