@@ -300,7 +300,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         tool("subagent_spawn")["description"]
             .as_str()
             .unwrap_or_default()
-            .contains("EXACT display name")
+            .contains("OPTIONAL parent-selected")
     );
     assert_eq!(by_id(17)["result"]["isError"], true);
     assert_eq!(by_id(18)["result"]["isError"], true);

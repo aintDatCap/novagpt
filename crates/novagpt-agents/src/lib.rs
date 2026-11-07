@@ -61,9 +61,7 @@ pub enum AgentError {
     NotWaiting,
     #[error("Subagent request is invalid")]
     Invalid,
-    #[error(
-        "The parent must supply the connector display name from its selected connected app; NovaGPT cannot infer ChatGPT's per-conversation plugin name"
-    )]
+    #[error("connector_name, when supplied, must contain a valid connected-app display name")]
     ConnectorMissing,
     #[error(
         "Subagent connector tools were not verified; refresh/reconnect the named app, or use the parent connector's guarded file tools to apply explicitly reviewed proposals"
@@ -103,6 +101,9 @@ pub enum AgentLogStage {
     BrowserCreateFailed,
     BrowserReplyReceived,
     BrowserReplyFailed,
+    BrowserReplyUncertain,
+    BrowserReplyBlocked,
+    BrowserReplyManual,
     Waiting,
     Completed,
     Failed,
@@ -116,6 +117,9 @@ impl AgentLogStage {
             Self::BrowserCreateFailed => "agent_browser_create_failed",
             Self::BrowserReplyReceived => "agent_browser_reply_received",
             Self::BrowserReplyFailed => "agent_browser_reply_failed",
+            Self::BrowserReplyUncertain => "agent_browser_reply_uncertain",
+            Self::BrowserReplyBlocked => "agent_browser_reply_blocked",
+            Self::BrowserReplyManual => "agent_browser_reply_manual",
             Self::Waiting => "agent_waiting",
             Self::Completed => "agent_completed",
             Self::Failed => "agent_failed",
@@ -125,7 +129,12 @@ impl AgentLogStage {
     pub const fn is_failure(self) -> bool {
         matches!(
             self,
-            Self::BrowserCreateFailed | Self::BrowserReplyFailed | Self::Failed
+            Self::BrowserCreateFailed
+                | Self::BrowserReplyFailed
+                | Self::BrowserReplyUncertain
+                | Self::BrowserReplyBlocked
+                | Self::BrowserReplyManual
+                | Self::Failed
         )
     }
 }
@@ -369,6 +378,7 @@ struct Entry {
     epoch: u64,
     ready: bool,
     probe_pending: bool,
+    probe_required: bool,
     probe_patch: bool,
     probe_create: bool,
     probe_progress: bool,
@@ -474,31 +484,29 @@ impl AgentManager {
     /// Legacy trusted in-process interface for embedders and test fixtures.
     /// MCP entrypoints must use spawn_with_connector to gate actual tasks.
     pub async fn spawn(&self, request: SpawnAgent) -> AgentResult<AgentInfo> {
-        self.spawn_internal(request, None).await
+        self.spawn_internal(request, None, false).await
     }
 
     /// The authenticated parent passes the display name shown by its selected
     /// connected app. MCP cannot discover a ChatGPT-side alias or namespace.
-    /// Read-only roles may omit it for clients with a stale tool schema; an
-    /// implementer still requires it for the write-capability preflight.
+    /// All roles may omit this hint. Implementers still require live authenticated
+    /// no-write preflight before the coding task can be dispatched.
     pub async fn spawn_with_connector(
         &self,
         request: SpawnAgent,
         connector_name: Option<&str>,
     ) -> AgentResult<AgentInfo> {
-        if connector_name.is_none() && request.role == AgentRole::Implementer {
-            return Err(AgentError::ConnectorMissing);
-        }
         if connector_name.is_some_and(|name| name.trim().is_empty()) {
             return Err(AgentError::ConnectorMissing);
         }
-        self.spawn_internal(request, connector_name).await
+        self.spawn_internal(request, connector_name, true).await
     }
 
     async fn spawn_internal(
         &self,
         request: SpawnAgent,
         connector_name: Option<&str>,
+        require_capability_preflight: bool,
     ) -> AgentResult<AgentInfo> {
         let connector_name = connector_name.map(str::trim);
         if connector_name.is_some_and(|name| {
@@ -567,9 +575,10 @@ impl AgentManager {
         let tool_instructions = connector_name.map(|name| format!(
             "**NovaGPT workspace tools**\nYour coding workspace is managed by the NovaGPT connector named {}.\nYou MUST use this specific connected app/plugin to interact with the workspace whenever its tools are available. Discover the actual tool namespace and exposed capabilities before attempting file operations. Do not derive the namespace from the display name. For existing-file modifications use authenticated subagent_apply_patch; for new files use subagent_create_file; report activity through subagent_progress and completion through subagent_finished when exposed. Use the current private execution credential supplied by NovaGPT. Never print it, include it in reports, or expose it in logs. A successful server receipt is required before claiming a file was created or modified. If required tools are missing, disconnected, disabled, or inaccessible, report that explicitly; do not silently switch plugins or claim modifications.",
             serde_json::to_string(name).unwrap_or_default(),
-        )).unwrap_or_else(|| "**NovaGPT workspace tools**\nParent connector display name was not provided; do not infer its name or tool namespace. Discover only actually exposed NovaGPT capabilities; report unavailable tools explicitly.".to_owned());
+        )).unwrap_or_else(|| "**NovaGPT workspace tools**\nThe parent cannot supply a ChatGPT connector display name. Discover actual connected NovaGPT tools by their advertised capabilities; do not invent any display name or derive a tool namespace. Verify access through the authenticated no-write probes before accepting a coding task. Report missing tools explicitly.".to_owned());
         let task_prompt = format!("{tool_instructions}\n\n{prompt}");
-        let probe_pending = request.role == AgentRole::Implementer && connector_name.is_some();
+        let probe_required = request.role == AgentRole::Implementer && require_capability_preflight;
+        let probe_pending = probe_required;
         // The coding task is deliberately not present in the initial probe
         // message: absence of the child connector cannot authorize work.
         let prompt = if probe_pending {
@@ -636,6 +645,7 @@ impl AgentManager {
                     epoch: 1,
                     ready: false,
                     probe_pending,
+                    probe_required,
                     probe_patch: false,
                     probe_create: false,
                     probe_progress: false,
@@ -674,14 +684,14 @@ impl AgentManager {
                     return Err(BackendFailure::Unavailable);
                 }
                 let reply = manager.inner.backend.send(&id, &prompt).await;
-                manager.emit(
-                    &id,
-                    if reply.is_ok() {
-                        AgentLogStage::BrowserReplyReceived
-                    } else {
-                        AgentLogStage::BrowserReplyFailed
-                    },
-                );
+                let stage = match &reply {
+                    Ok(_) => AgentLogStage::BrowserReplyReceived,
+                    Err(BackendFailure::Uncertain(_)) => AgentLogStage::BrowserReplyUncertain,
+                    Err(BackendFailure::Blocked(_)) => AgentLogStage::BrowserReplyBlocked,
+                    Err(BackendFailure::Manual(_)) => AgentLogStage::BrowserReplyManual,
+                    Err(BackendFailure::Unavailable) => AgentLogStage::BrowserReplyFailed,
+                };
+                manager.emit(&id, stage);
                 reply
             }
             .await;
@@ -941,27 +951,25 @@ impl AgentManager {
             if entry.info.role == AgentRole::Implementer {
                 next.push_str("\n\nFor existing files call subagent_apply_patch with this id/code, one selected file per patch. For NEW files anywhere within the authorized workspace call subagent_create_file with id/code/path/content; paths need not be selected. Check the receipt before saying APPLIED; otherwise label changes NOT APPLIED.");
             }
-            if entry.info.role == AgentRole::Implementer {
-                if let Some(name) = entry.info.connector_name.as_deref() {
-                    // A follow-up is a fresh execution credential and the
-                    // child's plugin access may have changed in the meantime.
-                    // Never skip its capability check.
-                    let connector = format!(
-                        "**NovaGPT workspace tools**\nYour coding workspace is managed by the NovaGPT connector named {}. Discover the actual tool namespace of this exact connected app; do not guess its name or assume it is still connected. The actual task will follow only after server-verified callbacks. Never reveal the private credential or claim edits without server receipts.",
-                        serde_json::to_string(name).unwrap_or_default()
-                    );
-                    entry.task_prompt = Some(format!("{connector}\n\n{next}"));
-                    entry.probe_pending = true;
-                    entry.probe_patch = false;
-                    entry.probe_create = false;
-                    entry.probe_progress = false;
-                    entry.info.capability_status = "probing".into();
-                    format!(
-                        "{connector}\n\nCAPABILITY PREFLIGHT ONLY. Do NOT begin coding yet. Discover the actual connected app's namespace and call subagent_progress with id={id}, code={code}, kind=working; subagent_apply_patch with id={id}, code={code}, patch=\"\", probe=true; and subagent_create_file with id={id}, code={code}, path=\"\", content=\"\", probe=true. These operations return authenticated receipts without writing files. Do not call subagent_finished in preflight. End the turn after successful receipts, or explicitly report unavailable tools."
-                    )
-                } else {
-                    next
-                }
+            if entry.probe_required {
+                // Even without a ChatGPT-side connector alias, every new MCP
+                // implementer run must prove live tools with its fresh code.
+                let hint = entry.info.connector_name.as_deref().map_or_else(
+                    || "The parent did not provide a connector display name. Discover actual NovaGPT connected tools by their advertised capabilities; do not invent a display name or tool namespace.".to_owned(),
+                    |name| format!("The parent selected the NovaGPT connected app named {}. Discover this connected app's actual tools without guessing its namespace.", serde_json::to_string(name).unwrap_or_default()),
+                );
+                let connector = format!(
+                    "**NovaGPT workspace tools**\n{hint} The coding task follows only after server-verified no-write callbacks; keep the execution credential private."
+                );
+                entry.task_prompt = Some(format!("{connector}\n\n{next}"));
+                entry.probe_pending = true;
+                entry.probe_patch = false;
+                entry.probe_create = false;
+                entry.probe_progress = false;
+                entry.info.capability_status = "probing".into();
+                format!(
+                    "{connector}\n\nCAPABILITY PREFLIGHT ONLY. Do NOT begin coding yet. Discover the actual NovaGPT connected tools and call subagent_progress with id={id}, code={code}, kind=working; subagent_apply_patch with id={id}, code={code}, patch=\"\", probe=true; and subagent_create_file with id={id}, code={code}, path=\"\", content=\"\", probe=true. These operations return authenticated receipts without writing files. Do not call subagent_finished in preflight. End the turn after successful receipts, or explicitly report unavailable tools."
+                )
             } else {
                 next
             }
@@ -1516,7 +1524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_or_untrusted_connector_name_is_denied_before_tab_creation() {
+    async fn invalid_connector_hints_are_denied_before_tab_creation() {
         let dir = tempfile::tempdir().expect("fixture");
         let backend = probe_backend();
         let manager = AgentManager::new(
@@ -1530,10 +1538,6 @@ mod tests {
             paths: vec![],
             context: None,
         };
-        assert!(matches!(
-            manager.spawn_with_connector(request.clone(), None).await,
-            Err(AgentError::ConnectorMissing)
-        ));
         assert!(matches!(
             manager
                 .spawn_with_connector(request.clone(), Some("  "))
@@ -1607,9 +1611,10 @@ mod tests {
     #[tokio::test]
     async fn named_connector_probe_gates_real_writes_and_completion() {
         for name in [
-            "NovaGPT Laptop",
-            "NovaGPT PC",
-            "Arbitrary Custom Connection",
+            Some("NovaGPT Laptop"),
+            Some("NovaGPT PC"),
+            Some("Arbitrary Custom Connection"),
+            None,
         ] {
             let dir = tempfile::tempdir().expect("fixture");
             std::fs::write(dir.path().join("approved.rs"), "old\n").expect("existing file");
@@ -1627,14 +1632,18 @@ mod tests {
                         paths: vec!["approved.rs".into()],
                         context: None,
                     },
-                    Some(name),
+                    name,
                 )
                 .await
                 .expect("spawn");
             backend.entered.notified().await;
             let sent = backend.prompts.lock().await;
             assert_eq!(sent.len(), 1);
-            assert!(sent[0].contains(name));
+            if let Some(name) = name {
+                assert!(sent[0].contains(name));
+            } else {
+                assert!(sent[0].contains("display name"));
+            }
             assert!(sent[0].contains("CAPABILITY PREFLIGHT ONLY"));
             assert!(!sent[0].contains("ASSIGNMENT:"));
             drop(sent);
@@ -1648,7 +1657,7 @@ mod tests {
                 .agents
                 .remove(0);
             assert_eq!(initial.capability_status, "probing");
-            assert_eq!(initial.connector_name.as_deref(), Some(name));
+            assert_eq!(initial.connector_name.as_deref(), name);
             assert!(matches!(
                 manager.finished(&info.id, &code, "forged finish").await,
                 Err(AgentError::CompletionDenied)
@@ -1703,7 +1712,9 @@ mod tests {
             let sent = backend.prompts.lock().await;
             assert_eq!(sent.len(), 2, "coding task sent after all probes");
             assert!(sent[1].contains("ASSIGNMENT:"));
-            assert!(sent[1].contains(name));
+            if let Some(name) = name {
+                assert!(sent[1].contains(name));
+            }
             drop(sent);
             assert_eq!(
                 manager.status(Some(&info.id)).await.expect("status").agents[0].capability_status,
@@ -1753,6 +1764,36 @@ mod tests {
                     .await,
                 Err(AgentError::PatchDenied)
             ));
+            let followup = manager
+                .message(&info.id, "FOLLOWUP SECRET ASSIGNMENT")
+                .await
+                .expect("follow-up");
+            assert_eq!(followup.capability_status, "probing");
+            backend.entered.notified().await;
+            let messages = backend.prompts.lock().await;
+            assert_eq!(messages.len(), 3, "only the new preflight is dispatched");
+            assert!(messages[2].contains("CAPABILITY PREFLIGHT ONLY"));
+            assert!(!messages[2].contains("FOLLOWUP SECRET ASSIGNMENT"));
+            drop(messages);
+            let next_code = manager.inner.entries.lock().await[&info.id]
+                .completion_code
+                .clone();
+            assert_ne!(code, next_code);
+            assert!(matches!(
+                manager
+                    .finished(&info.id, &next_code, "bypass preflight")
+                    .await,
+                Err(AgentError::CompletionDenied)
+            ));
+            let next_entry = manager.inner.entries.lock().await;
+            assert!(next_entry[&info.id].probe_pending);
+            assert!(
+                next_entry[&info.id]
+                    .task_prompt
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("FOLLOWUP SECRET ASSIGNMENT")
+            );
         }
     }
 
@@ -1773,7 +1814,7 @@ mod tests {
                     paths: vec![],
                     context: None,
                 },
-                Some("Custom plugin"),
+                None,
             )
             .await
             .expect("spawn");
@@ -1846,10 +1887,15 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_browser_timeout_keeps_execution_credential_valid() {
         let dir = tempfile::tempdir().expect("fixture");
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = reported.clone();
         let manager = AgentManager::new(
             WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
             Arc::new(TimeoutAfterSubmission),
-        );
+        )
+        .with_diagnostic_reporter(move |_, stage| {
+            captured.lock().expect("diagnostic lock").push(stage);
+        });
         let info = manager
             .spawn(SpawnAgent {
                 workspace_id: None,
@@ -1862,6 +1908,12 @@ mod tests {
             .expect("spawn");
         let timed_out = manager.wait(&info.id, 2).await.expect("wait");
         assert_eq!(timed_out.agent.state, AgentState::Waiting);
+        assert!(
+            reported
+                .lock()
+                .expect("diagnostics")
+                .contains(&AgentLogStage::BrowserReplyUncertain)
+        );
         assert!(
             timed_out
                 .agent
@@ -1960,7 +2012,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|(_, stage)| *stage == AgentLogStage::BrowserReplyFailed)
+                .any(|(_, stage)| *stage == AgentLogStage::BrowserReplyBlocked)
         );
         assert!(
             !events
