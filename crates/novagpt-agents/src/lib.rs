@@ -294,6 +294,9 @@ fn map_browser(error: BrowserError) -> BackendFailure {
         BrowserError::ComposerUnavailable => {
             BackendFailure::Blocked("ChatGPT composer unavailable; no prompt submitted")
         }
+        BrowserError::InteractionBlocked => BackendFailure::Blocked(
+            "ChatGPT tab could not be made visible and focused; no prompt submitted",
+        ),
         BrowserError::AmbiguousSubmission => BackendFailure::Uncertain(
             "Chrome disconnected after possible submission; no prompt replay. Authenticated callbacks remain available",
         ),

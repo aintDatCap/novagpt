@@ -2,7 +2,9 @@
 //! native ChromeDriver/WebDriver lifecycle. Never reads Chrome
 //! cookies/credentials; manual challenges are for the user.
 mod bridge;
+mod interaction;
 pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
+pub use interaction::InteractionPacing;
 /// Native managed Chrome/ChromeDriver lifecycle. Exposed so the CLI and
 /// embedders can install/inspect a verified driver without starting a browser.
 pub use novagpt_browser_driver::undetected as managed;
@@ -103,6 +105,8 @@ pub enum BrowserError {
     Manual(&'static str),
     #[error("ChatGPT navigation did not complete; no prompt was submitted")]
     NavigationTimeout,
+    #[error("ChatGPT tab could not be made visible and focused; no prompt was submitted")]
+    InteractionBlocked,
     #[error("ChatGPT composer unavailable after waiting; no prompt was submitted")]
     ComposerUnavailable,
     #[error("Chrome disconnected after possible prompt submission; no automatic replay")]
@@ -236,6 +240,7 @@ pub struct BrowserReply {
 struct Page {
     transport: WebDriverTab,
     background: Option<BackgroundTarget>,
+    pacing: InteractionPacing,
     cancelled: AtomicBool,
     // A crashed tab must never cause automatic replay after a send event.
     submission_attempted: AtomicBool,
@@ -370,6 +375,29 @@ impl Page {
         {
             return Err(BrowserError::Protocol);
         }
+        // A person moves the pointer before pressing a button. Emit a short,
+        // jittered path so the press is not the first mouse event the page
+        // ever sees at that point.
+        let steps = self.pacing.pointer_steps;
+        if steps > 0 {
+            let start_x = (x - 120.0).max(1.0);
+            let start_y = (y + 60.0).max(1.0);
+            for step in 1..=steps {
+                let progress = f64::from(step) / f64::from(steps);
+                let point_x = start_x + (x - start_x) * progress + interaction::wobble(1.5);
+                let point_y = start_y + (y - start_y) * progress + interaction::wobble(1.5);
+                self.command(
+                    "Input.dispatchMouseEvent",
+                    json!({"type":"mouseMoved","x":point_x,"y":point_y,"buttons":0}),
+                )
+                .await?;
+                sleep(interaction::jittered(
+                    self.pacing.pointer_delay,
+                    self.pacing.pointer_jitter,
+                ))
+                .await;
+            }
+        }
         if let Some(target) = &self.background {
             target
                 .commands(&[
@@ -406,6 +434,110 @@ impl Page {
                 .map_err(BrowserError::from)
         }
     }
+
+    /// Run a small ordered batch of input commands. The background transport
+    /// keeps them on one socket; the WebDriver fixture sends them in order.
+    async fn input_batch(&self, requests: &[(&str, Value)]) -> Result<(), BrowserError> {
+        if let Some(target) = &self.background {
+            target
+                .commands(requests)
+                .await
+                .map(|_| ())
+                .map_err(BrowserError::from)
+        } else {
+            for (method, params) in requests {
+                self.transport
+                    .cdp_execute(method, params.clone())
+                    .await
+                    .map_err(BrowserError::from)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Insert the prompt the way a person would. Short ASCII prompts are sent
+    /// as individual key presses (with Shift+Enter for newlines); longer or
+    /// non-ASCII prompts use one trusted text insertion because Chrome does
+    /// not expose a user-permitted clipboard paste to an automation client.
+    /// Returns `true` when keystrokes were used.
+    async fn type_prompt(&self, text: &str) -> Result<bool, BrowserError> {
+        let normalized = text.replace("\r\n", "\n");
+        let characters = normalized.chars().count();
+        if !normalized.is_ascii() || characters > self.pacing.max_typed_chars {
+            self.insert_text(&normalized).await?;
+            return Ok(false);
+        }
+        let mut batch: Vec<(&str, Value)> = Vec::with_capacity(4);
+        for character in normalized.chars() {
+            if character == '\n' {
+                if !batch.is_empty() {
+                    self.input_batch(&batch).await?;
+                    batch.clear();
+                }
+                // Enter alone sends a message in ChatGPT; Shift+Enter inserts
+                // the newline a person would type.
+                self.input_batch(&[
+                    (
+                        "Input.dispatchKeyEvent",
+                        json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"modifiers":8,"text":"\r","unmodifiedText":"\r"}),
+                    ),
+                    (
+                        "Input.dispatchKeyEvent",
+                        json!({"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"modifiers":8}),
+                    ),
+                ])
+                .await?;
+            } else {
+                let key = character.to_string();
+                batch.push((
+                    "Input.dispatchKeyEvent",
+                    json!({"type":"keyDown","key":key,"text":key,"unmodifiedText":key}),
+                ));
+                batch.push(("Input.dispatchKeyEvent", json!({"type":"keyUp","key":key})));
+                if batch.len() == 4 {
+                    self.input_batch(&batch).await?;
+                    batch.clear();
+                }
+            }
+            sleep(interaction::jittered(
+                self.pacing.key_delay,
+                self.pacing.key_jitter,
+            ))
+            .await;
+        }
+        if !batch.is_empty() {
+            self.input_batch(&batch).await?;
+        }
+        Ok(true)
+    }
+
+    /// Raise this tab and require the page to report itself visible and
+    /// focused before input. A hidden or unfocused document cannot receive
+    /// human input, so dispatching keystrokes there is both ineffective and
+    /// an automation tell.
+    async fn ensure_interactive(&self) -> Result<(), BrowserError> {
+        if let Some(target) = &self.background {
+            target.bring_to_front().await.map_err(BrowserError::from)?;
+        } else {
+            self.transport
+                .cdp_execute("Page.bringToFront", json!({}))
+                .await
+                .map_err(BrowserError::from)?;
+        }
+        let deadline = Instant::now() + self.pacing.reveal_timeout;
+        loop {
+            let state = self
+                .eval("({visible:document.visibilityState === 'visible', focused:document.hasFocus()})")
+                .await?;
+            if state["visible"] == true && state["focused"] == true {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(BrowserError::InteractionBlocked);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 struct Inner {
     config: ManagedConfig,
@@ -414,6 +546,8 @@ struct Inner {
     create_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
     reporter: Option<DiagnosticReporter>,
+    pacing: InteractionPacing,
+    last_open: Mutex<Option<Instant>>,
 }
 #[derive(Clone)]
 pub struct ChatGptBrowser {
@@ -455,6 +589,8 @@ impl ChatGptBrowser {
                 create_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
+                pacing: InteractionPacing::human(),
+                last_open: Mutex::new(None),
             }),
         })
     }
@@ -478,6 +614,8 @@ impl ChatGptBrowser {
                 create_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
+                pacing: InteractionPacing::instant(),
+                last_open: Mutex::new(None),
             }),
         }
     }
@@ -512,6 +650,16 @@ impl ChatGptBrowser {
         let inner = Arc::get_mut(&mut self.inner).ok_or(BrowserError::Protocol)?;
         inner.dev_origin = Some(approved);
         Ok(self)
+    }
+
+    /// Replace the human interaction pacing. Production uses
+    /// [`InteractionPacing::human`]; deterministic tests and embedders that
+    /// drive their own page can use [`InteractionPacing::instant`].
+    pub fn with_pacing(mut self, pacing: InteractionPacing) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.pacing = pacing;
+        }
+        self
     }
 
     fn approved_url(&self, input: &str) -> Result<reqwest::Url, BrowserError> {
@@ -581,6 +729,19 @@ impl ChatGptBrowser {
             return Err(BrowserError::Protocol);
         }
         let _serial = self.inner.create_lock.lock().await;
+        // Tabs are created one at a time. A short randomized gap keeps six
+        // concurrent workers from starting six top-level navigations in the
+        // same instant, without requiring every caller to pace itself.
+        let gap =
+            interaction::jittered(self.inner.pacing.tab_gap, self.inner.pacing.tab_gap_jitter);
+        let previous = *self.inner.last_open.lock().await;
+        if let Some(previous) = previous {
+            let elapsed = previous.elapsed();
+            if elapsed < gap {
+                sleep(gap - elapsed).await;
+            }
+        }
+        *self.inner.last_open.lock().await = Some(Instant::now());
         let chrome = self.chrome().await?;
         {
             let mut pages = self.inner.pages.lock().await;
@@ -609,6 +770,7 @@ impl ChatGptBrowser {
         let page = Arc::new(Page {
             transport,
             background,
+            pacing: self.inner.pacing,
             cancelled: AtomicBool::new(false),
             submission_attempted: AtomicBool::new(false),
             send_lock: Mutex::new(()),
@@ -1112,6 +1274,17 @@ impl ChatGptBrowser {
             before
         } else {
             let before = state["assistant_count"].as_u64().unwrap_or(0) as usize;
+            // A human does not start typing the instant a composer renders.
+            sleep(interaction::jittered(
+                page.pacing.settle_after_ready,
+                page.pacing.settle_jitter,
+            ))
+            .await;
+            // Input into a hidden or unfocused tab is not something a person
+            // can do. Raise this tab and refuse to type unless the document
+            // confirms it is visible and focused.
+            page.ensure_interactive().await?;
+            page.diagnostic("tab_interactive", "").await;
             // Select the actual visible, editable textbox (not its wrapper).
             // Replacing a selection via browser input generates real input events,
             // unlike writing directly to the DOM or dispatching fake events.
@@ -1137,8 +1310,16 @@ impl ChatGptBrowser {
                 return Err(BrowserError::Unavailable);
             }
             page.diagnostic("composer_focused", "").await;
-            page.insert_text(prompt).await?;
-            page.diagnostic("text_input_dispatched", "").await;
+            let typed = page.type_prompt(prompt).await?;
+            page.diagnostic(
+                if typed {
+                    "text_input_typed"
+                } else {
+                    "text_input_inserted"
+                },
+                "",
+            )
+            .await;
             // Check an actual prefix of the inserted prompt, not merely that
             // some unrelated element had nonempty text.
             let inserted = page
@@ -1156,23 +1337,61 @@ impl ChatGptBrowser {
                 return Err(BrowserError::Unavailable);
             }
             page.diagnostic("text_verified", "").await;
+            // A verification interstitial can appear after the composer was
+            // classified as ready, including over an already-rendered page.
+            // Re-check the live document immediately before submitting and
+            // keep the unsent prompt for the manual-verification flow.
+            let pre_submit = self.dom_state(&page).await?;
+            page.note_state(&pre_submit).await;
+            if let Some(manual) = manual_reason(&pre_submit) {
+                *page.manual.lock().await = Some(manual.to_owned());
+                page.diagnostic("manual_before_submit", manual).await;
+                return Err(BrowserError::Manual(manual));
+            }
+            let editable = page
+                .eval(&ui_expression(
+                    r#"const el = findEditor();
+                    return !!el && document.activeElement === el;"#,
+                ))
+                .await?;
+            if editable != Value::Bool(true) {
+                page.diagnostic("editor_not_focused", "").await;
+                return Err(BrowserError::InteractionBlocked);
+            }
+            sleep(interaction::jittered(
+                page.pacing.submit_delay,
+                page.pacing.submit_jitter,
+            ))
+            .await;
             // Physical mouse events, rather than DOM .click(), match the
-            // physical input that a browser automation click uses.
+            // physical input that a browser automation click uses. The click
+            // is only sent when the button is the topmost element at its own
+            // centre, so a challenge overlay or dialog cannot be clicked
+            // blindly.
             // Retry briefly for React to enable the button after typing.
             let mut button = Value::Null;
+            let mut obscured = false;
             for _ in 0..8 {
                 button = page
                     .eval(&ui_expression(
                         r#"const el = findSendButton();
                         if (!el) return null;
                         const rect = el.getBoundingClientRect();
-                        return {x:rect.left + rect.width/2, y:rect.top + rect.height/2};"#,
+                        const x = rect.left + rect.width/2;
+                        const y = rect.top + rect.height/2;
+                        const hit = document.elementFromPoint(x, y);
+                        return {x, y, clear: !!hit && (hit === el || el.contains(hit))};"#,
                     ))
                     .await?;
                 if button.is_object() {
+                    obscured = button["clear"] != true;
                     break;
                 }
                 sleep(Duration::from_millis(125)).await;
+            }
+            if obscured {
+                page.diagnostic("send_button_obscured", "").await;
+                return Err(BrowserError::InteractionBlocked);
             }
             if let (Some(x), Some(y)) = (button["x"].as_f64(), button["y"].as_f64()) {
                 page.diagnostic("send_button_found", "").await;
@@ -1735,6 +1954,11 @@ mod tests {
         reply_ready: bool,
         inserted: usize,
         inserted_text: String,
+        keys: usize,
+        shift_enters: usize,
+        not_visible: bool,
+        not_focused: bool,
+        obscured: bool,
         pressed: bool,
         released: bool,
         clicks: usize,
@@ -1883,10 +2107,10 @@ mod tests {
                 json!(true)
             } else if script.contains("return editorText(findEditor())") {
                 json!(state.inserted_text)
-            } else if script.contains("rect.left + rect.width/2") {
-                json!({"x":100.0,"y":40.0})
+            } else if script.contains("elementFromPoint") {
+                json!({"x":100.0,"y":40.0,"clear":!state.obscured})
             } else if script.contains("document.visibilityState") {
-                json!(true)
+                json!({"visible":!state.not_visible,"focused":!state.not_focused})
             } else if script.contains("ready:document.readyState") {
                 json!({"url":state.url,"ready":"complete"})
             } else if script.contains("document.body?.innerText") {
@@ -1900,8 +2124,6 @@ mod tests {
                     "controls":[{"tag":"button","label":"Save","selector":"#save"}]})
             } else if script.contains("url:location.href,width:innerWidth") {
                 json!({"url":state.url,"width":800,"height":600})
-            } else if script.contains("elementFromPoint") {
-                json!({"x":55.0,"y":30.0,"href":null})
             } else if script.contains("location.href") {
                 json!(state.url)
             } else {
@@ -1931,7 +2153,18 @@ mod tests {
                     (200, json!({"value":{}}))
                 }
                 "Input.dispatchKeyEvent" => {
-                    (200, json!({"value":{"error":"unexpected key fallback"}}))
+                    if params["type"] == "keyDown" {
+                        state.keys += 1;
+                        if params["key"] == "Enter" {
+                            if params["modifiers"].as_u64() == Some(8) {
+                                state.shift_enters += 1;
+                                state.inserted_text.push('\n');
+                            }
+                        } else if let Some(text) = params["text"].as_str() {
+                            state.inserted_text.push_str(text);
+                        }
+                    }
+                    (200, json!({"value":{}}))
                 }
                 "Page.navigate" => {
                     state.url = params["url"].as_str().unwrap_or("about:blank").to_owned();
@@ -1942,6 +2175,7 @@ mod tests {
                     json!({"value":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XvCuXwAAAABJRU5ErkJggg=="}}),
                 ),
                 "Page.enable"
+                | "Page.bringToFront"
                 | "Log.enable"
                 | "Network.enable"
                 | "Emulation.setDeviceMetricsOverride" => (200, json!({"value":{}})),
@@ -2016,6 +2250,18 @@ mod tests {
             diagnostics
                 .recent_events
                 .iter()
+                .any(|e| e == "tab_interactive")
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|e| e == "text_input_typed")
+        );
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
                 .any(|e| e == "send_mouse_dispatched")
         );
         let serialized = serde_json::to_string(&diagnostics).expect("json");
@@ -2023,10 +2269,15 @@ mod tests {
         assert!(!serialized.contains("Fixture answer"));
         assert!(!serialized.contains("https://chatgpt.com/c/mock"));
         let state = state.lock().await;
-        assert_eq!(state.inserted, 1);
+        assert_eq!(state.inserted, 0, "short ASCII prompts are typed");
+        assert!(
+            state.keys >= 14,
+            "one key-down per character: {}",
+            state.keys
+        );
         assert!(state.released);
-        assert!(state.cdp.iter().any(|cmd| cmd == "Input.insertText"));
-        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.dispatchKeyEvent"));
+        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.insertText"));
+        assert!(state.cdp.iter().any(|cmd| cmd == "Input.dispatchKeyEvent"));
         server.abort();
     }
 
@@ -2063,7 +2314,11 @@ mod tests {
         .expect("resume")
         .expect("reply");
         assert_eq!(reply.content, "Fixture answer");
-        assert_eq!(state.lock().await.inserted, 1);
+        assert_eq!(
+            state.lock().await.inserted_text,
+            "Retained fixture prompt",
+            "the prompt is typed exactly once after verification"
+        );
         assert!(
             browser
                 .diagnostics(Some("agent-verified"))
@@ -2085,6 +2340,7 @@ mod tests {
             Arc::new(Page {
                 transport: tab,
                 background: None,
+                pacing: InteractionPacing::instant(),
                 cancelled: AtomicBool::new(false),
                 submission_attempted: AtomicBool::new(true),
                 send_lock: Mutex::new(()),
@@ -2111,6 +2367,89 @@ mod tests {
         );
         assert_eq!(diagnostic.page_count, 1);
         assert_eq!(state.lock().await.inserted, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_aborts_without_input_when_the_tab_cannot_be_focused() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut state = state.lock().await;
+            state.verified = true;
+            state.not_focused = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-hidden").await.expect("open");
+        let result = timeout(
+            Duration::from_secs(4),
+            browser.send("agent-hidden", "Must not be typed"),
+        )
+        .await
+        .expect("no hang")
+        .expect_err("unfocused tab");
+        assert!(matches!(result, BrowserError::InteractionBlocked));
+        let state = state.lock().await;
+        assert_eq!(state.keys, 0, "no keystroke may be dispatched");
+        assert_eq!(state.inserted, 0, "no text insertion may be dispatched");
+        assert!(!state.pressed, "no submit click may be dispatched");
+        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.insertText"));
+        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.dispatchKeyEvent"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn newlines_are_typed_as_shift_enter_without_early_submission() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut state = state.lock().await;
+            state.verified = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-newline").await.expect("open");
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-newline", "first\nsecond"),
+        )
+        .await
+        .expect("send timeout")
+        .expect("reply");
+        assert_eq!(reply.content, "Fixture answer");
+        let state = state.lock().await;
+        assert_eq!(state.shift_enters, 1);
+        assert_eq!(state.inserted, 0);
+        assert_eq!(state.inserted_text, "first\nsecond");
+        assert!(state.released, "the only submission is the send click");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_obscured_send_button_is_not_clicked_blindly() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut state = state.lock().await;
+            state.verified = true;
+            state.obscured = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-covered").await.expect("open");
+        let result = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-covered", "Do not click an overlay"),
+        )
+        .await
+        .expect("no hang")
+        .expect_err("obscured button");
+        assert!(matches!(result, BrowserError::InteractionBlocked));
+        let diagnostics = browser.diagnostics(Some("agent-covered")).await;
+        assert!(
+            diagnostics
+                .recent_events
+                .iter()
+                .any(|event| event == "send_button_obscured")
+        );
+        let state = state.lock().await;
+        assert!(!state.pressed, "a covered button must not be clicked");
+        assert_eq!(state.inserted, 0);
         server.abort();
     }
 
