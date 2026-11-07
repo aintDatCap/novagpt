@@ -62,6 +62,28 @@ impl Controller {
                     let _ = tx.send(OperationEvent::NgrokInstallFinished(result));
                 }));
             }
+            Effect::LoadAudit => {
+                let tx = self.tx.clone();
+                self.runtime.spawn_blocking(move || {
+                    let result = crate::logging::audit_directory(&root)
+                        .and_then(|dir| novagpt_mcp::AuditTrail::persisted_events(&dir, 2_000))
+                        .map_err(|_| "Saved audit history unavailable".to_string());
+                    let _ = tx.send(OperationEvent::AuditLoaded(result));
+                });
+            }
+            Effect::ExportAudit => {
+                let tx = self.tx.clone();
+                self.runtime.spawn_blocking(move || {
+                    let result = crate::logging::audit_directory(&root)
+                        .and_then(|dir| {
+                            let destination = crate::logging::support_bundle_destination()?;
+                            novagpt_mcp::AuditTrail::export_compressed(&dir, &destination)?;
+                            Ok(destination)
+                        })
+                        .map_err(|_| "Unable to export private audit metadata".to_string());
+                    let _ = tx.send(OperationEvent::AuditExported(result));
+                });
+            }
             Effect::ShowConnectorUrl(port) => {
                 let tx = self.tx.clone();
                 self.runtime.spawn(async move {

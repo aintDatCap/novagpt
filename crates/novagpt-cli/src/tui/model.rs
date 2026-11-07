@@ -21,6 +21,8 @@ pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
         8 => i18n::Messages::show_chatgpt_url(lang),
         9 => i18n::Messages::open_agent_browser(lang),
         10 => i18n::Messages::show_subagent_chrome(lang),
+        11 => i18n::Messages::audit_history_action(lang),
+        12 => i18n::Messages::audit_export_action(lang),
         _ => "",
     }
 }
@@ -94,6 +96,7 @@ pub(super) enum Confirm {
     Stop,
     InstallNgrok,
     Quit,
+    ExportAudit,
 }
 #[derive(Clone, Debug)]
 pub(super) enum Modal {
@@ -123,6 +126,8 @@ pub(super) enum Effect {
     LoadNovaSource(PathBuf),
     OpenAgentBrowser(LocalSettings),
     ShowSubagentChrome,
+    LoadAudit,
+    ExportAudit,
     Quit,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +154,8 @@ pub(super) enum OperationEvent {
     NovaSourceLoaded(Result<ImportProfile, String>),
     BrowserLoginFinished(Result<(), BrowserOpenFailure>),
     BrowserShowFinished(Result<(), ()>),
+    AuditLoaded(Result<Vec<novagpt_mcp::AuditEvent>, String>),
+    AuditExported(Result<PathBuf, String>),
     Saved {
         settings: LocalSettings,
         outcome: Result<String, String>,
@@ -181,6 +188,8 @@ pub(super) struct App {
     pub busy: bool,
     pub browser_login_running: bool,
     pub logs: VecDeque<LogEntry>,
+    pub audit_logs: VecDeque<LogEntry>,
+    pub audit_view: bool,
     pub log_offset: usize,
     pub status: String,
     pub clipboard_feedback: Option<String>,
@@ -221,6 +230,8 @@ impl App {
             busy: false,
             browser_login_running: false,
             logs: VecDeque::new(),
+            audit_logs: VecDeque::new(),
+            audit_view: false,
             log_offset: 0,
             status: "Ready".into(),
             clipboard_feedback: None,
@@ -228,6 +239,14 @@ impl App {
         app.log(Level::Info, "NovaGPT started. Press ? for help.");
         app
     }
+    pub fn visible_logs(&self) -> &VecDeque<LogEntry> {
+        if self.audit_view {
+            &self.audit_logs
+        } else {
+            &self.logs
+        }
+    }
+
     pub fn start_on_launch(&mut self) -> Option<Effect> {
         if !self.setup && self.persisted.auto_start_mcp {
             self.activate_command(0)
@@ -315,6 +334,50 @@ impl App {
     pub fn on_event(&mut self, event: OperationEvent) {
         match event {
             OperationEvent::Log(level, text) => self.log(level, text),
+            OperationEvent::AuditLoaded(outcome) => {
+                self.busy = false;
+                match outcome {
+                    Ok(events) => {
+                        self.audit_logs = events.into_iter().map(|event| {
+                            let seconds = event.unix_seconds % 86400;
+                            LogEntry {
+                                time: format!("{:02}:{:02}:{:02} UTC",
+                                    seconds / 3600, seconds / 60 % 60, seconds % 60),
+                                level: if event.status == "error" { Level::Error } else { Level::Info },
+                                english: format!(
+                                    "Event #{} at UNIX timestamp {}: tool {} completed with status {}.",
+                                    event.sequence, event.unix_seconds, event.tool, event.status
+                                ),
+                            }
+                        }).collect();
+                        self.audit_view = true;
+                        self.tab = 1;
+                        self.log_offset = 0;
+                        self.log_localized(Level::Info, i18n::Messages::audit_history_ready);
+                    }
+                    Err(_) => {
+                        self.log_localized(Level::Error, i18n::Messages::audit_history_failed)
+                    }
+                }
+            }
+            OperationEvent::AuditExported(outcome) => {
+                self.busy = false;
+                match outcome {
+                    Ok(destination) => {
+                        self.log_localized(Level::Success, i18n::Messages::audit_export_ready);
+                        self.notice(
+                            i18n::Messages::audit_export_action(self.language()),
+                            &format!(
+                                "{}\n\n{}",
+                                i18n::Messages::audit_export_ready(self.language()),
+                                destination.display()
+                            ),
+                        );
+                    }
+                    Err(_) => self.log_localized(Level::Error, i18n::Messages::audit_export_failed),
+                }
+            }
+
             OperationEvent::Server(s) => {
                 self.server = s;
                 if matches!(s, ServerState::Stopped | ServerState::Failed) {
@@ -517,7 +580,7 @@ impl App {
             vec![0, 7, 9, 2]
         };
         if self.show_advanced {
-            commands.extend([3, 4, 5, 6]);
+            commands.extend([3, 4, 5, 6, 11, 12]);
         }
         commands
     }
@@ -672,6 +735,20 @@ impl App {
                     self.busy = true;
                     Some(Effect::ShowSubagentChrome)
                 }
+            }
+            11 => {
+                if self.busy {
+                    None
+                } else {
+                    self.busy = true;
+                    Some(Effect::LoadAudit)
+                }
+            }
+            12 => {
+                if !self.busy {
+                    self.confirm(Confirm::ExportAudit);
+                }
+                None
             }
             _ => None,
         }
@@ -915,6 +992,14 @@ impl App {
                 self.log_localized(Level::Info, i18n::Messages::changes_discarded);
                 None
             }
+            Confirm::ExportAudit => {
+                if self.busy {
+                    None
+                } else {
+                    self.busy = true;
+                    Some(Effect::ExportAudit)
+                }
+            }
             Confirm::Quit => Some(Effect::Quit),
         }
     }
@@ -1012,6 +1097,18 @@ impl App {
             KeyCode::BackTab => self.tab = (self.tab + 2) % 3,
             KeyCode::Left => self.tab = (self.tab + 2) % 3,
             KeyCode::Right => self.tab = (self.tab + 1) % 3,
+            KeyCode::Char('h') if self.tab == 1 && !self.busy => {
+                if self.audit_view {
+                    self.audit_view = false;
+                    self.log_offset = 0;
+                } else {
+                    self.busy = true;
+                    return Some(Effect::LoadAudit);
+                }
+            }
+            KeyCode::Char('e') if self.tab == 1 && !self.busy => {
+                self.confirm(Confirm::ExportAudit);
+            }
             KeyCode::Char('q') => {
                 if self.dirty() {
                     self.confirm(Confirm::Quit);
@@ -1022,6 +1119,9 @@ impl App {
             KeyCode::Esc => {
                 if self.setup && self.tab == 2 && self.step > 0 && self.step < 4 {
                     self.step -= 1;
+                } else if self.tab == 1 && self.audit_view {
+                    self.audit_view = false;
+                    self.log_offset = 0;
                 } else if self.tab != 0 {
                     self.tab = 0;
                 }
@@ -1034,7 +1134,10 @@ impl App {
             }
             KeyCode::Up => match self.tab {
                 0 => self.select_command(-1),
-                1 => self.log_offset = (self.log_offset + 1).min(self.logs.len().saturating_sub(1)),
+                1 => {
+                    self.log_offset =
+                        (self.log_offset + 1).min(self.visible_logs().len().saturating_sub(1))
+                }
                 _ => self.select_config(-1),
             },
             KeyCode::Down => match self.tab {
@@ -1043,12 +1146,15 @@ impl App {
                 _ => self.select_config(1),
             },
             KeyCode::PageUp if self.tab == 1 => {
-                self.log_offset = (self.log_offset + 10).min(self.logs.len().saturating_sub(1))
+                self.log_offset =
+                    (self.log_offset + 10).min(self.visible_logs().len().saturating_sub(1))
             }
             KeyCode::PageDown if self.tab == 1 => {
                 self.log_offset = self.log_offset.saturating_sub(10)
             }
-            KeyCode::Home if self.tab == 1 => self.log_offset = self.logs.len().saturating_sub(1),
+            KeyCode::Home if self.tab == 1 => {
+                self.log_offset = self.visible_logs().len().saturating_sub(1)
+            }
             KeyCode::End if self.tab == 1 => self.log_offset = 0,
             KeyCode::Enter if self.tab == 0 => return self.activate_command(self.command),
             KeyCode::Enter if self.tab == 2 && !self.busy => return self.config_action(),

@@ -1,7 +1,7 @@
 //! Official rmcp-based protocol and transport boundary.
 mod audit;
 mod output_store;
-pub use audit::AuditTrail;
+pub use audit::{AuditEvent, AuditTrail};
 use axum::{
     Router,
     extract::{Request, State},

@@ -420,10 +420,10 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
         sections[0],
     );
     let visible = sections[1].height.saturating_sub(2) as usize;
-    let end = app.logs.len().saturating_sub(app.log_offset);
+    let events = app.visible_logs();
+    let end = events.len().saturating_sub(app.log_offset);
     let start = end.saturating_sub(visible);
-    let items = app
-        .logs
+    let items = events
         .iter()
         .skip(start)
         .take(end.saturating_sub(start))
@@ -444,7 +444,16 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ]))
         })
         .collect::<Vec<_>>();
-    let caption = Messages::event_count(lang, end, app.logs.len());
+    let caption = if app.audit_view {
+        format!(
+            "{} ({}/{})",
+            Messages::audit_history_caption(lang),
+            end,
+            events.len()
+        )
+    } else {
+        Messages::event_count(lang, end, events.len())
+    };
     frame.render_widget(List::new(items).block(panel(&caption)), sections[1]);
 }
 fn config_help(index: usize, lang: Language) -> &'static str {
@@ -734,6 +743,7 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
                 }
                 Confirm::Discard => Messages::discard_all_unsaved_changes_2(lang),
                 Confirm::Stop => Messages::stop_the_http_server_started_by_this(lang),
+                Confirm::ExportAudit => Messages::audit_confirm_export(lang),
                 Confirm::Quit => Messages::quit_and_lose_unsaved_changes(lang),
             };
             let choices = format!(

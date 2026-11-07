@@ -357,6 +357,22 @@ impl AuditTrail {
         }
     }
 
+    /// Read a bounded disk-backed history for the local terminal UI.
+    /// Keeps the realtime 128-entry buffer independent from retained events.
+    pub fn persisted_events(directory: &Path, limit: usize) -> io::Result<Vec<AuditEvent>> {
+        let parent = directory
+            .parent()
+            .ok_or_else(|| invalid("Missing audit parent"))?;
+        let app = parent
+            .parent()
+            .ok_or_else(|| invalid("Missing application state"))?;
+        private_dir(app)?;
+        private_dir(parent)?;
+        private_dir(directory)?;
+        let state = archive::recent(directory, limit.clamp(1, MAX_HISTORY_RESULTS))?;
+        Ok(state.events.into_iter().collect())
+    }
+
     /// Export validated audit metadata as a standalone zstd text file.
     /// The destination must not exist and is created with private permissions.
     pub fn export_compressed(directory: &Path, destination: &Path) -> io::Result<usize> {

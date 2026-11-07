@@ -246,6 +246,80 @@ mod tests {
         a.key(key(KeyCode::Esc));
         assert!(a.modal.is_none());
     }
+
+    #[test]
+    fn saved_history_can_be_opened_scrolled_and_left_without_clobbering_live_activity() {
+        let mut a = app();
+        let live_len = a.logs.len();
+        a.tab = 1;
+        assert!(matches!(
+            a.key(key(KeyCode::Char('h'))),
+            Some(Effect::LoadAudit)
+        ));
+        a.on_event(OperationEvent::AuditLoaded(Ok(vec![
+            novagpt_mcp::AuditEvent {
+                sequence: 27,
+                unix_seconds: 3601,
+                tool: "subagent_spawn".into(),
+                status: "error".into(),
+            },
+            novagpt_mcp::AuditEvent {
+                sequence: 28,
+                unix_seconds: 3602,
+                tool: "read".into(),
+                status: "ok".into(),
+            },
+        ])));
+        assert!(a.audit_view);
+        assert_eq!(a.tab, 1);
+        assert_eq!(a.visible_logs().len(), 2);
+        assert_eq!(a.visible_logs()[0].level, Level::Error);
+        assert!(a.visible_logs()[0].english.contains("subagent_spawn"));
+        assert!(!a.visible_logs()[0].english.contains("token="));
+        let mut terminal = Terminal::new(TestBackend::new(110, 35)).expect("test terminal");
+        terminal
+            .draw(|frame| render::draw(frame, &a))
+            .expect("render audit history");
+        a.key(key(KeyCode::Esc));
+        assert!(!a.audit_view);
+        assert_eq!(a.tab, 1, "back to live activity");
+        assert!(a.logs.len() >= live_len);
+    }
+
+    #[test]
+    fn export_requires_explicit_consent_and_never_auto_shares() {
+        let mut a = app();
+        a.tab = 1;
+        assert!(a.key(key(KeyCode::Char('e'))).is_none());
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm(model::Confirm::ExportAudit))
+        ));
+        assert!(!a.yes, "sensitive export defaults to no");
+        assert!(a.key(key(KeyCode::Enter)).is_none());
+        assert!(a.modal.is_none());
+        a.key(key(KeyCode::Char('e')));
+        assert!(matches!(
+            a.key(key(KeyCode::Char('y'))),
+            Some(Effect::ExportAudit)
+        ));
+        a.on_event(OperationEvent::AuditExported(Ok(PathBuf::from(
+            "/private/novagpt-support-example.zst",
+        ))));
+        assert!(!a.busy);
+        assert!(matches!(a.modal, Some(Modal::Notice { .. })));
+        let mut b = app();
+        b.tab = 0;
+        b.key(key(KeyCode::Char('a')));
+        assert!(b.visible_commands().contains(&11));
+        assert!(b.visible_commands().contains(&12));
+        b.command = 11;
+        assert!(matches!(
+            b.key(key(KeyCode::Enter)),
+            Some(Effect::LoadAudit)
+        ));
+    }
+
     #[test]
     fn save_is_confirmed_and_validated_by_settings() {
         let dir = tempfile::tempdir().expect("workspace");
@@ -619,7 +693,7 @@ mod tests {
         assert_eq!(a.command, 0);
         a.key(key(KeyCode::Char('a')));
         assert!(a.show_advanced);
-        assert_eq!(a.visible_commands(), vec![0, 7, 9, 2, 3, 4, 5, 6]);
+        assert_eq!(a.visible_commands(), vec![0, 7, 9, 2, 3, 4, 5, 6, 11, 12]);
         a.key(key(KeyCode::Char('a')));
         assert!(!a.show_advanced);
         a.on_event(OperationEvent::Server(ServerState::Running));

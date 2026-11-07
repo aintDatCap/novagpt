@@ -15,6 +15,8 @@ NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **
 | `?` | Show help |
 | `q` / `Ctrl+C` | Quit and restore the terminal |
 | `PgUp` / `PgDn` | Scroll Activity events |
+| `h` (Activity) | Toggle live activity and the last 2,000 saved audit events |
+| `e` (Activity) | Confirm ZSTD support-log export |
 
 ## Overview
 
@@ -24,6 +26,8 @@ NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **
 - **Show / copy ChatGPT URL:** Reveal the complete private URL only after the server and tunnel are ready. Press **C** in the dialog to copy it. NovaGPT selects Wayland (`wl-copy`), X11 (`xclip`/`xsel`), WSL (`clip.exe`), macOS (`pbcopy`) or Windows (`clip.exe`) as appropriate. On Linux, install the appropriate clipboard utility if it is absent; the dialog displays an error instead of reporting a false success.
 - **Diagnostics and optional tools:** Verify workspace status, inspect VM images when enabled, or launch the dedicated browser login flow.
 - **Show subagent Chrome:** When MCP is running with ChatGPT Browser enabled, explicitly bring one existing subagent tab to the foreground without navigating or changing its work. If none exists, open a separate blank browsing tab in the same owned Chrome. This requires the desktop to allow window focus; it never opens a second browser profile. The separate manual-login action remains available only while MCP is stopped.
+
+The advanced Overview actions also offer **Browse saved audit logs** and **Export support logs (ZSTD)**. Export asks for consent (No by default), creates a private file in the application-state exports directory, and never uploads or copies it automatically. Review the archive before sharing.
 
 If ngrok is **missing** when starting a tunnel, NovaGPT asks whether to install it using an available supported system package manager. The confirmation defaults to **No**. The installer needs the user's explicit consent, and ngrok account authentication remains a separate manual step. See the [ngrok setup guide](INSTALLATION.md#configure-ngrok-for-chatgpt-access).
 
@@ -46,7 +50,7 @@ Changes remain in a draft until saved with `s`. During guided setup, pressing **
 
 Activity shows bounded lifecycle and operational events with timestamps. **Logs and diagnostics are always in English**, regardless of the selected interface language. TUI labels and prompts may be translated into Italian.
 
-Use `novagpt logs tail --lines 50` for persistent metadata-only audit events, or `novagpt doctor --json` for local diagnostics. Tokens, full connector URLs, and private file contents should never appear in logs.
+Use `novagpt logs tail --lines 500` to inspect retained events, `novagpt logs export --output /new/path/support.log.zst` to create a compressed support archive, or `novagpt doctor --json` for diagnostics. The old `audit.1.log` and other legacy raw segments are not read or exported. Tokens, full connector URLs, and private file contents should never appear in logs.
 
 ## Security
 

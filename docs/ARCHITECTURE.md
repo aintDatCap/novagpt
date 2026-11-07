@@ -38,6 +38,8 @@ The CLI/TUI can manage its own ngrok process and verify the matching upstream po
 
 `novagpt` opens a three-page terminal UI: Overview, Activity and Settings. Guided `--setup` requires confirmation before it saves settings or creates a workspace-local launcher. The default UI language is Automatic, resolved from the system locale, with English fallback; all logs and diagnostics are in English.
 
+The TUI Activity page can display up to 2,000 recent persisted audit events (H switches back to live events); E prompts for an owner-private ZSTD metadata export. Both actions are also in the advanced Overview menu. Export creates a new file without upload or automatic clipboard sharing. The CLI supports logs tail and logs export, using the same validated records.
+
 The TUI initializes the shared user HTTP token automatically on launch using the existing private, concurrency-safe token resolver; it reuses an existing token and does not reveal its value. Startup token preparation is independent of the saved MCP auto-start preference.
 
 The saved `auto_start_mcp` preference is disabled by default. If enabled, normal TUI launch requests MCP startup using saved HTTP and ngrok preferences; guided setup does not. Missing ngrok prompts for explicit installer consent, with No as the default answer. The installer uses only supported system package managers and does not handle ngrok account credentials.

@@ -83,6 +83,14 @@ macro_rules! messages {
 
 messages! {
     static {
+        audit_history_action: { en: "Browse saved audit logs", it: "Consulta log audit salvati" },
+        audit_export_action: { en: "Export support logs (ZSTD)", it: "Esporta log supporto (ZSTD)" },
+        audit_history_ready: { en: "Saved audit history loaded. Press H for live events.", it: "Cronologia audit caricata. Premi H per gli eventi live." },
+        audit_history_failed: { en: "Could not load saved audit history.", it: "Impossibile leggere la cronologia audit salvata." },
+        audit_export_ready: { en: "Private, sanitized support bundle created. Review before sharing:", it: "Archivio privato e sanitizzato creato. Controllalo prima di condividerlo:" },
+        audit_export_failed: { en: "Could not export audit history.", it: "Impossibile esportare la cronologia audit." },
+        audit_confirm_export: { en: "Create a private compressed bundle containing timestamps, fixed tool names and success/error status only? No upload occurs. Inspect the archive before sharing with developers.", it: "Creare un archivio compresso privato contenente solo orari, nomi fissi dei tool e stato successo/errore? Non viene caricato online. Controlla il contenuto prima di condividerlo con gli sviluppatori." },
+        audit_history_caption: { en: " SAVED AUDIT HISTORY", it: " CRONOLOGIA AUDIT SALVATA" },
         ngrok_missing_prompt: { en: "ngrok is not installed. Confirm to install it using your system package manager.", it: "ngrok non è installato. Conferma per installarlo tramite il gestore pacchetti di sistema." },
         install_ngrok_confirm: { en: "Install ngrok now through your OS package manager? This may request system permissions. You must configure your ngrok account separately.", it: "Installare ngrok tramite il gestore pacchetti? Potrebbero servire permessi di sistema. Configura poi il tuo account ngrok separatamente." },
         ngrok_install_requested: { en: "ngrok installation requested through a supported package manager.", it: "Installazione di ngrok richiesta tramite un gestore pacchetti supportato." },
@@ -112,7 +120,7 @@ messages! {
         setup_optional_import: { en: "SETUP 3/4 · Optional import · n: next", it: "SETUP 3/4 · Importazione facoltativa · n: avanti" },
         settings_browser_heading: { en: "BROWSER", it: "BROWSER" },
         keys_overview: { en: "↑↓ actions   Enter run   a advanced   Tab views   ? help   q quit", it: "↑↓ azioni   Enter esegui   a avanzate   Tab schede   ? aiuto   q esci" },
-        keys_activity: { en: "↑↓ / PgUp PgDn events   Tab views   ? help   q quit", it: "↑↓ / PgUp PgDn eventi   Tab schede   ? aiuto   q esci" },
+        keys_activity: { en: "↑↓ scroll   H: saved/live logs   E: export   Tab views   ? help", it: "↑↓ scorri   H: log salvati/live   E: esporta   Tab schede   ? aiuto" },
         edit_input_prompt: { en: "Enter a value and press Enter:", it: "Inserisci il valore e premi Invio:" },
         none_server: { en: "Stopped", it: "Disattivato" },
         settings_save_pending: { en: "● Unsaved changes", it: "● Modifiche da salvare" },
@@ -134,7 +142,7 @@ messages! {
         vm_inventory_description: { en: "List approved images in the local NovaGPT store.", it: "Elenca le immagini approvate nello store NovaGPT locale." },
         subagents_description: { en: "Spawn/status/message/result/cancel/resume via MCP when browser is enabled.", it: "Spawn/status/message/result/cancel/resume via MCP, se browser attivo." },
         remove_authorized_directory: { en: "Remove authorized directory", it: "Rimuovi directory autorizzata" },
-        help_body: { en: "Tab / Shift+Tab: Overview, Activity, Settings\n↑ ↓: select or scroll logs\nEnter: run, edit or confirm\na: show/hide advanced actions in Overview\ns: save in Settings\nEsc: close/back   q: quit\n?: help   Ctrl+C: safe exit\nActivity: PgUp/PgDn, Home/End scroll events\nSettings: * marks a changed value\nSetup: n next, b back\nKeys 1–4: quick actions.", it: "Tab / Shift+Tab: Panoramica, Attività, Impostazioni\n↑ ↓: seleziona o scorri i log\nEnter: esegui, modifica o conferma\na: mostra/nascondi azioni avanzate in Panoramica\ns: salva da Impostazioni\nEsc: chiudi/indietro   q: esci\n?: aiuto   Ctrl+C: uscita controllata\nAttività: PgUp/PgDn, Home/End scorrono gli eventi\nImpostazioni: * indica un valore modificato\nSetup: n avanti, b indietro\nScorciatoie 1–4: operazioni rapide." },
+        help_body: { en: "Tab / Shift+Tab: Overview, Activity, Settings\n↑ ↓: select or scroll logs\nEnter: run, edit or confirm\na: show/hide advanced actions in Overview\ns: save in Settings\nEsc: close/back   q: quit\n?: help   Ctrl+C: safe exit\nActivity: PgUp/PgDn, Home/End scroll events; H saved/live audit, E export\nSettings: * marks a changed value\nSetup: n next, b back\nKeys 1–4: quick actions.", it: "Tab / Shift+Tab: Panoramica, Attività, Impostazioni\n↑ ↓: seleziona o scorri i log\nEnter: esegui, modifica o conferma\na: mostra/nascondi azioni avanzate in Panoramica\ns: salva da Impostazioni\nEsc: chiudi/indietro   q: esci\n?: aiuto   Ctrl+C: uscita controllata\nAttività: PgUp/PgDn, Home/End scorrono gli eventi; H log salvati/live, E esporta\nImpostazioni: * indica un valore modificato\nSetup: n avanti, b indietro\nScorciatoie 1–4: operazioni rapide." },
         choose_english_italian_or_automatic_system_language: { en: "Choose English, Italian or Automatic (system language).", it: "Scegli English, Italiano o Automatico (lingua di sistema)." },
         language_italian: { en: "Italian", it: "Italiano" },
         absent: { en: "(absent)", it: "(assente)" },
