@@ -286,7 +286,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     assert_eq!(listed.len(), if development_only { 58 } else { 57 });
     // MCP server tool registration is distinct from the ChatGPT client's
     // selected connector schema. Ensure new callers can discover the actual
-    // arguments needed for authenticated child preflight.
+    // arguments for optional authenticated no-write capability probes.
     let tool = |name: &str| {
         listed
             .iter()

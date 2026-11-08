@@ -417,8 +417,7 @@ struct AgentSpawnArgs {
     task: String,
     role: String,
     /// Optional display-name hint selected by the parent ChatGPT conversation.
-    /// MCP servers cannot read this client-side alias; if omitted, implementers
-    /// still need authenticated no-write capability probes before receiving tasks.
+    /// MCP servers cannot read this client-side alias; it is not authorization.
     #[serde(default)]
     connector_name: Option<String>,
     #[serde(default)]
@@ -1392,7 +1391,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Spawn a persistent asynchronous untrusted subagent. connector_name is an OPTIONAL parent-selected connected-app display-name hint; omit it if unknown, never guess it from a tool namespace. Every implementer task is withheld until the new worker completes authenticated no-write subagent_progress, subagent_apply_patch(probe=true), and subagent_create_file(probe=true) checks, even without connector_name. If child tools are unavailable, no task is sent and recovery diagnostics are returned; no text-only auto-apply."
+        description = "Spawn a persistent asynchronous untrusted subagent. connector_name is an OPTIONAL parent-selected connected-app display-name hint; omit it if unknown, never guess it from a tool namespace. The initial prompt contains the assignment immediately; there is no separate capability-preflight turn. File edits still require authenticated, credential-bound tool callbacks and verified receipts. If child tools are unavailable, the agent must report NOT APPLIED; no text-only auto-apply."
     )]
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
         let response = async {
@@ -1410,8 +1409,8 @@ impl NovaMcp {
                     )));
                 }
             };
-            // An optional display-name hint is not authorization. Every MCP
-            // implementer must prove live tools even when this alias is unknown.
+            // An optional display-name hint is not authorization. Write callbacks
+            // validate the worker credential and assigned paths independently.
             external_reply(
                 manager
                     .spawn_with_connector(
@@ -1562,7 +1561,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "For an implementer subagent: apply a guarded one-file Git unified diff to an explicitly assigned existing file, requiring the current private code and returning a verified receipt. During capability preflight only, probe=true with empty patch checks authenticated tool access WITHOUT writing a file; never claim a real edit from a probe."
+        description = "For an implementer subagent: apply a guarded one-file Git unified diff to an explicitly assigned existing file, requiring the current private code and returning a verified receipt. Optionally set probe=true with an empty patch to verify this callback without writing a file; the actual assignment is sent immediately. Never claim a real edit from a probe."
     )]
     async fn subagent_apply_patch(
         &self,
@@ -1583,7 +1582,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "For an authenticated implementer subagent: exclusively create a NEW UTF-8 file at a safe path inside its assigned workspace with current private code; never overwrite. During capability preflight only, probe=true with empty path/content checks authenticated tool access WITHOUT writing a file; never claim real creation from a probe."
+        description = "For an authenticated implementer subagent: exclusively create a NEW UTF-8 file at a safe path inside its assigned workspace with current private code; never overwrite. Optionally set probe=true with empty path/content to verify this callback without writing a file; the actual assignment is sent immediately. Never claim a real creation from a probe."
     )]
     async fn subagent_create_file(
         &self,

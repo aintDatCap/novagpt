@@ -1441,7 +1441,7 @@ impl ChatGptBrowser {
             // centre, so a challenge overlay or dialog cannot be clicked
             // blindly.
             // A Send button already used in this tab must reappear before
-            // another submission. After a callback-heavy preflight, a missing
+            // another submission. After an earlier message, a missing
             // button can mean that ChatGPT is STILL processing the prior turn,
             // even when its Stop control is absent. Never treat that as a
             // fallback invitation to press Enter into a busy composer.
@@ -1608,42 +1608,10 @@ impl ChatGptBrowser {
             return {{url:location.href, title, page_kind:'chatgpt',
                 composer:!!editor, challenge, login,
                 assistant_count:assistants.length, last_text:content?.innerText || '',
-                complete:copy || !stop,
-                preflight_idle:!!editor && editorText(editor).trim() === '' && !stop}};"#,
+                complete:copy || !stop}};"#,
             json!(ASSISTANTS)
         ));
         page.eval(&expression).await
-    }
-
-    /// Independently confirm that an already-submitted capability preflight
-    /// is no longer generating. A missing assistant message is not enough,
-    /// and authenticated callbacks alone do not prove the UI is idle.
-    /// Keep the original send poller alive unless this check succeeds.
-    pub async fn preflight_idle(&self, id: &str) -> Result<bool, BrowserError> {
-        let page = self.page(id).await?;
-        if !page.submission_attempted.load(Ordering::Acquire)
-            || page.pending_before.lock().await.is_none()
-        {
-            return Ok(false);
-        }
-        for sample in 0..4 {
-            if page.cancelled.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            let state = self.dom_state(&page).await?;
-            page.note_state(&state).await;
-            if manual_reason(&state).is_some()
-                || page_phase(&state) != PagePhase::Ready
-                || state["preflight_idle"] != true
-            {
-                return Ok(false);
-            }
-            if sample < 3 {
-                sleep(Duration::from_millis(350)).await;
-            }
-        }
-        page.diagnostic("preflight_idle_confirmed", "").await;
-        Ok(true)
     }
 
     /// A completion callback already contains the trusted-by-transport but
@@ -2445,33 +2413,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_idle_requires_submitted_prompt_and_stable_idle_ui() {
-        let (port, state, server) = spawn_mock().await;
-        state.lock().await.verified = true;
-        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
-        browser.open("agent-idle").await.expect("open");
-        assert!(!browser.preflight_idle("agent-idle").await.expect("unsent"));
-
-        let page = browser.page("agent-idle").await.expect("page");
-        page.submission_attempted.store(true, Ordering::Release);
-        *page.pending_before.lock().await = Some(0);
-        state.lock().await.generating = true;
-        assert!(!browser.preflight_idle("agent-idle").await.expect("busy"));
-        state.lock().await.generating = false;
-        assert!(browser.preflight_idle("agent-idle").await.expect("idle"));
-        browser.complete("agent-idle").await.expect("stop polling");
-        assert!(
-            !browser
-                .preflight_idle("agent-idle")
-                .await
-                .expect("completed")
-        );
-
-        browser.shutdown().await;
-        server.abort();
-    }
-
-    #[tokio::test]
     async fn send_waits_for_known_control_instead_of_enter_during_previous_turn() {
         let (port, state, server) = spawn_mock().await;
         {
@@ -2753,7 +2694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_preflight_cannot_recreate_a_lost_conversation() {
+    async fn completed_turn_cannot_recreate_a_lost_conversation() {
         let (port, state, server) = spawn_mock().await;
         let session = test_session(port).await;
         let tab = session.first_tab().await.expect("tab");
