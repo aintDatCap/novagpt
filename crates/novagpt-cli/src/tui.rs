@@ -73,7 +73,7 @@ impl TerminalGuard {
 /// Preparing the shared HTTP token is safe and idempotent on every launch.
 /// Guided setup still never starts an MCP server automatically.
 fn initial_effects(app: &mut model::App) -> Vec<model::Effect> {
-    let mut effects = vec![model::Effect::EnsureToken];
+    let mut effects = vec![model::Effect::EnsureToken, model::Effect::LoadSessions];
     if let Some(effect) = app.start_on_launch() {
         effects.push(effect);
     }
@@ -143,7 +143,7 @@ mod tests {
         let mut regular = app();
         assert!(matches!(
             initial_effects(&mut regular).as_slice(),
-            [Effect::EnsureToken]
+            [Effect::EnsureToken, Effect::LoadSessions]
         ));
         let autostart = LocalSettings {
             auto_start_mcp: true,
@@ -152,12 +152,12 @@ mod tests {
         let mut regular = App::new(PathBuf::from("."), autostart.clone(), false, vec![]);
         assert!(matches!(
             initial_effects(&mut regular).as_slice(),
-            [Effect::EnsureToken, Effect::Start(_)]
+            [Effect::EnsureToken, Effect::LoadSessions, Effect::Start(_)]
         ));
         let mut setup = App::new(PathBuf::from("."), autostart, true, vec![]);
         assert!(matches!(
             initial_effects(&mut setup).as_slice(),
-            [Effect::EnsureToken]
+            [Effect::EnsureToken, Effect::LoadSessions]
         ));
         assert_eq!(setup.server, ServerState::Stopped);
     }
@@ -176,13 +176,15 @@ mod tests {
         a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 2);
         a.key(key(KeyCode::Tab));
+        assert_eq!(a.tab, 3);
+        a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 0);
         a.key(key(KeyCode::BackTab));
-        assert_eq!(a.tab, 2);
+        assert_eq!(a.tab, 3);
         a.key(key(KeyCode::Left));
-        assert_eq!(a.tab, 1);
-        a.key(key(KeyCode::Right));
         assert_eq!(a.tab, 2);
+        a.key(key(KeyCode::Right));
+        assert_eq!(a.tab, 3);
         a.key(key(KeyCode::Tab));
         let selected = a.key(key(KeyCode::Char('4')));
         assert_eq!(a.command, 2);
@@ -1106,5 +1108,187 @@ mod tests {
         assert!(displayed.contains("MCP restart required"));
         let ctrl = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(matches!(a.key(ctrl), Some(Effect::Quit)));
+    }
+
+    fn app_with(settings: LocalSettings) -> App {
+        App::new(PathBuf::from("."), settings, false, vec![])
+    }
+    fn browser_settings() -> LocalSettings {
+        LocalSettings {
+            browser_enabled: true,
+            ..LocalSettings::default()
+        }
+    }
+    fn screen_of(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn chat_page_types_sends_and_ignores_a_second_send_while_pending() {
+        let mut a = app_with(browser_settings());
+        a.tab = 3;
+        for ch in "ciao".chars() {
+            a.key(key(KeyCode::Char(ch)));
+        }
+        let effect = a.key(key(KeyCode::Enter));
+        let Some(Effect::ChatSend { prompt, .. }) = effect else {
+            panic!("expected a chat send effect");
+        };
+        assert_eq!(prompt, "ciao");
+        assert!(a.chat.input.is_empty());
+        assert!(a.chat.pending);
+        assert_eq!(a.chat.messages.len(), 1);
+        assert_eq!(a.chat.messages[0].text, "ciao");
+        // A second Enter while a reply is pending must not queue another prompt.
+        assert!(a.key(key(KeyCode::Enter)).is_none());
+        assert_eq!(a.chat.messages.len(), 1);
+    }
+
+    #[test]
+    fn chat_requires_the_browser_setting() {
+        let mut a = app();
+        a.tab = 3;
+        a.key(key(KeyCode::Char('x')));
+        assert!(a.key(key(KeyCode::Enter)).is_none());
+        assert!(!a.chat.pending);
+        assert!(a.status.to_lowercase().contains("browser"));
+    }
+
+    #[test]
+    fn chat_reply_is_shown_and_links_the_conversation() {
+        let mut a = app_with(browser_settings());
+        a.tab = 3;
+        a.chat.pending = true;
+        a.on_event(OperationEvent::ChatFinished(Ok(model::ChatOutcome {
+            content: "risposta".into(),
+            conversation_url: Some("https://chatgpt.com/c/aaa".into()),
+        })));
+        assert!(!a.chat.pending);
+        assert_eq!(
+            a.chat.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/aaa")
+        );
+        assert_eq!(a.chat.messages.back().expect("reply").text, "risposta");
+        assert_eq!(
+            a.chat.messages.back().expect("reply").role,
+            model::ChatRole::Assistant
+        );
+    }
+
+    fn session(kind: crate::sessions::SessionKind, url: &str) -> crate::sessions::SessionRecord {
+        crate::sessions::SessionRecord {
+            id: "tui-chat".into(),
+            kind,
+            url: url.into(),
+            created_ms: 1,
+            updated_ms: 2,
+            workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn reopening_a_tui_session_restores_its_conversation_url() {
+        let mut a = app_with(browser_settings());
+        a.sessions = vec![session(
+            crate::sessions::SessionKind::Chat,
+            "https://chatgpt.com/c/aaa",
+        )];
+        a.tab = 3;
+        let effect = a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(effect, Some(Effect::LoadSessions)));
+        assert!(matches!(a.modal, Some(Modal::Sessions)));
+        let effect = a.key(key(KeyCode::Enter));
+        let Some(Effect::ReopenSession { url, chat, .. }) = effect else {
+            panic!("expected a reopen effect");
+        };
+        assert!(chat);
+        assert_eq!(url, "https://chatgpt.com/c/aaa");
+        assert_eq!(
+            a.chat.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/aaa")
+        );
+        assert_eq!(a.chat.messages.len(), 1);
+        assert_eq!(a.chat.messages[0].role, model::ChatRole::Notice);
+        assert_eq!(a.tab, 3);
+    }
+
+    #[test]
+    fn reopening_a_subagent_session_opens_a_browser_tab_instead_of_the_chat_page() {
+        let mut a = app_with(browser_settings());
+        a.sessions = vec![session(
+            crate::sessions::SessionKind::Subagent,
+            "https://chatgpt.com/c/bbb",
+        )];
+        a.tab = 0;
+        a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(a.modal, Some(Modal::Sessions)));
+        let effect = a.key(key(KeyCode::Enter));
+        let Some(Effect::ReopenSession { chat, url, .. }) = effect else {
+            panic!("expected a reopen effect");
+        };
+        assert!(!chat);
+        assert_eq!(url, "https://chatgpt.com/c/bbb");
+        assert_eq!(
+            a.tab, 0,
+            "subagent sessions open a browser tab, not the chat page"
+        );
+    }
+
+    #[test]
+    fn project_url_edit_normalizes_and_rejects_other_origins() {
+        let mut a = app_with(browser_settings());
+        a.tab = 2;
+        a.config = 17;
+        assert!(a.key(key(KeyCode::Enter)).is_none());
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Edit(model::Field::ProjectUrl))
+        ));
+        for ch in "https://evil.test/g/g-p-a/project".chars() {
+            a.key(key(KeyCode::Char(ch)));
+        }
+        a.key(key(KeyCode::Enter));
+        assert!(matches!(a.modal, Some(Modal::Edit(_))));
+        assert!(a.input_error.is_some());
+        while !a.input.is_empty() {
+            a.key(key(KeyCode::Backspace));
+        }
+        for ch in "https://chatgpt.com/g/g-p-abc/project/".chars() {
+            a.key(key(KeyCode::Char(ch)));
+        }
+        a.key(key(KeyCode::Enter));
+        assert!(a.modal.is_none());
+        assert_eq!(
+            a.draft.chatgpt_project_url.as_deref(),
+            Some("https://chatgpt.com/g/g-p-abc/project")
+        );
+    }
+
+    #[test]
+    fn chat_page_and_sessions_modal_render_without_prompt_content() {
+        let mut a = app_with(browser_settings());
+        a.tab = 3;
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).expect("terminal");
+        terminal.draw(|frame| render::draw(frame, &a)).unwrap();
+        let shown = screen_of(&terminal);
+        assert!(shown.contains("CHATGPT CHAT"));
+        assert!(shown.contains("No messages yet"));
+        assert!(shown.contains("Message"));
+        a.sessions = vec![session(
+            crate::sessions::SessionKind::Chat,
+            "https://chatgpt.com/c/aaa",
+        )];
+        a.modal = Some(Modal::Sessions);
+        terminal.draw(|frame| render::draw(frame, &a)).unwrap();
+        let shown = screen_of(&terminal);
+        assert!(shown.contains("CHATGPT SESSIONS"));
+        assert!(shown.contains("https://chatgpt.com/c/aaa"));
+        assert!(shown.contains("TUI chat"));
     }
 }

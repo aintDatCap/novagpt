@@ -781,6 +781,13 @@ impl ChatGptBrowser {
         self.open_url(id, &self.start_url(), false).await
     }
 
+    /// Open a fresh ChatGPT conversation at the account home, deliberately
+    /// outside the designated subagent project. The interactive TUI chat uses
+    /// this so its own conversations stay in normal ChatGPT history.
+    pub async fn open_home(&self, id: &str) -> Result<(), BrowserError> {
+        self.open_url(id, HOME, true).await
+    }
+
     /// Reopen an existing ChatGPT conversation in a new owned tab. Only a
     /// validated `https://chatgpt.com/c/<id>` URL is accepted. The reopened
     /// tab skips the project guard: the conversation already exists in the
@@ -2678,6 +2685,33 @@ mod tests {
         .await
         .expect("send timeout")
         .expect("reopened send");
+        assert_eq!(reply.content, "Fixture answer");
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tui_chat_tab_stays_outside_the_subagent_project() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.verified = true;
+            mock.chat_url = "https://chatgpt.com/".into();
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser
+            .set_project_url(Some("https://chatgpt.com/g/g-p-abc123/project"))
+            .expect("valid project");
+        browser.open_home("tui-chat").await.expect("home tab");
+        assert_eq!(state.lock().await.url, "https://chatgpt.com/");
+        // The project guard must not reject a deliberate non-project chat.
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("tui-chat", "Fixture prompt"),
+        )
+        .await
+        .expect("send timeout")
+        .expect("chat send");
         assert_eq!(reply.content, "Fixture answer");
         browser.shutdown().await;
         server.abort();

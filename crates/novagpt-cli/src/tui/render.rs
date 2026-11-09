@@ -1,6 +1,7 @@
 //! Stateless Ratatui widgets and responsive layout (Ratatui 0.29).
 use super::model::{
-    App, AuthState, Confirm, Field, Level, Modal, ServerState, command_label, config_label,
+    App, AuthState, ChatRole, Confirm, Field, Level, Modal, ServerState, command_label,
+    config_label,
 };
 use crate::i18n::{Language, LanguageChoice, Messages};
 use ratatui::{
@@ -75,6 +76,10 @@ fn shorten(value: &str, width: usize) -> String {
         .rev()
         .collect();
     format!("… {tail}")
+}
+fn clock(ms: u64) -> String {
+    let seconds = ms / 1000 % 86_400;
+    format!("{:02}:{:02}", seconds / 3600, seconds / 60 % 60)
 }
 fn clip_label(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
@@ -203,6 +208,14 @@ fn config_value(app: &App, index: usize) -> String {
                 },
             ),
         },
+        17 => format!(
+            "{}{}",
+            app.draft
+                .chatgpt_project_url
+                .as_deref()
+                .unwrap_or(Messages::not_set(lang)),
+            dirty_mark(app.draft.chatgpt_project_url != app.persisted.chatgpt_project_url)
+        ),
         _ => Messages::setup_step(lang, app.step.min(3) + 1),
     }
 }
@@ -472,6 +485,7 @@ fn config_help(index: usize, lang: Language) -> &'static str {
         13 => Messages::import_novagpt_help(lang),
         15 => Messages::choose_english_italian_or_automatic_system_language(lang),
         16 => Messages::auto_start_mcp_help(lang),
+        17 => Messages::chatgpt_project_url_help(lang),
         _ => Messages::next_setup_help(lang),
     }
 }
@@ -518,7 +532,7 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let group = match i {
             15 => Messages::settings_general(lang),
             0 | 16 | 11 | 12 | 10 => Messages::settings_connection(lang),
-            2 | 3 => Messages::settings_browser_heading(lang),
+            2 | 3 | 17 => Messages::settings_browser_heading(lang),
             1 => Messages::virtual_machines(lang),
             4 | 5 => Messages::authorized_directories(lang),
             6 | 7 | 13 => Messages::import(lang),
@@ -610,6 +624,81 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), split[1]);
     }
 }
+fn chat(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let lang = app.language();
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+    let visible = sections[0].height.saturating_sub(2) as usize;
+    let total = app.chat.messages.len();
+    let end = total.saturating_sub(app.chat.scroll);
+    let start = end.saturating_sub(visible);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for message in app
+        .chat
+        .messages
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
+        let (prefix, color) = match message.role {
+            ChatRole::User => (Messages::chat_role_you(lang), ACCENT),
+            ChatRole::Assistant => (Messages::chat_role_chatgpt(lang), OK),
+            ChatRole::Notice => (Messages::chat_role_note(lang), MUTED),
+        };
+        let mut first = true;
+        for line in message.text.lines() {
+            if first {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{prefix}> "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(line.to_owned()),
+                ]));
+                first = false;
+            } else {
+                lines.push(Line::from(format!("   {line}")));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            Messages::chat_empty(lang),
+            Style::default().fg(MUTED),
+        )));
+    }
+    let title = if app.chat.pending {
+        Messages::chat_sending(lang)
+    } else {
+        Messages::chat_page_title(lang)
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(panel(title)),
+        sections[0],
+    );
+    let status = app
+        .chat
+        .error
+        .clone()
+        .unwrap_or_else(|| Messages::chat_input_hint(lang).to_owned());
+    let status_color = if app.chat.error.is_some() { BAD } else { MUTED };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("{}▏", app.chat.input),
+                Style::default().fg(Color::White),
+            )),
+            Line::from(Span::styled(status, Style::default().fg(status_color))),
+        ])
+        .block(panel(Messages::chat_input_title(lang))),
+        sections[1],
+    );
+}
 fn centered(area: Rect, percent_w: u16, h: u16) -> Rect {
     let width = area
         .width
@@ -667,6 +756,7 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
                 Field::Root => Messages::add_authorized_directory(lang),
                 Field::NgrokDomain => Messages::ngrok_domain_hostname(lang),
                 Field::NovaSource => Messages::edit_novagpt_source_path(lang),
+                Field::ProjectUrl => Messages::chatgpt_project_url(lang),
             };
             (
                 title.into(),
@@ -677,6 +767,40 @@ fn modal(frame: &mut Frame<'_>, app: &App) {
                     app.input_error.as_deref().unwrap_or("")
                 ),
                 Messages::enter_apply_esc_cancel(lang).into(),
+            )
+        }
+        Modal::Sessions => {
+            let body = if app.sessions.is_empty() {
+                Messages::sessions_empty(lang).to_owned()
+            } else {
+                app.sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| {
+                        let kind = match record.kind {
+                            crate::sessions::SessionKind::Chat => Messages::session_kind_chat(lang),
+                            crate::sessions::SessionKind::Subagent => {
+                                Messages::session_kind_subagent(lang)
+                            }
+                        };
+                        format!(
+                            "{} [{kind}] {}  {}",
+                            if index == app.session_selection {
+                                "›"
+                            } else {
+                                " "
+                            },
+                            shorten(&record.url, 44),
+                            clock(record.updated_ms),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            (
+                Messages::sessions_title(lang).into(),
+                body,
+                Messages::sessions_hint(lang).into(),
             )
         }
         Modal::Roots => (
@@ -847,6 +971,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         Messages::tab_overview(lang),
         Messages::tab_activity(lang),
         Messages::tab_settings(lang),
+        Messages::tab_chat(lang),
     ])
     .select(app.tab)
     .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -855,7 +980,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
     match app.tab {
         0 => commands(frame, app, slots[2]),
         1 => dashboard(frame, app, slots[2]),
-        _ => config(frame, app, slots[2]),
+        2 => config(frame, app, slots[2]),
+        _ => chat(frame, app, slots[2]),
     }
     let keys = if app.modal.is_some() {
         Messages::enter_confirm_esc_cancel(lang)
@@ -863,7 +989,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         match app.tab {
             0 => Messages::keys_overview(lang),
             1 => Messages::keys_activity(lang),
-            _ => Messages::fields_enter_edit_s_save_tab_views(lang),
+            2 => Messages::fields_enter_edit_s_save_tab_views(lang),
+            _ => Messages::chat_input_hint(lang),
         }
     };
     let foot = vec![

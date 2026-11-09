@@ -1,5 +1,6 @@
 //! UI state and pure keyboard transitions. Effects are executed by operations.rs.
 use crate::i18n::{self, Language};
+use crate::sessions::{SessionKind, SessionRecord};
 use crate::settings::{ImportProfile, LocalSettings};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -27,8 +28,8 @@ pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
     }
 }
 
-pub(super) const CONFIG_ORDER: [usize; 17] =
-    [15, 0, 16, 11, 12, 10, 2, 3, 1, 4, 5, 6, 7, 13, 8, 9, 14];
+pub(super) const CONFIG_ORDER: [usize; 18] =
+    [15, 0, 16, 11, 12, 10, 2, 3, 17, 1, 4, 5, 6, 7, 13, 8, 9, 14];
 pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
     match index {
         0 => i18n::Messages::http_port(lang),
@@ -48,6 +49,7 @@ pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
         14 => i18n::Messages::next_setup_step(lang),
         15 => i18n::Messages::settings_language(lang),
         16 => i18n::Messages::auto_start_mcp(lang),
+        17 => i18n::Messages::chatgpt_project_url(lang),
         _ => "",
     }
 }
@@ -59,6 +61,38 @@ pub(super) enum Level {
     Warn,
     Error,
     Success,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChatRole {
+    User,
+    Assistant,
+    Notice,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ChatMessage {
+    pub role: ChatRole,
+    pub text: String,
+}
+
+/// In-memory transcript for the chat page. Prompts and replies are never
+/// persisted: ChatGPT remains the owner of the conversation history, and the
+/// TUI only remembers which conversation URL to continue.
+#[derive(Default)]
+pub(super) struct ChatState {
+    pub messages: VecDeque<ChatMessage>,
+    pub input: String,
+    pub pending: bool,
+    pub scroll: usize,
+    pub conversation_url: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub(super) struct ChatOutcome {
+    pub content: String,
+    pub conversation_url: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub(super) struct LogEntry {
@@ -86,6 +120,7 @@ pub(super) enum Field {
     Root,
     NgrokDomain,
     NovaSource,
+    ProjectUrl,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Confirm {
@@ -108,6 +143,7 @@ pub(super) enum Modal {
     ImportPreview,
     SetupResult(String),
     ConnectorUrl(String),
+    Sessions,
 }
 #[derive(Clone, Debug)]
 pub(super) enum Effect {
@@ -128,6 +164,17 @@ pub(super) enum Effect {
     ShowSubagentChrome,
     LoadAudit,
     ExportAudit,
+    LoadSessions,
+    ChatSend {
+        prompt: String,
+        settings: LocalSettings,
+    },
+    ChatNew,
+    ReopenSession {
+        url: String,
+        chat: bool,
+        settings: LocalSettings,
+    },
     Quit,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +203,12 @@ pub(super) enum OperationEvent {
     BrowserShowFinished(Result<(), ()>),
     AuditLoaded(Result<Vec<novagpt_mcp::AuditEvent>, String>),
     AuditExported(Result<PathBuf, String>),
+    ChatFinished(Result<ChatOutcome, String>),
+    SessionsLoaded(Vec<SessionRecord>),
+    SessionReopened {
+        chat: bool,
+        result: Result<(), String>,
+    },
     Saved {
         settings: LocalSettings,
         outcome: Result<String, String>,
@@ -193,6 +246,9 @@ pub(super) struct App {
     pub log_offset: usize,
     pub status: String,
     pub clipboard_feedback: Option<String>,
+    pub chat: ChatState,
+    pub sessions: Vec<SessionRecord>,
+    pub session_selection: usize,
 }
 impl App {
     pub fn new(
@@ -246,6 +302,9 @@ impl App {
             log_offset: 0,
             status: "Ready".into(),
             clipboard_feedback: None,
+            chat: ChatState::default(),
+            sessions: Vec::new(),
+            session_selection: 0,
         };
         app.log(Level::Info, "NovaGPT started. Press ? for help.");
         app
@@ -282,7 +341,7 @@ impl App {
             })
     }
     pub fn config_len(&self) -> usize {
-        if self.setup { 17 } else { 16 }
+        if self.setup { 18 } else { 17 }
     }
 
     pub fn config_order(&self) -> &'static [usize] {
@@ -549,6 +608,49 @@ impl App {
                     Err(msg) => self.log(Level::Error, msg),
                 }
             }
+            OperationEvent::ChatFinished(outcome) => {
+                self.chat.pending = false;
+                match outcome {
+                    Ok(outcome) => {
+                        if let Some(url) = outcome.conversation_url {
+                            self.chat.conversation_url = Some(url);
+                        }
+                        self.chat.messages.push_back(ChatMessage {
+                            role: ChatRole::Assistant,
+                            text: outcome.content,
+                        });
+                        self.chat.scroll = 0;
+                    }
+                    Err(message) => {
+                        self.chat.error =
+                            Some(i18n::Messages::chat_failed(self.language()).to_owned());
+                        self.log(Level::Error, message);
+                    }
+                }
+            }
+            OperationEvent::SessionsLoaded(records) => {
+                self.sessions = records;
+                self.session_selection = self
+                    .session_selection
+                    .min(self.sessions.len().saturating_sub(1));
+            }
+            OperationEvent::SessionReopened { chat, result } => match result {
+                Ok(()) => {
+                    if chat {
+                        self.log_localized(Level::Success, i18n::Messages::chat_reopened);
+                    } else {
+                        self.log_localized(Level::Success, i18n::Messages::session_opened);
+                    }
+                }
+                Err(message) => {
+                    if chat {
+                        self.chat.conversation_url = None;
+                        self.chat.error =
+                            Some(i18n::Messages::session_open_failed(self.language()).to_owned());
+                    }
+                    self.log(Level::Error, message);
+                }
+            },
             OperationEvent::Saved { settings, outcome } => {
                 self.busy = false;
                 match outcome {
@@ -765,6 +867,101 @@ impl App {
             _ => None,
         }
     }
+    fn chat_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        match key.code {
+            KeyCode::Esc => self.tab = 0,
+            KeyCode::Tab => self.tab = (self.tab + 1) % 4,
+            KeyCode::BackTab => self.tab = (self.tab + 3) % 4,
+            KeyCode::Left => self.tab = 2,
+            KeyCode::Right => self.tab = 0,
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.chat = ChatState::default();
+                self.log_localized(Level::Info, i18n::Messages::chat_new_conversation);
+                return Some(Effect::ChatNew);
+            }
+            KeyCode::Enter => return self.send_chat(),
+            KeyCode::Backspace => {
+                self.chat.input.pop();
+                self.chat.error = None;
+            }
+            KeyCode::Up => {
+                self.chat.scroll =
+                    (self.chat.scroll + 1).min(self.chat.messages.len().saturating_sub(1))
+            }
+            KeyCode::Down => self.chat.scroll = self.chat.scroll.saturating_sub(1),
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.chat.input.len() < 8_000 =>
+            {
+                self.chat.input.push(ch);
+                self.chat.error = None;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn send_chat(&mut self) -> Option<Effect> {
+        if self.chat.pending {
+            self.log_localized(Level::Info, i18n::Messages::chat_pending_note);
+            return None;
+        }
+        if !self.persisted.browser_enabled {
+            self.log_localized(Level::Warn, i18n::Messages::chat_browser_required);
+            return None;
+        }
+        let prompt = self.chat.input.trim().to_owned();
+        if prompt.is_empty() {
+            return None;
+        }
+        self.chat.input.clear();
+        self.chat.error = None;
+        self.chat.scroll = 0;
+        self.chat.messages.push_back(ChatMessage {
+            role: ChatRole::User,
+            text: prompt.clone(),
+        });
+        self.chat.pending = true;
+        Some(Effect::ChatSend {
+            prompt,
+            settings: self.persisted.clone(),
+        })
+    }
+
+    fn open_sessions(&mut self) -> Option<Effect> {
+        self.session_selection = self
+            .session_selection
+            .min(self.sessions.len().saturating_sub(1));
+        self.modal = Some(Modal::Sessions);
+        // Refresh from disk so conversations recorded by the MCP server appear.
+        Some(Effect::LoadSessions)
+    }
+
+    fn reopen(&mut self, record: SessionRecord) -> Option<Effect> {
+        let chat = record.kind == SessionKind::Chat;
+        if chat {
+            self.tab = 3;
+            self.chat = ChatState {
+                conversation_url: Some(record.url.clone()),
+                ..ChatState::default()
+            };
+            self.chat.messages.push_back(ChatMessage {
+                role: ChatRole::Notice,
+                text: i18n::Messages::chat_reopened_history_note(self.language()).to_owned(),
+            });
+            self.log_localized(Level::Info, i18n::Messages::chat_reopening);
+        } else {
+            self.log_localized(Level::Info, i18n::Messages::session_opening_in_browser);
+        }
+        Some(Effect::ReopenSession {
+            url: record.url,
+            chat,
+            settings: self.persisted.clone(),
+        })
+    }
+
     fn notice(&mut self, title: &str, body: &str) {
         self.modal = Some(Modal::Notice {
             title: title.into(),
@@ -789,6 +986,7 @@ impl App {
             Field::Root => String::new(),
             Field::NgrokDomain => self.draft.ngrok_domain.clone().unwrap_or_default(),
             Field::NovaSource => String::new(),
+            Field::ProjectUrl => self.draft.chatgpt_project_url.clone().unwrap_or_default(),
         };
         self.input_error = None;
         self.modal = Some(Modal::Edit(field));
@@ -833,6 +1031,22 @@ impl App {
                 self.input.clear();
                 self.busy = true;
                 return Some(Effect::LoadNovaSource(folder));
+            }
+            Field::ProjectUrl => {
+                let normalized = if value.is_empty() {
+                    None
+                } else {
+                    match novagpt_browser::project::project_url(value) {
+                        Some(url) => Some(url),
+                        None => {
+                            self.input_error = Some(
+                                i18n::Messages::chatgpt_project_invalid(self.language()).into(),
+                            );
+                            return None;
+                        }
+                    }
+                };
+                self.draft.chatgpt_project_url = normalized;
             }
             Field::Root => {
                 if value.is_empty() {
@@ -944,6 +1158,7 @@ impl App {
             14 if self.setup && self.step < 4 => {
                 self.step = (self.step + 1).min(3);
             }
+            17 => self.start_edit(Field::ProjectUrl),
             _ => {}
         }
         None
@@ -1072,6 +1287,24 @@ impl App {
                     }
                     _ => {}
                 },
+                Modal::Sessions => match key.code {
+                    KeyCode::Esc => self.modal = None,
+                    KeyCode::Up => {
+                        self.session_selection = self.session_selection.saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        self.session_selection =
+                            (self.session_selection + 1).min(self.sessions.len().saturating_sub(1))
+                    }
+                    KeyCode::Enter => {
+                        let record = self.sessions.get(self.session_selection).cloned();
+                        self.modal = None;
+                        if let Some(record) = record {
+                            return self.reopen(record);
+                        }
+                    }
+                    _ => {}
+                },
                 Modal::Roots => match key.code {
                     KeyCode::Esc => self.modal = None,
                     KeyCode::Up => self.root_selection = self.root_selection.saturating_sub(1),
@@ -1097,6 +1330,13 @@ impl App {
             }
             return None;
         }
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // The session list is global, so it is reachable from every page.
+            return self.open_sessions();
+        }
+        if self.tab == 3 {
+            return self.chat_key(key);
+        }
         match key.code {
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('a') if self.tab == 0 => {
@@ -1105,10 +1345,10 @@ impl App {
                     self.command = self.visible_commands()[0];
                 }
             }
-            KeyCode::Tab => self.tab = (self.tab + 1) % 3,
-            KeyCode::BackTab => self.tab = (self.tab + 2) % 3,
-            KeyCode::Left => self.tab = (self.tab + 2) % 3,
-            KeyCode::Right => self.tab = (self.tab + 1) % 3,
+            KeyCode::Tab => self.tab = (self.tab + 1) % 4,
+            KeyCode::BackTab => self.tab = (self.tab + 3) % 4,
+            KeyCode::Left => self.tab = (self.tab + 3) % 4,
+            KeyCode::Right => self.tab = (self.tab + 1) % 4,
             KeyCode::Char('h') if self.tab == 1 && !self.busy => {
                 if self.audit_view {
                     self.audit_view = false;
