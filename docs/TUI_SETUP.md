@@ -10,10 +10,10 @@ NovaGPT's interactive terminal interface (TUI) has four pages: **Overview**, **A
 | `↑` / `↓` | Select actions/settings or scroll events/messages |
 | `Enter` | Run an action, edit a field, or confirm (in Chat: send) |
 | `Esc` | Close a dialog or cancel an edit (in Chat: return to Overview) |
-| `s` | Save settings (with confirmation) |
+| `s` | Save settings (with confirmation; in Chat the key is typed) |
 | `a` | Show or hide advanced actions on Overview |
-| `?` | Show help |
-| `q` / `Ctrl+C` | Quit and restore the terminal |
+| `?` | Show help (in Chat the key is typed) |
+| `q` / `Ctrl+C` | Quit and restore the terminal (in Chat use `Ctrl+C`) |
 | `PgUp` / `PgDn` | Scroll Activity events |
 | `h` (Activity) | Toggle live activity and the last 2,000 saved audit events |
 | `e` (Activity) | Confirm ZSTD support-log export |
