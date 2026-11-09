@@ -213,7 +213,18 @@ impl App {
             show_advanced: false,
             tunnel_ready: false,
             config: 0,
-            system_language: i18n::detect_system(),
+            // Unit tests must not depend on the host locale; the real launcher
+            // resolves the system language once here.
+            system_language: {
+                #[cfg(test)]
+                {
+                    Language::English
+                }
+                #[cfg(not(test))]
+                {
+                    i18n::detect_system()
+                }
+            },
             profile: 0,
             root_selection: 0,
             server: ServerState::Stopped,

@@ -36,6 +36,9 @@ impl LanguageChoice {
     }
 }
 
+/// Resolve the host UI language. Only the real launcher calls this; unit tests
+/// pin English so assertions never depend on the developer's locale.
+#[cfg_attr(test, allow(dead_code))]
 pub fn detect_system() -> Language {
     language_from_tag(sys_locale::get_locale().as_deref())
 }
