@@ -346,11 +346,14 @@ mod tests {
         options
             .add_argument("--disable-background-networking")
             .unwrap();
-        let profile = Path::new("/tmp/novagpt-dedicated");
-        let args = options.launch_arguments(profile, 4567, "en-US").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("novagpt-dedicated");
+        let args = options
+            .launch_arguments(&profile, 4567, "en-US")
+            .unwrap();
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
         assert!(args.contains(&"--remote-debugging-port=4567".to_owned()));
-        assert!(args.contains(&"--user-data-dir=/tmp/novagpt-dedicated".to_owned()));
+        assert!(args.contains(&format!("--user-data-dir={}", profile.display())));
         assert!(args.contains(&"--headless=new".to_owned()));
         assert!(!args.iter().any(|arg| arg == "--no-sandbox"));
         assert!(!args.iter().any(|arg| arg == "--enable-automation"));
@@ -370,8 +373,8 @@ mod tests {
                 .launch_arguments(Path::new("relative"), 4567, "en-US")
                 .is_err()
         );
-        assert!(options.launch_arguments(profile, 0, "en-US").is_ok());
-        assert!(options.launch_arguments(profile, 4567, "en US").is_err());
+        assert!(options.launch_arguments(&profile, 0, "en-US").is_ok());
+        assert!(options.launch_arguments(&profile, 4567, "en US").is_err());
     }
 
     #[test]

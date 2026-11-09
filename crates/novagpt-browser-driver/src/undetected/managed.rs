@@ -579,9 +579,10 @@ pub async fn resolve_stable(store: &ChromeDriverStore) -> Result<DriverRelease, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
+    #[cfg(unix)]
     fn shell_fixture(body: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/novagpt-test-fixtures");
         std::fs::create_dir_all(&base).unwrap();
@@ -600,6 +601,7 @@ mod tests {
         (directory, path)
     }
 
+    #[cfg(unix)]
     fn driver_bytes(version: &str, patched: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\x7fELF-novagpt\nplatform_handle\x00content\x00");
@@ -639,6 +641,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mismatched_explicit_driver_is_rejected_before_browser_launch() {
         let (_chrome_dir, chrome) = shell_fixture("echo 'Google Chrome 156.0.8078.47'");
@@ -652,6 +655,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn duplicate_profile_launch_is_rejected_without_touching_the_owner() {
         let (_chrome_dir, chrome) = shell_fixture("echo 'Google Chrome 156.0.8078.47'");

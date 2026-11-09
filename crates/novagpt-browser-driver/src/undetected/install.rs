@@ -940,7 +940,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_layout_is_selected_for_old_milestones() {
         let version = "114.0.5735.90";
-        let zip = zip_with(&[("chromedriver", &driver_bytes(version, false))]);
+        // Legacy archives embed the platform binary name, which carries the
+        // `.exe` suffix on Windows.
+        let entry = platform().legacy_archive_binary_path();
+        let zip = zip_with(&[(entry, &driver_bytes(version, false))]);
         let release_url = manifest::legacy_release_url(114);
         let download_url = manifest::legacy_download_url(version.parse().unwrap(), platform());
         let fetcher = Arc::new(StaticFetcher::new(response_map(&[
