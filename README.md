@@ -13,6 +13,7 @@ You run NovaGPT on your own machine. ChatGPT connects to it through a protected 
 - **Run commands:** execute development commands in your computer's normal shell.
 - **Connect multiple conversations:** different ChatGPT conversations can access the same project without copying it.
 - **Optional tools:** use a dedicated Chrome browser through NovaGPT-managed ChromeDriver, subagents or virtual machines when configured.
+- **Chat from the terminal:** ask ChatGPT from the built-in Chat page through the same dedicated browser, reopen earlier conversations, and keep subagent chats together in one optional ChatGPT project you can delete in one action.
 
 > **Security:** NovaGPT's shell runs with your user account's permissions; it is not sandboxed. Give access only to ChatGPT connections you trust. Keep your connector URL and token secret.
 
@@ -47,7 +48,7 @@ novagpt --setup
 
 Follow the setup guide, check your workspace and save the settings. On subsequent launches, just run `novagpt` to open the terminal interface.
 
-The **Overview** screen shows server and tunnel status, **Activity** shows events, and **Settings** lets you manage the connection and optional features. Interface language is detected automatically, with English as the fallback.
+The **Overview** screen shows server and tunnel status, **Activity** shows events, **Settings** lets you manage the connection and optional features, and **Chat** asks ChatGPT from the terminal through the dedicated browser. Interface language is detected automatically, with English as the fallback.
 
 ### 3. Connect ChatGPT
 

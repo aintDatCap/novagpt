@@ -36,7 +36,13 @@ The CLI/TUI can manage its own ngrok process and verify the matching upstream po
 
 ## User experience and lifecycle
 
-`novagpt` opens a three-page terminal UI: Overview, Activity and Settings. Guided `--setup` requires confirmation before it saves settings or creates a workspace-local launcher. The default UI language is Automatic, resolved from the system locale, with English fallback; all logs and diagnostics are in English.
+`novagpt` opens a four-page terminal UI: Overview, Activity, Settings and Chat. Guided `--setup` requires confirmation before it saves settings or creates a workspace-local launcher. The default UI language is Automatic, resolved from the system locale, with English fallback; all logs and diagnostics are in English.
+
+The Chat page asks the model through the same owned `ChatGptBrowser` instead of an HTTP client: prompts are composed in the visible, authenticated Chrome tab `tui-chat` and replies are read back, so no cookie or token is handled by NovaGPT. That tab is opened at the account home with `open_home()`, outside the optional subagent project. Prompt and reply text stay in memory for the current run only; ChatGPT remains the owner of history.
+
+Conversation URLs are recorded in a bounded, owner-private session index (`chat-sessions.json`, 0600, atomic replace) containing only opaque ids, kinds, validated `https://chatgpt.com/c/<id>` URLs and timestamps. Subagent conversations reach it through a narrow `AgentManager` observer that receives just `(agent id, URL)`. `Ctrl+O` lists the index; reopening a TUI chat continues that conversation in the chat page, while a subagent conversation opens in the existing browsing tab. A tampered or oversized index degrades to an empty list and is never used to navigate.
+
+The optional ChatGPT project URL makes every new subagent tab start on that project page, so the group can be deleted in ChatGPT at once. Before the first prompt the adapter refuses to submit if the page is no longer on the project (`ProjectMismatch`); reopened conversations and TUI chat tabs intentionally skip that guard. NovaGPT never creates or deletes the project itself. See [ADR 0004](decisions/0004-browser-mediated-tui-chat.md).
 
 The TUI Activity page can display up to 2,000 recent persisted audit events (H switches back to live events); E prompts for an owner-private ZSTD metadata export. Both actions are also in the advanced Overview menu. Export creates a new file without upload or automatic clipboard sharing. The CLI supports logs tail and logs export, using the same validated records.
 
@@ -81,6 +87,7 @@ For local Rust iteration, `script/dev.py` builds once at startup and **never reb
 - Shell commands run with host permissions; subprocess-tree cleanup and full sandboxing are not guaranteed.
 - VM guest control and some optional integrations require live testing. The managed ChromeDriver transport passed disposable Chrome 156 tests covering launch, patch, four-tab isolation, reconnect, Chrome crash/restart, profile persistence across application restart, screenshots, and the ChatGPT adapter's local browsing path. Live ChatGPT authentication, challenge handling, and response completion remain unverified; this is not a fully managed cloud environment.
 - Adapter input requires a visible, focusable tab. A window manager that refuses focus produces `InteractionBlocked` (no prompt submitted) instead of hidden background input.
+- The TUI chat requires the ChatGPT browser feature and a visible Chrome; its transcript is not restored after a restart, and the live login/Cloudflare/reply path is still unverified. Live Chrome execution on Windows is untested.
 - Some filesystem writes are not crash-atomic on all platforms; path-swap defenses and adversarial concurrency require further review.
 - Public MCP transport session TTL, reconnect and load boundaries need additional integration tests.
 

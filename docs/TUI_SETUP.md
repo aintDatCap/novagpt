@@ -1,15 +1,15 @@
 # NovaGPT terminal interface
 
-NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **Activity** and **Settings**. Open it with `novagpt`, or run `novagpt --setup` for guided first-time configuration. Use `--root /absolute/path/to/project` to select a different workspace.
+NovaGPT's interactive terminal interface (TUI) has four pages: **Overview**, **Activity**, **Settings** and **Chat**. Open it with `novagpt`, or run `novagpt --setup` for guided first-time configuration. Use `--root /absolute/path/to/project` to select a different workspace.
 
 ## Navigation
 
 | Key | Action |
 | --- | --- |
 | `Tab` / `Shift+Tab` | Switch between pages |
-| `↑` / `↓` | Select actions/settings or scroll events |
-| `Enter` | Run an action, edit a field, or confirm |
-| `Esc` | Close a dialog or cancel an edit |
+| `↑` / `↓` | Select actions/settings or scroll events/messages |
+| `Enter` | Run an action, edit a field, or confirm (in Chat: send) |
+| `Esc` | Close a dialog or cancel an edit (in Chat: return to Overview) |
 | `s` | Save settings (with confirmation) |
 | `a` | Show or hide advanced actions on Overview |
 | `?` | Show help |
@@ -17,6 +17,8 @@ NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **
 | `PgUp` / `PgDn` | Scroll Activity events |
 | `h` (Activity) | Toggle live activity and the last 2,000 saved audit events |
 | `e` (Activity) | Confirm ZSTD support-log export |
+| `Ctrl+N` (Chat) | Start a new ChatGPT conversation |
+| `Ctrl+O` (any page) | List saved ChatGPT sessions and reopen one |
 
 ## Overview
 
@@ -26,10 +28,23 @@ NovaGPT's interactive terminal interface (TUI) has three pages: **Overview**, **
 - **Show / copy ChatGPT URL:** Reveal the complete private URL only after the server and tunnel are ready. Press **C** in the dialog to copy it. NovaGPT selects Wayland (`wl-copy`), X11 (`xclip`/`xsel`), WSL (`clip.exe`), macOS (`pbcopy`) or Windows (`clip.exe`) as appropriate. On Linux, install the appropriate clipboard utility if it is absent; the dialog displays an error instead of reporting a false success.
 - **Diagnostics and optional tools:** Verify workspace status, inspect VM images when enabled, or launch the dedicated browser login flow.
 - **Show subagent Chrome:** When MCP is running with ChatGPT Browser enabled, explicitly bring one existing subagent tab to the foreground without navigating or changing its work. If none exists, open a separate blank browsing tab in the same owned Chrome. This requires the desktop to allow window focus; it never opens a second browser profile. The separate manual-login action remains available only while MCP is stopped.
+- **ChatGPT sessions (Ctrl+O):** List the conversations NovaGPT opened and reopen one. A TUI chat continues in the Chat page; a subagent conversation opens in the browsing tab. Reopening never resubmits an earlier prompt.
 
 The advanced Overview actions also offer **Browse saved audit logs** and **Export support logs (ZSTD)**. Export asks for consent (No by default), creates a private file in the application-state exports directory, and never uploads or copies it automatically. Review the archive before sharing.
 
 If ngrok is **missing** when starting a tunnel, NovaGPT asks whether to install it using an available supported system package manager. The confirmation defaults to **No**. The installer needs the user's explicit consent, and ngrok account authentication remains a separate manual step. See the [ngrok setup guide](INSTALLATION.md#configure-ngrok-for-chatgpt-access).
+
+## Chat
+
+The Chat page asks ChatGPT directly from the terminal. It requires **Enable ChatGPT browser** in Settings and a visible Chrome window on the dedicated NovaGPT profile, because the prompt is typed into the real, authenticated page — NovaGPT never handles your cookies or account tokens.
+
+- Type a message and press **Enter**. The reply appears in the page when ChatGPT finishes; `↑`/`↓` scroll the local transcript.
+- **Ctrl+N** asks for a new conversation. **Ctrl+O** opens the session list: `↑`/`↓` select, **Enter** reopens.
+- The local transcript lasts for the current run only. ChatGPT keeps the real history, and a conversation URL is stored in the private session index so it can be reopened later.
+- If the MCP server is already running, Chat reuses its dedicated browser and tab set. Otherwise NovaGPT opens the browser lazily; when MCP is later started it reuses that browser instead of launching a second Chrome on the same profile.
+- A visible, focused tab is required for typing. If the desktop refuses focus, the send is rejected without submitting anything.
+
+The session index (`chat-sessions.json`) is owner-private and contains only opaque ids, conversation URLs and timestamps — never prompts, replies, cookies or tokens. A damaged or oversized index is ignored instead of being used.
 
 ## Settings
 
@@ -41,6 +56,7 @@ Settings are shared across the current operating-system user, regardless of the 
 - **Automatic ngrok:** When enabled, starting MCP normally also starts an owned ngrok tunnel.
 - **ngrok hostname:** Optional hostname already assigned to your ngrok account; only the hostname is accepted, without a scheme or path.
 - **Browser and virtual machines:** Disabled by default; enable only when needed.
+- **ChatGPT subagent project URL:** Optional project page such as `https://chatgpt.com/g/g-p-abc123/project`. When set, every new subagent conversation is created inside that project, so deleting the project in ChatGPT deletes the whole group. Create the project in ChatGPT first; NovaGPT never creates or deletes it. If ChatGPT leaves the project before the first prompt, the send is refused instead of creating a conversation outside it.
 - **Authorized directories:** Add or remove existing directories explicitly.
 - **Import NovaGPT workspace settings:** Preview and import selected connection preferences from another NovaGPT workspace configuration, with confirmation. Secrets and workspace permissions are not imported.
 
