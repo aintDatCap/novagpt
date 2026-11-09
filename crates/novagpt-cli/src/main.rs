@@ -6,6 +6,7 @@ mod driver;
 mod i18n;
 mod logging;
 mod ngrok_install;
+mod sessions;
 mod settings;
 mod token;
 mod tui;
@@ -493,10 +494,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browser = match (chrome, profile) {
         (Some(executable), Some(profile)) => {
             let browser = ChatGptBrowser::new(executable, profile)?;
-            Some(match cli.browser_dev_origin.as_deref() {
+            let browser = match cli.browser_dev_origin.as_deref() {
                 Some(origin) => browser.with_dev_origin(origin)?,
                 None => browser,
-            })
+            };
+            browser
+                .set_project_url(local.chatgpt_project_url.as_deref())
+                .map_err(|_| "Invalid ChatGPT project URL in saved settings")?;
+            Some(browser)
         }
         (None, None) => None,
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
@@ -504,12 +509,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audit = novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?;
     let agents = browser.as_ref().map(|browser| {
         let agent_audit = audit.clone();
+        let session_runtime = tokio::runtime::Handle::current();
         AgentManager::new(
             workspaces.clone(),
             Arc::new(ChatGptBackend::new(browser.clone())),
         )
         .with_diagnostic_reporter(move |id, stage| {
             agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+        })
+        .with_conversation_recorder(move |id, url| {
+            // Owner-private index only: no prompt or reply is written here.
+            let id = id.to_owned();
+            let url = url.to_owned();
+            session_runtime.spawn_blocking(move || {
+                if let Ok(store) = sessions::SessionStore::open_default() {
+                    let _ = store.record(sessions::SessionKind::Subagent, &id, &url, None);
+                }
+            });
         })
     });
     let browser_bridge = match (

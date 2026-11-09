@@ -430,6 +430,8 @@ impl Entry {
 }
 
 type AgentDiagnosticReporter = Arc<dyn Fn(&str, AgentLogStage) + Send + Sync>;
+/// Receives (agent id, conversation URL). Must not block.
+type ConversationRecorder = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 struct Inner {
     backend: Arc<dyn AgentBackend>,
@@ -440,6 +442,9 @@ struct Inner {
     /// Monotonic completion order for bounded tab eviction.
     next_completed_seq: AtomicU64,
     reporter: OnceLock<AgentDiagnosticReporter>,
+    /// Optional owner-facing session index observer. Receives the agent id and
+    /// the validated conversation URL; never prompts or replies.
+    conversation_recorder: OnceLock<ConversationRecorder>,
 }
 #[derive(Clone)]
 pub struct AgentManager {
@@ -457,6 +462,7 @@ impl AgentManager {
                 max_live_tabs: MAX_LIVE_TABS,
                 next_completed_seq: AtomicU64::new(1),
                 reporter: OnceLock::new(),
+                conversation_recorder: OnceLock::new(),
             }),
         }
     }
@@ -468,6 +474,18 @@ impl AgentManager {
         reporter: impl Fn(&str, AgentLogStage) + Send + Sync + 'static,
     ) -> Self {
         let _ = self.inner.reporter.set(Arc::new(reporter));
+        self
+    }
+
+    /// Configure one optional owner-facing session index observer. It receives
+    /// the agent id and the conversation URL so the TUI can list and reopen the
+    /// chat later. The callback must not block: the CLI forwards the value to a
+    /// blocking writer. It is never called for prompts or assistant text.
+    pub fn with_conversation_recorder(
+        self,
+        recorder: impl Fn(&str, &str) + Send + Sync + 'static,
+    ) -> Self {
+        let _ = self.inner.conversation_recorder.set(Arc::new(recorder));
         self
     }
 
@@ -674,6 +692,14 @@ impl AgentManager {
                 reply
             }
             .await;
+            // Record the conversation outside the per-agent lock; the observer
+            // is required to be non-blocking. A discarded stale reply may still
+            // have created a real ChatGPT conversation worth listing.
+            if let (Ok((_, Some(url))), Some(recorder)) =
+                (&outcome, manager.inner.conversation_recorder.get())
+            {
+                recorder(&id, url);
+            }
             // Serialize completion with an in-flight file patch for this agent.
             let Ok(patch_gate) = manager.patch_gate(&id).await else {
                 return;
@@ -1907,6 +1933,67 @@ mod tests {
             serde_json::json!({"ready":true})
         }
     }
+    struct UrlBackend;
+    #[async_trait]
+    impl AgentBackend for UrlBackend {
+        fn name(&self) -> &'static str {
+            "test-url"
+        }
+        fn model(&self) -> &'static str {
+            "fake"
+        }
+        async fn create(&self, _id: &str) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+        async fn send(
+            &self,
+            _id: &str,
+            prompt: &str,
+        ) -> Result<(String, Option<String>), BackendFailure> {
+            Ok((
+                format!("echo: {prompt}"),
+                Some("https://chatgpt.com/c/mock".into()),
+            ))
+        }
+        async fn cancel(&self, _id: &str) {}
+        async fn diagnostics(&self, _id: &str) -> serde_json::Value {
+            serde_json::json!({"ready":true})
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_recorder_receives_agent_id_and_conversation_url_only() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            Arc::new(UrlBackend),
+        )
+        .with_conversation_recorder(move |id, url| {
+            sink.lock()
+                .expect("sink")
+                .push((id.to_owned(), url.to_owned()));
+        });
+        let info = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "inspect only".into(),
+                role: AgentRole::Explorer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        manager.wait(&info.id, 2).await.expect("wait");
+        let seen = seen.lock().expect("seen");
+        assert_eq!(
+            seen.as_slice(),
+            [(info.id.clone(), "https://chatgpt.com/c/mock".to_owned())]
+        );
+    }
+
     #[tokio::test]
     async fn unnamed_read_only_roles_can_spawn_from_legacy_mcp_clients() {
         let dir = tempfile::tempdir().expect("fixture");

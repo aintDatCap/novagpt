@@ -44,6 +44,9 @@ pub struct LocalSettings {
     pub auto_start_mcp: bool,
     pub ngrok_enabled: bool,
     pub ngrok_domain: Option<String>,
+    /// Optional ChatGPT project page used as the start page for every new
+    /// subagent conversation, so the group can be deleted in one action.
+    pub chatgpt_project_url: Option<String>,
 }
 impl Default for LocalSettings {
     fn default() -> Self {
@@ -58,6 +61,7 @@ impl Default for LocalSettings {
             auto_start_mcp: false,
             ngrok_enabled: false,
             ngrok_domain: None,
+            chatgpt_project_url: None,
         }
     }
 }
@@ -195,6 +199,13 @@ impl LocalSettings {
             .is_some_and(|host| !crate::tunnel::valid_domain(host))
         {
             return Err(invalid("invalid ngrok hostname"));
+        }
+        if self
+            .chatgpt_project_url
+            .as_deref()
+            .is_some_and(|url| novagpt_browser::project::project_url(url).is_none())
+        {
+            return Err(invalid("invalid ChatGPT project URL"));
         }
         if self.browser_enabled
             && crate::chrome::discover(self.chrome_executable.as_deref()).is_err()

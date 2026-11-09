@@ -310,6 +310,7 @@ impl Controller {
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
         let tx = self.tx.clone();
         let agent_browser = Arc::clone(&self.agent_browser);
+        let session_runtime = self.runtime.clone();
         let task = self.runtime.spawn(async move {
             if ngrok && !crate::ngrok_install::available().await {
                 let _ = tx.send(OperationEvent::NgrokMissing);
@@ -339,21 +340,23 @@ impl Controller {
                     let chrome = crate::chrome::discover(config.chrome_executable.as_deref())
                         .map_err(|_| "Chrome is unavailable.")?;
                     let browser_tx = tx_info.clone();
-                    Some(
-                        novagpt_browser::ChatGptBrowser::new(
-                            chrome,
-                            settings::global_dir()
-                                .map_err(|_| "Global browser directory unavailable".to_string())?
-                                .join("browser"),
-                        )
-                        .map_err(|_| "Unable to initialize browser.".to_string())?
-                        .with_diagnostic_reporter(move |event| {
-                            let _ = browser_tx.send(OperationEvent::Log(
-                                Level::Info,
-                                format!("Browser: {event}"),
-                            ));
-                        }),
+                    let browser = novagpt_browser::ChatGptBrowser::new(
+                        chrome,
+                        settings::global_dir()
+                            .map_err(|_| "Global browser directory unavailable".to_string())?
+                            .join("browser"),
                     )
+                    .map_err(|_| "Unable to initialize browser.".to_string())?
+                    .with_diagnostic_reporter(move |event| {
+                        let _ = browser_tx.send(OperationEvent::Log(
+                            Level::Info,
+                            format!("Browser: {event}"),
+                        ));
+                    });
+                    browser
+                        .set_project_url(config.chatgpt_project_url.as_deref())
+                        .map_err(|_| "Invalid ChatGPT project URL.".to_string())?;
+                    Some(browser)
                 } else {
                     None
                 };
@@ -364,11 +367,27 @@ impl Controller {
                 .map_err(|_| "Audit storage unavailable or unsafe.".to_string())?;
                 let agents = browser.as_ref().map(|browser| {
                     let agent_audit = audit.clone();
+                    let runtime = session_runtime.clone();
                     novagpt_agents::AgentManager::new(
                         workspaces.clone(),
                         Arc::new(novagpt_agents::ChatGptBackend::new(browser.clone())),
                     ).with_diagnostic_reporter(move |id, stage| {
                         agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+                    })
+                    .with_conversation_recorder(move |id, url| {
+                        // Owner-private index only: prompts and replies are never stored.
+                        let id = id.to_owned();
+                        let url = url.to_owned();
+                        runtime.spawn_blocking(move || {
+                            if let Ok(store) = crate::sessions::SessionStore::open_default() {
+                                let _ = store.record(
+                                    crate::sessions::SessionKind::Subagent,
+                                    &id,
+                                    &url,
+                                    None,
+                                );
+                            }
+                        });
                     })
                 });
                 let resolved = token::resolve()
