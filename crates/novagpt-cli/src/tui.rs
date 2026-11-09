@@ -1151,6 +1151,38 @@ mod tests {
     }
 
     #[test]
+    fn chat_composer_keeps_the_draft_tail_visible_after_wrapping_and_resize() {
+        let mut app = app_with(browser_settings());
+        app.tab = 3;
+        for ch in format!("{}界界TAILEND", "x".repeat(300)).chars() {
+            app.key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(app.chat.input.chars().count(), 309);
+        for (width, height) in [(64, 22), (36, 14), (30, 11)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+            let output = screen_of(&terminal);
+            assert!(
+                output.contains("TAILEND▏"),
+                "the end of a long draft must remain visible at {width}x{height}"
+            );
+        }
+        for _ in 0..7 {
+            app.key(key(KeyCode::Backspace));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(36, 14)).unwrap();
+        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+        assert!(screen_of(&terminal).contains("界") || screen_of(&terminal).contains("x"));
+        assert!(!screen_of(&terminal).contains("TAILEND"));
+        // Scrolling only affects the viewport; it must not change the submitted text.
+        let expected = app.chat.input.clone();
+        let Some(Effect::ChatSend { prompt, .. }) = app.key(key(KeyCode::Enter)) else {
+            panic!("expected a chat send effect");
+        };
+        assert_eq!(prompt, expected);
+    }
+
+    #[test]
     fn chat_requires_the_browser_setting() {
         let mut a = app();
         a.tab = 3;

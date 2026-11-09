@@ -624,11 +624,48 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), split[1]);
     }
 }
+/// Keep the editable tail visible while preserving the full draft for sending.
+/// Wrap by terminal cell width, not UTF-8 byte count.
+fn chat_composer_lines(input: &str, width: usize, height: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthChar;
+
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut cells = 0;
+    for ch in input.chars().chain(std::iter::once('▏')) {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cells + char_width > width && !current.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            cells = 0;
+        }
+        current.push(ch);
+        cells += char_width;
+    }
+    lines.push(Line::from(current));
+    lines
+        .into_iter()
+        .rev()
+        .take(height)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
 fn chat(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lang = app.language();
+    // Grow the message composer on taller terminals without hiding the transcript.
+    let input_height = if area.height < 8 {
+        area.height.min(5)
+    } else {
+        (area.height / 3).clamp(4, 8)
+    };
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(0), Constraint::Length(input_height)])
         .split(area);
     let visible = sections[0].height.saturating_sub(2) as usize;
     let total = app.chat.messages.len();
@@ -687,16 +724,25 @@ fn chat(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .clone()
         .unwrap_or_else(|| Messages::chat_input_hint(lang).to_owned());
     let status_color = if app.chat.error.is_some() { BAD } else { MUTED };
+    let input_block = panel(Messages::chat_input_title(lang));
+    let inner = input_block.inner(sections[1]);
+    frame.render_widget(input_block, sections[1]);
+    let input_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let lines = chat_composer_lines(
+        &app.chat.input,
+        usize::from(input_sections[0].width),
+        usize::from(input_sections[0].height),
+    );
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                format!("{}▏", app.chat.input),
-                Style::default().fg(Color::White),
-            )),
-            Line::from(Span::styled(status, Style::default().fg(status_color))),
-        ])
-        .block(panel(Messages::chat_input_title(lang))),
-        sections[1],
+        Paragraph::new(lines).style(Style::default().fg(Color::White)),
+        input_sections[0],
+    );
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(status_color)),
+        input_sections[1],
     );
 }
 fn centered(area: Rect, percent_w: u16, h: u16) -> Rect {

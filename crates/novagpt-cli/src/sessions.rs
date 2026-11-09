@@ -6,6 +6,7 @@
 //! a missing or damaged index degrades to an empty list instead of blocking
 //! the TUI or the MCP server.
 use crate::settings::global_dir;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -115,6 +116,32 @@ impl SessionStore {
             .collect()
     }
 
+    /// Serialize read-modify-replace across all local server instances. The
+    /// index itself remains atomically replaced, so readers need no lock.
+    fn lock_index(&self) -> io::Result<fs::File> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| invalid("missing session directory"))?;
+        fs::create_dir_all(parent)?;
+        let lock_path = self.path.with_extension("lock");
+        if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(invalid("unsafe session lock target"));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(lock_path)?;
+        file.lock_exclusive()?;
+        Ok(file)
+    }
+
     /// Record or refresh one conversation. Duplicate URLs are moved to the
     /// front and keep their original creation time. Writes atomically.
     pub fn record(
@@ -129,6 +156,7 @@ impl SessionStore {
         }
         let url = novagpt_browser::project::conversation_url(url)
             .ok_or_else(|| invalid("invalid conversation URL"))?;
+        let _lock = self.lock_index()?;
         let now = now_ms();
         let mut sessions = self.load();
         if let Some(position) = sessions.iter().position(|record| record.url == url) {
@@ -158,6 +186,7 @@ impl SessionStore {
     /// Remove every stored reference. The conversations remain in ChatGPT.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear(&self) -> io::Result<()> {
+        let _lock = self.lock_index()?;
         match fs::symlink_metadata(&self.path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -349,6 +378,42 @@ mod tests {
         fs::create_dir_all(store.path.as_path().parent().unwrap()).unwrap();
         fs::write(store.path.as_path(), serde_json::to_vec(&tampered).unwrap()).unwrap();
         assert!(store.load().is_empty());
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_distinct_conversations() {
+        use std::sync::{Arc, Barrier};
+        let (dir, store) = store();
+        let path = store.path.clone();
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|worker| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = SessionStore::new(path);
+                    for index in 0..4 {
+                        store
+                            .record(
+                                SessionKind::Subagent,
+                                &format!("agent-{worker}"),
+                                &format!("https://chatgpt.com/c/worker{worker}-{index}"),
+                                None,
+                            )
+                            .expect("serialized record");
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("writer thread");
+        }
+        let loaded = SessionStore::new(dir.path().join(FILE_NAME)).load();
+        assert_eq!(loaded.len(), 32, "no simultaneous update may be lost");
+        let urls: std::collections::HashSet<_> =
+            loaded.iter().map(|session| session.url.as_str()).collect();
+        assert_eq!(urls.len(), 32);
     }
 
     #[test]
