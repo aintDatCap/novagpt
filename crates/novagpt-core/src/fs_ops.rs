@@ -372,7 +372,7 @@ mod create_new_tests {
         let receipt = registry
             .create_new_file(None, "generated/nested/hello.rs", "fn hello() {}\n")
             .unwrap();
-        assert_eq!(receipt.path, "generated/nested/hello.rs");
+        assert_eq!(receipt.path.replace('\\', "/"), "generated/nested/hello.rs");
         assert_eq!(receipt.bytes, "fn hello() {}\n".len());
         assert_eq!(
             fs::read_to_string(dir.path().join("generated/nested/hello.rs")).unwrap(),

@@ -21,6 +21,14 @@ use uuid::Uuid;
 
 const MAX_AGENTS: usize = 6;
 const MAX_RECORDS: usize = 64;
+
+/// Compare workspace-relative paths regardless of the platform separator.
+/// Patch targets always use `/`, while file-creation receipts use the OS
+/// separator on Windows; a plain equality check would deny patching a file
+/// this same run had just created.
+fn same_relative_path(left: &str, right: &str) -> bool {
+    left.replace('\\', "/") == right.replace('\\', "/")
+}
 /// Completed conversations stay open for follow-up messages, but the Chrome
 /// window must not accumulate one tab per agent forever. The oldest completed
 /// tab is closed when the cap is reached; a later follow-up then opens a new
@@ -1267,7 +1275,11 @@ impl AgentManager {
                 // A file this run created is also an authorized edit target,
                 // even when its path was not known at spawn time.
                 if !entry.allowed_paths.contains(&target)
-                    && !entry.info.created_paths.contains(&relative)
+                    && !entry
+                        .info
+                        .created_paths
+                        .iter()
+                        .any(|path| same_relative_path(path, &relative))
                 {
                     return Err(AgentError::PatchDenied);
                 }
@@ -2792,7 +2804,7 @@ mod tests {
             .create_file(&worker.id, &code, "src/deep/generated.rs", "created\n")
             .await
             .unwrap();
-        assert_eq!(created.path, "src/deep/generated.rs");
+        assert_eq!(created.path.replace('\\', "/"), "src/deep/generated.rs");
         assert_eq!(created.files_created, 1);
         assert_eq!(created.bytes, "created\n".len());
         assert_eq!(created.sha256.len(), 64);
@@ -2838,7 +2850,14 @@ mod tests {
         );
         let status = manager.status(Some(&worker.id)).await.unwrap();
         assert_eq!(status.agents[0].files_created, 1);
-        assert_eq!(status.agents[0].created_paths, ["src/deep/generated.rs"]);
+        assert_eq!(
+            status.agents[0]
+                .created_paths
+                .iter()
+                .map(|path| path.replace('\\', "/"))
+                .collect::<Vec<_>>(),
+            ["src/deep/generated.rs"]
+        );
         manager
             .finished(&worker.id, &code, "Created and edited")
             .await
