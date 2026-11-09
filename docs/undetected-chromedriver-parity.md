@@ -366,7 +366,7 @@ The CLI was exercised manually against the real environment:
 | Background Reactor thread | Rust async pull model avoids a long-lived thread and leaked callbacks. | Users call `drain_cdp_events`; no wildcard handler registry. |
 | `click_safe` | Hidden reconnect after each click is surprising and can replay/lose state. | Reconnect is explicit. |
 | Chrome browser auto-download | Upstream discovers Chrome; NovaGPT does the same. | No browser binary management, by design. |
-| macOS/Windows execution | Only Linux x86_64 was available. | Code has platform mappings but is not runtime-verified there. |
+| macOS/Windows execution | Linux was the original reference platform. | Windows x64 with Chrome 156 and ChromeDriver 156 now passes the managed lifecycle and the adapter's browsing path; macOS is not runtime-verified. |
 | Live authenticated ChatGPT end-to-end | No authorized account was available to this task. | Real login, Cloudflare challenge, and conversation completion remain unverified. |
 | Old ChromeDriver ≤114 live download | Legacy path unit-tested only. | URL/layout logic is covered; old binaries are not executed. |
 
@@ -377,11 +377,40 @@ deterministic coverage for binary selection, integrity, extraction,
 patching, service startup, WebDriver tabs, isolation, atomic input,
 reconnection, Chrome crash recovery and profile persistence. Real Chrome
 156/ChromeDriver 156 runs passed for the raw managed lifecycle and for the
-ChatGPT adapter's browsing path. It is not yet validated against a live
+ChatGPT adapter's browsing path, including a Windows x64 run after the
+version-detection fix in section 11. It is not yet validated against a live
 authenticated ChatGPT account, the headless stealth layer is intentionally
-absent, and Windows/macOS, legacy ChromeDriver downloads and the Chrome
+absent, and macOS, legacy ChromeDriver downloads and the Chrome
 144+ consent-based attach flow are unverified. ChromeDriver's CDP passthrough
 is required for physical input/screenshot commands. Treat this as a
 functionally integrated but not provider-validated implementation, not as a
 guarantee of complete upstream parity or of reliable bypass of provider
 defenses.
+
+## 11. Windows Chrome version detection (2026-11-09)
+
+**Symptom.** On Windows the managed backend reported `Dedicated Chrome cannot
+be launched or contacted` and no browser window appeared;
+`novagpt chrome-driver status` failed with `Unable to determine the installed
+Chrome version`. No Chrome crash dump, `Application Error` (event 1000) or
+`chrome_debug.log` existed, because Chrome was never launched.
+
+**Root cause.** `detect_chrome_version` ran `chrome.exe --version` and parsed
+stdout/stderr. Chrome is a GUI-subsystem executable on Windows, so the
+launcher never writes that output to a parent console and detection always
+failed — before ChromeDriver could be located, installed or attached. Manual
+login launched Chrome directly and needed no version, which hid the defect.
+
+**Fix.** Prefer the versioned installation layout
+(`Application/<version>/chrome.dll` on Windows, `<version>/chrome` elsewhere),
+read on a blocking task without starting a process, then fall back to the
+launcher probe. The real installation is detected without opening a browser.
+
+**Evidence.** `cargo run -p novagpt-cli -- chrome-driver status` reports
+`Chrome: 156.0.8078.80`; `novagpt chrome-driver install` installed and verified
+the patched `156.0.8078.80` driver for that Chrome. The opt-in
+`cargo test -p novagpt-browser --test real_browser -- --ignored` passed on
+Windows x64 (Chrome 156.0.8078.80, ChromeDriver 156.0.8078.80, 7.27 s),
+covering launch, WebDriver tabs, navigation, text input, click, screenshot,
+console capture and shutdown against a loopback fixture. Live ChatGPT login
+and Cloudflare handling remain unverified.

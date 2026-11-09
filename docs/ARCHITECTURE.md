@@ -87,7 +87,7 @@ For local Rust iteration, `script/dev.py` builds once at startup and **never reb
 - Shell commands run with host permissions; subprocess-tree cleanup and full sandboxing are not guaranteed.
 - VM guest control and some optional integrations require live testing. The managed ChromeDriver transport passed disposable Chrome 156 tests covering launch, patch, four-tab isolation, reconnect, Chrome crash/restart, profile persistence across application restart, screenshots, and the ChatGPT adapter's local browsing path. Live ChatGPT authentication, challenge handling, and response completion remain unverified; this is not a fully managed cloud environment.
 - Adapter input requires a visible, focusable tab. A window manager that refuses focus produces `InteractionBlocked` (no prompt submitted) instead of hidden background input.
-- The TUI chat requires the ChatGPT browser feature and a visible Chrome; its transcript is not restored after a restart, and the live login/Cloudflare/reply path is still unverified. Live Chrome execution on Windows is untested.
+- The TUI chat requires the ChatGPT browser feature and a visible Chrome; its transcript is not restored after a restart, and the live login/Cloudflare/reply path is still unverified. Windows x64 Chrome 156 launch and the adapter's browsing path are now verified; macOS Chrome execution is untested. See the [managed backend notes](undetected-chromedriver-parity.md#11-windows-chrome-version-detection-2026-11-09).
 - Some filesystem writes are not crash-atomic on all platforms; path-swap defenses and adversarial concurrency require further review.
 - Public MCP transport session TTL, reconnect and load boundaries need additional integration tests.
 
