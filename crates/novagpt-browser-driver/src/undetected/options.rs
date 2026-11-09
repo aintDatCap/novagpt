@@ -348,9 +348,7 @@ mod tests {
             .unwrap();
         let root = tempfile::tempdir().unwrap();
         let profile = root.path().join("novagpt-dedicated");
-        let args = options
-            .launch_arguments(&profile, 4567, "en-US")
-            .unwrap();
+        let args = options.launch_arguments(&profile, 4567, "en-US").unwrap();
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
         assert!(args.contains(&"--remote-debugging-port=4567".to_owned()));
         assert!(args.contains(&format!("--user-data-dir={}", profile.display())));
