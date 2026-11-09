@@ -152,9 +152,64 @@ async fn healthy_browser(client: &reqwest::Client, port: u16) -> bool {
 /// Detect the installed Chrome version from its own launcher. The child is
 /// bounded and killed on timeout; its output is parsed in memory and never
 /// logged.
+/// Chrome installs each release in a versioned sibling directory
+/// (`Application/<version>/chrome.exe` on Windows). That layout is
+/// authoritative and needs no process launch. It is the only reliable source
+/// on Windows, where the GUI launcher does not write `--version` output to a
+/// parent console.
+fn installed_layout_version(executable: &Path) -> Option<ChromeVersion> {
+    let binary = if cfg!(windows) {
+        "chrome.exe"
+    } else {
+        "chrome"
+    };
+    let parent = executable.parent()?; // A caller may pass the launcher inside the versioned directory.
+    if let Some(name) = parent.file_name().and_then(|name| name.to_str())
+        && let Ok(version) = name.parse::<ChromeVersion>()
+        && executable.is_file()
+    {
+        return Some(version);
+    }
+    let mut best: Option<ChromeVersion> = None;
+    for entry in std::fs::read_dir(parent).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(version) = name.parse::<ChromeVersion>() else {
+            continue;
+        };
+        // The launcher at the Application root delegates to this directory.
+        // Windows installations keep the main module (`chrome.dll`) here and
+        // only a signature for the launcher, so either marker proves the
+        // directory is a real browser installation.
+        if !(entry.path().join(binary).is_file() || entry.path().join("chrome.dll").is_file()) {
+            continue;
+        }
+        best = Some(match best {
+            Some(current) if current >= version => current,
+            _ => version,
+        });
+    }
+    best
+}
+
 pub async fn detect_chrome_version(executable: &Path) -> Result<ChromeVersion, UpstreamError> {
     if !executable.is_file() {
         return Err(UpstreamError::Chrome);
+    }
+    // Filesystem-only fast path: keep it off Tokio workers. It also avoids
+    // launching a GUI browser just to ask for its version.
+    let layout_path = executable.to_path_buf();
+    if let Ok(Some(version)) =
+        tokio::task::spawn_blocking(move || installed_layout_version(&layout_path)).await
+    {
+        return Ok(version);
     }
     let mut command = Command::new(executable);
     command
@@ -353,5 +408,73 @@ mod tests {
             detect_chrome_version(&executable).await,
             Err(UpstreamError::Chrome)
         ));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn binary_name() -> &'static str {
+        if cfg!(windows) {
+            "chrome.exe"
+        } else {
+            "chrome"
+        }
+    }
+
+    /// Windows keeps `chrome.dll` in the version directory and only the
+    /// signature of the launcher.
+    fn layout_marker() -> &'static str {
+        if cfg!(windows) {
+            "chrome.dll"
+        } else {
+            "chrome"
+        }
+    }
+
+    #[tokio::test]
+    async fn version_is_read_from_the_versioned_install_layout_without_launching() {
+        let root = tempfile::tempdir().expect("root");
+        let application = root.path().join("Application");
+        let version_directory = application.join("156.0.8078.80");
+        std::fs::create_dir_all(&version_directory).expect("version directory");
+        let launcher = application.join(binary_name());
+        std::fs::write(&launcher, b"launcher").expect("launcher");
+        std::fs::write(version_directory.join(layout_marker()), b"browser").expect("browser");
+        assert_eq!(
+            detect_chrome_version(&launcher)
+                .await
+                .expect("layout version"),
+            ChromeVersion::new(156, 0, 8078, 80)
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            detect_chrome_version(&version_directory.join(binary_name()))
+                .await
+                .expect("nested layout version"),
+            ChromeVersion::new(156, 0, 8078, 80)
+        );
+    }
+
+    #[tokio::test]
+    async fn highest_installed_version_wins_and_unrelated_directories_are_ignored() {
+        let root = tempfile::tempdir().expect("root");
+        let application = root.path().join("Application");
+        for version in ["140.0.1.2", "156.0.8078.80", "SetupMetrics"] {
+            let directory = application.join(version);
+            std::fs::create_dir_all(&directory).expect("directory");
+            std::fs::write(directory.join(layout_marker()), b"browser").expect("browser");
+        }
+        // A versioned name without the browser inside is not an installation.
+        std::fs::create_dir_all(application.join("200.0.0.1")).expect("incomplete version");
+        let launcher = application.join(binary_name());
+        std::fs::write(&launcher, b"launcher").expect("launcher");
+        assert_eq!(
+            detect_chrome_version(&launcher)
+                .await
+                .expect("highest version"),
+            ChromeVersion::new(156, 0, 8078, 80)
+        );
     }
 }

@@ -26,9 +26,12 @@ pub async fn run(
             "Chrome executable not found; install Chrome or configure --chatgpt-chrome",
         )
     })?;
-    let chrome_version = detect_chrome_version(&chrome)
-        .await
-        .map_err(|_| std::io::Error::other("Unable to determine the installed Chrome version"))?;
+    let chrome_version = detect_chrome_version(&chrome).await.map_err(|_| {
+        std::io::Error::other(format!(
+            "Unable to determine the installed Chrome version for {}",
+            chrome.display()
+        ))
+    })?;
     let store = ChromeDriverStore::new(ChromeDriverStore::default_root()?)
         .map_err(|_| std::io::Error::other("Unable to initialize the ChromeDriver store"))?;
     match action {
