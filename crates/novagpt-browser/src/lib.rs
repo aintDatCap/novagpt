@@ -3,6 +3,7 @@
 //! cookies/credentials; manual challenges are for the user.
 mod bridge;
 mod interaction;
+pub mod project;
 pub use bridge::{BridgeError, BrowserBridge, BrowserTab, BrowserTabText};
 pub use interaction::InteractionPacing;
 /// Native managed Chrome/ChromeDriver lifecycle. Exposed so the CLI and
@@ -18,7 +19,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::Path,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -135,6 +136,8 @@ pub enum BrowserError {
     InvalidControl,
     #[error("Development origin must be an explicit loopback HTTP origin with a port")]
     InvalidDevOrigin,
+    #[error("ChatGPT left the designated subagent project; no message was sent outside it")]
+    ProjectMismatch,
 }
 
 impl From<UpstreamError> for BrowserError {
@@ -254,6 +257,9 @@ struct Page {
     send_button_seen: AtomicBool,
     // A challenge observed in this attempt must suppress automatic recovery.
     verification_seen: AtomicBool,
+    // The first prompt was composed while the tab was still on the designated
+    // project page. Later turns navigate to /c/... and skip the project check.
+    project_confirmed: AtomicBool,
     send_lock: Mutex<()>,
     pending_before: Mutex<Option<usize>>,
     manual: Mutex<Option<String>>,
@@ -561,6 +567,9 @@ struct Inner {
     reporter: Option<DiagnosticReporter>,
     pacing: InteractionPacing,
     last_open: Mutex<Option<Instant>>,
+    /// Optional validated ChatGPT project used as the start page for every
+    /// worker tab, so subagent conversations can be removed together.
+    project_url: RwLock<Option<String>>,
 }
 #[derive(Clone)]
 pub struct ChatGptBrowser {
@@ -604,6 +613,7 @@ impl ChatGptBrowser {
                 reporter: None,
                 pacing: InteractionPacing::human(),
                 last_open: Mutex::new(None),
+                project_url: RwLock::new(None),
             }),
         })
     }
@@ -629,6 +639,7 @@ impl ChatGptBrowser {
                 reporter: None,
                 pacing: InteractionPacing::instant(),
                 last_open: Mutex::new(None),
+                project_url: RwLock::new(None),
             }),
         }
     }
@@ -737,7 +748,49 @@ impl ChatGptBrowser {
         }
     }
 
+    /// Optional ChatGPT project used as the start page for every new worker
+    /// tab. When set, new subagent conversations are created inside that
+    /// project, so the whole group can be deleted in ChatGPT at once.
+    pub fn set_project_url(&self, project: Option<&str>) -> Result<(), BrowserError> {
+        let normalized = match project {
+            Some(raw) => Some(project::project_url(raw).ok_or(BrowserError::Protocol)?),
+            None => None,
+        };
+        let mut current = self
+            .inner
+            .project_url
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = normalized;
+        Ok(())
+    }
+
+    fn project_url(&self) -> Option<String> {
+        self.inner
+            .project_url
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn start_url(&self) -> String {
+        self.project_url().unwrap_or_else(|| HOME.to_owned())
+    }
+
     pub async fn open(&self, id: &str) -> Result<(), BrowserError> {
+        self.open_url(id, &self.start_url(), false).await
+    }
+
+    /// Reopen an existing ChatGPT conversation in a new owned tab. Only a
+    /// validated `https://chatgpt.com/c/<id>` URL is accepted. The reopened
+    /// tab skips the project guard: the conversation already exists in the
+    /// user's account and no new chat is created outside the project.
+    pub async fn open_at(&self, id: &str, conversation: &str) -> Result<(), BrowserError> {
+        let conversation = project::conversation_url(conversation).ok_or(BrowserError::Protocol)?;
+        self.open_url(id, &conversation, true).await
+    }
+
+    async fn open_url(&self, id: &str, url: &str, conversation: bool) -> Result<(), BrowserError> {
         if !safe_id(id) {
             return Err(BrowserError::Protocol);
         }
@@ -769,7 +822,7 @@ impl ChatGptBrowser {
             pages.remove(id);
         }
         let transport = self
-            .create_tab(&chrome, if id == BROWSE_TAB { "" } else { HOME })
+            .create_tab(&chrome, if id == BROWSE_TAB { "" } else { url })
             .await?;
         let background = if chrome.debug_port() == 0 {
             // WebDriver-only test fixture.
@@ -789,6 +842,7 @@ impl ChatGptBrowser {
             ever_submitted: AtomicBool::new(false),
             send_button_seen: AtomicBool::new(false),
             verification_seen: AtomicBool::new(false),
+            project_confirmed: AtomicBool::new(conversation),
             send_lock: Mutex::new(()),
             pending_before: Mutex::new(None),
             manual: Mutex::new(None),
@@ -1340,6 +1394,20 @@ impl ChatGptBrowser {
         // A ready composer proves the earlier challenge is gone; later
         // failures may use the normal bounded recovery path again.
         page.verification_seen.store(false, Ordering::Release);
+        // With a designated project, the first prompt must still be composed
+        // on the project page. ChatGPT can navigate away on its own; sending
+        // then would silently create a chat outside the project that the user
+        // cannot delete as one group. The check is skipped for a reopened
+        // conversation and for later turns in the same tab.
+        if !page.project_confirmed.load(Ordering::Acquire)
+            && let Some(project) = self.project_url()
+        {
+            let current = state["url"].as_str().unwrap_or_default();
+            if current != project {
+                page.diagnostic("project_mismatch", "").await;
+                return Err(BrowserError::ProjectMismatch);
+            }
+        }
         page.diagnostic("composer_ready", "").await;
         let pending = *page.pending_before.lock().await;
         let before = if let Some(before) = pending {
@@ -1509,6 +1577,9 @@ impl ChatGptBrowser {
                 page.press_enter().await?;
                 page.diagnostic("send_enter_dispatched", "").await;
             }
+            // The prompt was composed on this page; later turns of the same
+            // conversation stay on /c/... and need no project check.
+            page.project_confirmed.store(true, Ordering::Release);
             *page.pending_before.lock().await = Some(before);
             before
         };
@@ -2144,6 +2215,8 @@ mod tests {
         released: bool,
         clicks: usize,
         url: String,
+        /// URL reported by the page DOM, independently of the WebDriver tab URL.
+        chat_url: String,
         logs: Vec<Value>,
         cdp: Vec<String>,
     }
@@ -2281,7 +2354,12 @@ mod tests {
                         "assistant_count":1,"last_text":"Fixture answer","complete":true,
                         "preflight_idle":!state.generating})
                 } else {
-                    json!({"url":"https://chatgpt.com/","page_kind":"chatgpt",
+                    let home = if state.chat_url.is_empty() {
+                        "https://chatgpt.com/"
+                    } else {
+                        state.chat_url.as_str()
+                    };
+                    json!({"url":home,"page_kind":"chatgpt",
                         "composer":true,"challenge":false,"login":false,
                         "assistant_count":0,"last_text":"","complete":true,
                         "preflight_idle":!state.generating})
@@ -2519,6 +2597,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_tab_opens_on_the_designated_project() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.verified = true;
+            mock.chat_url = "https://chatgpt.com/g/g-p-abc123/project".into();
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser
+            .set_project_url(Some("https://chatgpt.com/g/g-p-abc123/project/"))
+            .expect("valid project");
+        browser.open("agent-project").await.expect("open");
+        assert_eq!(
+            state.lock().await.url,
+            "https://chatgpt.com/g/g-p-abc123/project"
+        );
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-project", "Fixture prompt"),
+        )
+        .await
+        .expect("send timeout")
+        .expect("project send");
+        assert_eq!(reply.content, "Fixture answer");
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn leaving_the_project_blocks_before_any_input() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.verified = true;
+            mock.chat_url = "https://chatgpt.com/".into();
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser
+            .set_project_url(Some("https://chatgpt.com/g/g-p-abc123/project"))
+            .expect("valid project");
+        browser.open("agent-outside").await.expect("open");
+        let outcome = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-outside", "Fixture prompt"),
+        )
+        .await
+        .expect("send timeout");
+        assert!(matches!(outcome, Err(BrowserError::ProjectMismatch)));
+        let mock = state.lock().await;
+        assert_eq!(mock.clicks, 0, "nothing was submitted");
+        assert_eq!(mock.inserted, 0, "nothing was typed");
+        assert_eq!(mock.keys, 0, "no keystroke was dispatched");
+        drop(mock);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reopened_conversation_accepts_a_follow_up_outside_the_project_page() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.verified = true;
+            mock.chat_url = "https://chatgpt.com/c/68f0-abc".into();
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser
+            .set_project_url(Some("https://chatgpt.com/g/g-p-abc123/project"))
+            .expect("valid project");
+        browser
+            .open_at("agent-reopen", "https://chatgpt.com/c/68f0-abc/")
+            .await
+            .expect("reopen");
+        assert_eq!(state.lock().await.url, "https://chatgpt.com/c/68f0-abc");
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-reopen", "Fixture follow-up"),
+        )
+        .await
+        .expect("send timeout")
+        .expect("reopened send");
+        assert_eq!(reply.content, "Fixture answer");
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_project_and_conversation_urls_are_rejected() {
+        let (port, _state, server) = spawn_mock().await;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        for rejected in [
+            "https://evil.test/g/g-p-abc/project",
+            "http://chatgpt.com/g/g-p-abc/project",
+            "https://chatgpt.com/g/g-p-abc/project?next=1",
+            "https://chatgpt.com/c/abc",
+        ] {
+            assert!(
+                browser.set_project_url(Some(rejected)).is_err(),
+                "accepted project: {rejected}"
+            );
+        }
+        for rejected in [
+            "https://evil.test/c/abc",
+            "https://chatgpt.com/c/abc?x=1",
+            "https://chatgpt.com/g/g-p-abc/project",
+        ] {
+            assert!(
+                browser.open_at("agent-bad", rejected).await.is_err(),
+                "accepted conversation: {rejected}"
+            );
+        }
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn interstitial_waits_for_manual_verification_then_resumes_same_unsent_prompt() {
         let (port, state, server) = spawn_mock().await;
         let browser = ChatGptBrowser::with_test_session(test_session(port).await);
@@ -2583,6 +2777,7 @@ mod tests {
                 ever_submitted: AtomicBool::new(true),
                 send_button_seen: AtomicBool::new(false),
                 verification_seen: AtomicBool::new(false),
+                project_confirmed: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(Some(0)),
                 manual: Mutex::new(None),
@@ -2710,6 +2905,7 @@ mod tests {
                 ever_submitted: AtomicBool::new(true),
                 send_button_seen: AtomicBool::new(true),
                 verification_seen: AtomicBool::new(false),
+                project_confirmed: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(None),
                 manual: Mutex::new(None),
@@ -2749,6 +2945,7 @@ mod tests {
                 ever_submitted: AtomicBool::new(false),
                 send_button_seen: AtomicBool::new(false),
                 verification_seen: AtomicBool::new(true),
+                project_confirmed: AtomicBool::new(false),
                 send_lock: Mutex::new(()),
                 pending_before: Mutex::new(None),
                 manual: Mutex::new(None),

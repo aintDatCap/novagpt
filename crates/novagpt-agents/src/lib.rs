@@ -364,6 +364,9 @@ fn map_browser(error: BrowserError) -> BackendFailure {
         ),
         BrowserError::ProfileBusy => BackendFailure::Blocked("Dedicated Chrome profile is in use"),
         BrowserError::NotRunning => BackendFailure::Blocked("Dedicated Chrome is unavailable"),
+        BrowserError::ProjectMismatch => BackendFailure::Blocked(
+            "ChatGPT left the designated subagent project; no message was sent outside it",
+        ),
         _ => BackendFailure::Unavailable,
     }
 }
