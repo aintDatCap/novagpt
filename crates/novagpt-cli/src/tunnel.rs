@@ -10,6 +10,37 @@ pub struct NgrokTunnel {
     configured_domain: Option<String>,
 }
 
+/// Fixed, credential-free reasons for a tunnel that never became ready.
+/// These are safe to show in diagnostics and to store as audit event names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessFailure {
+    AgentExited,
+    AgentStatusUnavailable,
+    EndpointUnverified,
+}
+
+impl ReadinessFailure {
+    pub fn audit_event(self) -> &'static str {
+        match self {
+            Self::AgentExited => "http_tunnel_agent_exited",
+            Self::AgentStatusUnavailable => "http_tunnel_agent_status_failed",
+            Self::EndpointUnverified => "http_tunnel_discovery_failed",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::AgentExited => {
+                "ngrok exited before its endpoint was ready; run 'ngrok config check' and test ngrok in a terminal"
+            }
+            Self::AgentStatusUnavailable => "Unable to check the ngrok process state",
+            Self::EndpointUnverified => {
+                "ngrok is running but the expected MCP tunnel was not verified by the local agent API (127.0.0.1:4040)"
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct TunnelList {
     tunnels: Vec<TunnelEntry>,
@@ -95,19 +126,34 @@ impl NgrokTunnel {
 
     /// Learn the actual public host from the loopback ngrok API, restricted to
     /// the reserved upstream port. Never permit arbitrary inbound Host values.
-    pub async fn public_hostname(&self) -> Option<String> {
+    pub async fn public_hostname(&mut self) -> Result<String, ReadinessFailure> {
         for _ in 0..25 {
+            // A subprocess can spawn successfully and exit immediately (e.g.
+            // invalid ngrok credentials or a hostname not owned by the account).
+            // Do not report that case as a generic endpoint discovery failure.
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Err(ReadinessFailure::AgentExited),
+                Ok(None) => {}
+                Err(_) => return Err(ReadinessFailure::AgentStatusUnavailable),
+            }
             if let Some(endpoint) = self.endpoint().await {
-                let url = reqwest::Url::parse(&endpoint).ok()?;
-                let host = url.host_str()?.to_string();
-                if valid_domain(&host) {
-                    return Some(host);
+                // The local agent API can belong to another ngrok process;
+                // never accept its response after our own agent has exited.
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return Err(ReadinessFailure::AgentExited),
+                    Ok(None) => {}
+                    Err(_) => return Err(ReadinessFailure::AgentStatusUnavailable),
                 }
-                return None;
+                if let Ok(url) = reqwest::Url::parse(&endpoint)
+                    && let Some(host) = url.host_str()
+                    && valid_domain(host)
+                {
+                    return Ok(host.to_string());
+                }
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        None
+        Err(ReadinessFailure::EndpointUnverified)
     }
 
     /// Local discovery never prints or persists a token and does not start a tunnel.
@@ -208,6 +254,41 @@ pub fn connector_url(endpoint: &str, token: &str) -> Result<String, &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exited_ngrok_agent_is_not_reported_as_a_discovery_timeout() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit", "17"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 17"]);
+            command
+        };
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("short-lived ngrok fixture");
+        let mut tunnel = NgrokTunnel {
+            child,
+            port: 8787,
+            configured_domain: None,
+        };
+        tunnel.child.wait().await.expect("fixture exited");
+        let reason = tunnel.public_hostname().await.expect_err("agent exited");
+        assert_eq!(reason, ReadinessFailure::AgentExited);
+        assert_eq!(reason.audit_event(), "http_tunnel_agent_exited");
+        assert!(reason.message().contains("ngrok exited"));
+        assert_eq!(
+            ReadinessFailure::EndpointUnverified.audit_event(),
+            "http_tunnel_discovery_failed"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

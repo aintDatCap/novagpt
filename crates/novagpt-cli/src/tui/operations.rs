@@ -556,7 +556,8 @@ impl Controller {
                                 // Do not start a public tunnel unless NovaGPT owns this port.
                                 match tunnel::NgrokTunnel::start(address.port(), ngrok_domain).await {
                                     Ok(mut tunnel) => {
-                                        if let Some(hostname) = tunnel.public_hostname().await {
+                                        match tunnel.public_hostname().await {
+                                            Ok(hostname) => {
                                             // Same validated public host used by the tunnel; never disable host validation.
                                             extras.http_public_hostname = Some(hostname);
                                             let server = async {
@@ -588,11 +589,13 @@ impl Controller {
                                                     }
                                                 }
                                             }
-                                        } else {
-                                            audit.record("http_tunnel_discovery_failed", true);
-                                            tunnel.stop().await;
-                                            audit.flush().await;
-                                            Err("The ngrok hostname for the MCP port could not be verified".into())
+                                            }
+                                            Err(reason) => {
+                                                audit.record(reason.audit_event(), true);
+                                                tunnel.stop().await;
+                                                audit.flush().await;
+                                                Err(reason.message().into())
+                                            }
                                         }
                                     }
                                     Err(_) => {
@@ -615,13 +618,16 @@ impl Controller {
                     if let Ok(mut handle) = agent_browser.lock() {
                         *handle = None;
                     }
-                    if result.is_err() {
+                    if let Err(error) = result {
                         let _ = tx.send(OperationEvent::Server(ServerState::Failed));
-                        let _ = tx.send(OperationEvent::Log(
-                            Level::Error,
-                            "HTTP stopped: check port, token and settings."
-                                .into(),
-                        ));
+                        // Only the ngrok startup branch exposes this diagnostic:
+                        // its errors are fixed, credential-free messages.
+                        let message = if ngrok {
+                            format!("HTTP tunnel stopped: {error}")
+                        } else {
+                            "HTTP stopped: check port, token and settings.".to_string()
+                        };
+                        let _ = tx.send(OperationEvent::Log(Level::Error, message));
                     } else {
                         let _ = tx.send(OperationEvent::Server(ServerState::Stopped));
                         let _ = tx.send(OperationEvent::Log(

@@ -605,14 +605,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     hostname = tunnel.public_hostname() => hostname,
                 } {
-                    Some(host) => host,
-                    None => {
-                        audit.record("http_tunnel_discovery_failed", true);
+                    Ok(host) => host,
+                    Err(reason) => {
+                        audit.record(reason.audit_event(), true);
                         tunnel.stop().await;
                         audit.flush().await;
-                        return Err(
-                            "ngrok did not verify the public hostname for the MCP port".into()
-                        );
+                        return Err(reason.message().into());
                     }
                 };
                 // Trust only the hostname returned by the locally controlled ngrok

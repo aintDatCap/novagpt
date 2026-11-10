@@ -180,7 +180,8 @@ on first use, installing the matching driver if it is missing. See
 ## Troubleshooting
 
 - **ngrok command not found:** restart your terminal to refresh PATH, or install ngrok from its official download page. Supported TUI installation may prompt when you start a tunnel.
-- **ngrok fails to start:** verify `ngrok version`, account setup and authtoken, and check any reserved hostname belongs to your ngrok account.
+- **ngrok exits before the tunnel is ready:** NovaGPT now reports this separately from an unverified endpoint. On Windows, close NovaGPT, run `ngrok config check`, then start `ngrok http 127.0.0.1:8787 --inspect=false --log=stderr` in PowerShell to see the agent's original error. If a hostname is saved in NovaGPT, append `--url https://YOUR_ASSIGNED_HOSTNAME` to reproduce the same configuration. This diagnostic command **creates a public endpoint** if it succeeds; stop it with Ctrl+C before restarting NovaGPT. Do not share ngrok account tokens or private connector URLs.
+- **ngrok remains running but its MCP endpoint is unverified:** check the local ngrok agent API at `http://127.0.0.1:4040/api/tunnels`. NovaGPT currently expects an ngrok agent API at that address and an upstream matching the selected MCP port; a non-default ngrok `web_addr` or another process occupying the API port can prevent verification.
 - **Port already in use:** stop the other local process or choose a different port in Settings.
 - **ChatGPT cannot connect:** check MCP and tunnel readiness, confirm the full `/mcp?novagpt_token=...` URL, and use **No authentication**. Check plan/workspace permissions and refresh the plugin if its tools changed.
 - **Server errors:** run `novagpt doctor --json` and `novagpt logs tail --lines 50` locally. These diagnostics are in English and intentionally exclude credentials.
