@@ -99,7 +99,7 @@ const MAX_DIAGNOSTIC_EVENTS: usize = 24;
 // An idle tab times out after five minutes. A visibly generating reply is
 // allowed a longer but still finite deadline; never replay an uncertain send.
 const REPLY_SOFT_TIMEOUT: Duration = Duration::from_secs(300);
-const REPLY_ACTIVE_TIMEOUT: Duration = Duration::from_secs(900);
+const REPLY_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn reply_timed_out(elapsed: Duration, generating: bool) -> bool {
     elapsed >= REPLY_ACTIVE_TIMEOUT || (elapsed >= REPLY_SOFT_TIMEOUT && !generating)
@@ -1979,9 +1979,10 @@ mod tests {
         assert!(reply_timed_out(Duration::from_secs(300), false));
         // A real screenshot showed both workers still generating at 300 s.
         assert!(!reply_timed_out(Duration::from_secs(300), true));
-        assert!(!reply_timed_out(Duration::from_secs(899), true));
-        assert!(reply_timed_out(Duration::from_secs(900), true));
-        assert!(reply_timed_out(Duration::from_secs(901), false));
+        assert!(!reply_timed_out(Duration::from_secs(900), true));
+        assert!(!reply_timed_out(Duration::from_secs(3599), true));
+        assert!(reply_timed_out(Duration::from_secs(3600), true));
+        assert!(reply_timed_out(Duration::from_secs(3601), false));
     }
 
     #[test]
