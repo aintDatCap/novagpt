@@ -1590,7 +1590,10 @@ impl ChatGptBrowser {
             *page.pending_before.lock().await = Some(before);
             before
         };
-        let deadline = Instant::now() + Duration::from_secs(180);
+        // Longer research/coding turns can legitimately exceed three minutes.
+        // Keep a finite bound: timeout after submission is always uncertain
+        // and must never trigger an automatic replay.
+        let deadline = Instant::now() + Duration::from_secs(300);
         let mut last = String::new();
         let mut stable = 0;
         loop {

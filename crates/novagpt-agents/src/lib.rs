@@ -35,7 +35,7 @@ fn same_relative_path(left: &str, right: &str) -> bool {
 /// conversation instead of reusing the evicted tab.
 const MAX_LIVE_TABS: usize = 8;
 const MAX_ACTIVITY_EVENTS: usize = 32;
-const MAX_ACTIVITY_REPORTS: u8 = 64;
+const MAX_ACTIVITY_REPORTS: u16 = 1024;
 const MAX_TASK: usize = 50_000;
 const MAX_MESSAGE: usize = 50_000;
 const MAX_RESULT: usize = 180_000;
@@ -380,7 +380,7 @@ struct Entry {
     completion_claimed: bool,
     patch_attempts: u8,
     create_attempts: u16,
-    activity_reports: u8,
+    activity_reports: u16,
     activity_events: VecDeque<ActivityEvent>,
     activity_dropped_before: u64,
     allowed_paths: Vec<PathBuf>,
@@ -410,6 +410,44 @@ impl Entry {
             self.completion_failures = self.completion_failures.saturating_add(1);
         }
         correct
+    }
+
+    /// Only credential-authenticated worker calls can be attributed to this
+    /// agent. An MCP transport session is not a conversation identity.
+    fn record_activity(
+        &mut self,
+        kind: &str,
+        description: &'static str,
+    ) -> AgentResult<ActivityEvent> {
+        let sequence = self
+            .info
+            .activity_sequence
+            .checked_add(1)
+            .ok_or(AgentError::ActivityDenied)?;
+        let timestamp_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let event = ActivityEvent {
+            id: self.info.id.clone(),
+            epoch: self.epoch,
+            sequence,
+            timestamp_ms,
+            kind: kind.to_owned(),
+            description,
+        };
+        self.info.activity_sequence = sequence;
+        self.activity_events.push_back(event.clone());
+        if self.activity_events.len() > MAX_ACTIVITY_EVENTS
+            && let Some(evicted) = self.activity_events.pop_front()
+        {
+            self.activity_dropped_before = evicted.sequence;
+        }
+        self.updates.send_replace(self.info.clone());
+        Ok(event)
     }
 
     fn activity_since(&self, after_sequence: u64) -> AgentActivity {
@@ -590,7 +628,7 @@ impl AgentManager {
         // A progress report is explicit and credential-bound; never infer it
         // from an unrelated MCP call or browser tab/session.
         let prompt = format!(
-            "{prompt}\n\nWhile actively working, optionally call subagent_progress with id={id}, code={code}, and kind chosen from working, reading, editing, testing, reviewing, blocked. Do not send free-text details, prompts, URLs or raw tool inputs/results."
+            "{prompt}\n\nWhile actively working, call subagent_progress with id={id}, code={code}, and kind chosen from working, reading, editing, testing, reviewing, blocked, after each other NovaGPT MCP tool call. This authenticated progress is how your parent knows that tool usage belongs to you; ordinary tool calls cannot be safely attributed to a specific worker. Do not send free-text details, prompts, URLs or raw tool inputs/results."
         );
         let tool_instructions = connector_name.map(|name| format!(
             "**NovaGPT workspace tools**\nYour coding workspace is managed by the NovaGPT connector named {}.\nYou MUST use this specific connected app/plugin to interact with the workspace whenever its tools are available. Discover the actual tool namespace and exposed capabilities before attempting file operations. Do not derive the namespace from the display name. For existing-file modifications use authenticated subagent_apply_patch; for new files use subagent_create_file; report activity through subagent_progress and completion through subagent_finished when exposed. Use the current private execution credential supplied by NovaGPT. Never print it, include it in reports, or expose it in logs. A successful server receipt is required before claiming a file was created or modified. If required tools are missing, disconnected, disabled, or inaccessible, report that explicitly; do not silently switch plugins or claim modifications.",
@@ -1066,37 +1104,8 @@ impl AgentManager {
             "blocked" => "Worker reported a blocker",
             _ => return Err(AgentError::Invalid),
         };
-        let sequence = entry
-            .info
-            .activity_sequence
-            .checked_add(1)
-            .ok_or(AgentError::ActivityDenied)?;
-        let timestamp_ms = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        let event = ActivityEvent {
-            id: id.to_owned(),
-            epoch: entry.epoch,
-            sequence,
-            timestamp_ms,
-            kind: kind.to_owned(),
-            description,
-        };
-        entry.info.activity_sequence = sequence;
         entry.activity_reports += 1;
-        entry.activity_events.push_back(event.clone());
-        if entry.activity_events.len() > MAX_ACTIVITY_EVENTS
-            && let Some(evicted) = entry.activity_events.pop_front()
-        {
-            entry.activity_dropped_before = evicted.sequence;
-        }
-        // Lifecycle watchers will ignore running-to-running progress events.
-        entry.updates.send_replace(entry.info.clone());
-        Ok(event)
+        entry.record_activity(kind, description)
     }
 
     /// Read-only activity snapshot. No credential is disclosed.
@@ -1245,6 +1254,7 @@ impl AgentManager {
             "subagent_create_file" => "subagent_create_file",
             _ => return Err(AgentError::Invalid),
         };
+        entry.record_activity("tool_probe", "Authenticated capability probe")?;
         Ok(AgentToolProbe {
             id: id.to_owned(),
             capability,
@@ -1295,6 +1305,7 @@ impl AgentManager {
                 if !entry.accept_code(&code) {
                     return Err(AgentError::PatchDenied);
                 }
+                entry.record_activity("patch_attempt", "Authenticated patch request")?;
                 let workspace_id = entry.info.workspace_id.clone();
                 let target = manager
                     .inner
@@ -1387,6 +1398,7 @@ impl AgentManager {
                 if !entry.accept_code(&code) {
                     return Err(AgentError::PatchDenied);
                 }
+                entry.record_activity("create_attempt", "Authenticated file creation request")?;
                 entry.create_attempts += 1;
                 entry.info.workspace_id.clone()
             };
@@ -1706,6 +1718,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("other.rs")).expect("read"),
             "untouched\n"
+        );
+        let activity = manager.activity(&info.id).await.expect("worker activity");
+        assert_eq!(
+            activity
+                .events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "tool_probe",
+                "create_attempt",
+                "patch_attempt",
+                "patch_attempt"
+            ]
+        );
+        assert_eq!(activity.cursor, 4);
+        assert!(
+            activity
+                .events
+                .iter()
+                .all(|event| !event.description.contains("approved.rs")
+                    && !event.description.contains(&code)),
+            "event text must never contain paths or worker credentials"
         );
         manager
             .finished(&info.id, &code, "done")
@@ -2453,7 +2488,10 @@ mod tests {
         let feed = manager.activity(&worker.id).await.expect("feed");
         assert_eq!(feed.events.len(), MAX_ACTIVITY_EVENTS);
         assert_eq!(feed.cursor, u64::from(MAX_ACTIVITY_REPORTS));
-        assert_eq!(feed.dropped_before, 32);
+        assert_eq!(
+            feed.dropped_before,
+            u64::from(MAX_ACTIVITY_REPORTS) - MAX_ACTIVITY_EVENTS as u64
+        );
         assert!(
             feed.events
                 .iter()
