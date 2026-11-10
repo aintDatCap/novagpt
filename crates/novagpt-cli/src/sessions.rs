@@ -253,6 +253,12 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, SessionStore) {
         let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+                .expect("private session directory");
+        }
         let store = SessionStore::new(dir.path().join(FILE_NAME));
         (dir, store)
     }
