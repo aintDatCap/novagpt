@@ -96,6 +96,14 @@ const ASSISTANTS: &str = "[data-message-author-role='assistant']";
 const MAX_PROMPT: usize = 80_000;
 const MAX_REPLY: usize = 180_000;
 const MAX_DIAGNOSTIC_EVENTS: usize = 24;
+// An idle tab times out after five minutes. A visibly generating reply is
+// allowed a longer but still finite deadline; never replay an uncertain send.
+const REPLY_SOFT_TIMEOUT: Duration = Duration::from_secs(300);
+const REPLY_ACTIVE_TIMEOUT: Duration = Duration::from_secs(900);
+
+fn reply_timed_out(elapsed: Duration, generating: bool) -> bool {
+    elapsed >= REPLY_ACTIVE_TIMEOUT || (elapsed >= REPLY_SOFT_TIMEOUT && !generating)
+}
 type DiagnosticReporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Error)]
@@ -1590,10 +1598,11 @@ impl ChatGptBrowser {
             *page.pending_before.lock().await = Some(before);
             before
         };
-        // Longer research/coding turns can legitimately exceed three minutes.
-        // Keep a finite bound: timeout after submission is always uncertain
-        // and must never trigger an automatic replay.
-        let deadline = Instant::now() + Duration::from_secs(300);
+        // A response can remain visibly active beyond the normal deadline.
+        // Inspect live page state *before* deciding whether the turn timed out;
+        // a fixed clock alone incorrectly marked live workers as waiting.
+        let reply_started = Instant::now();
+        let mut extended = false;
         let mut last = String::new();
         let mut stable = 0;
         loop {
@@ -1601,12 +1610,20 @@ impl ChatGptBrowser {
                 *page.pending_before.lock().await = None;
                 return Err(BrowserError::Cancelled);
             }
-            if Instant::now() >= deadline {
+            let state = self.dom_state(&page).await?;
+            page.note_state(&state).await;
+            let elapsed = reply_started.elapsed();
+            let generating = state["generating"]
+                .as_bool()
+                .unwrap_or(state["complete"] == false);
+            if reply_timed_out(elapsed, generating) {
                 page.diagnostic("reply_timeout", "").await;
                 return Err(BrowserError::Timeout);
             }
-            let state = self.dom_state(&page).await?;
-            page.note_state(&state).await;
+            if elapsed >= REPLY_SOFT_TIMEOUT && !extended {
+                page.diagnostic("reply_generation_continues", "").await;
+                extended = true;
+            }
             if let Some(manual) = manual_reason(&state) {
                 *page.manual.lock().await = Some(manual.to_owned());
                 page.diagnostic("manual_check_after_send", manual).await;
@@ -1684,12 +1701,14 @@ impl ChatGptBrowser {
             const assistants = [...document.querySelectorAll({})];
             const last = assistants[assistants.length - 1];
             const content = last?.querySelector('.markdown, [data-message-content], .prose') || last;
-            const stop = [...document.querySelectorAll('[data-testid="stop-button"]')].some(isVisible);
+            const stop = [...document.querySelectorAll(
+                '[data-testid="stop-button"], button[aria-label="Stop"], button[aria-label="Stop generating"], button[aria-label="Interrompi"]'
+            )].some(isVisible);
             const copy = !!last?.querySelector('[data-testid="copy-turn-action-button"]');
             return {{url:location.href, title, page_kind:'chatgpt',
                 composer:!!editor, challenge, login,
                 assistant_count:assistants.length, last_text:content?.innerText || '',
-                complete:copy || !stop}};"#,
+                generating:stop, complete:copy || !stop}};"#,
             json!(ASSISTANTS)
         ));
         page.eval(&expression).await
@@ -1953,6 +1972,17 @@ mod tests {
         sync::Mutex,
         time::timeout,
     };
+
+    #[test]
+    fn reply_timeout_allows_live_generation_but_remains_bounded() {
+        assert!(!reply_timed_out(Duration::from_secs(299), false));
+        assert!(reply_timed_out(Duration::from_secs(300), false));
+        // A real screenshot showed both workers still generating at 300 s.
+        assert!(!reply_timed_out(Duration::from_secs(300), true));
+        assert!(!reply_timed_out(Duration::from_secs(899), true));
+        assert!(reply_timed_out(Duration::from_secs(900), true));
+        assert!(reply_timed_out(Duration::from_secs(901), false));
+    }
 
     #[test]
     fn manual_checks_are_never_bypassed() {
