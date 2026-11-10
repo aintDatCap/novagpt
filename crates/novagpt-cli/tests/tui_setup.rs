@@ -87,7 +87,9 @@ fn different_workspaces_use_same_global_settings_without_local_config() {
     fs::write(
         global.join("config.json"),
         serde_json::json!({
-            "version": 1, "port": 9193, "vm_enabled": true
+            "version": 1, "port": 9193, "vm_enabled": true,
+            "chatgpt_project_url": "https://chatgpt.com/g/g-p-abc123/project",
+            "future_setting": {"active": true}
         })
         .to_string(),
     )

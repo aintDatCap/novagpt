@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -32,7 +33,7 @@ fn read_limited(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct LocalSettings {
     pub version: u8,
     pub language: crate::i18n::LanguageChoice,
@@ -47,6 +48,10 @@ pub struct LocalSettings {
     /// Optional ChatGPT project page used as the start page for every new
     /// subagent conversation, so the group can be deleted in one action.
     pub chatgpt_project_url: Option<String>,
+    /// Preserve options introduced by newer releases when an older NovaGPT
+    /// loads and saves the same per-user configuration file.
+    #[serde(flatten)]
+    pub(crate) unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 impl Default for LocalSettings {
     fn default() -> Self {
@@ -62,6 +67,7 @@ impl Default for LocalSettings {
             ngrok_enabled: false,
             ngrok_domain: None,
             chatgpt_project_url: None,
+            unknown_fields: BTreeMap::new(),
         }
     }
 }
@@ -308,6 +314,58 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"port":8787,"ngrok_enabled":true}"#).unwrap();
         assert!(!config.auto_start_mcp);
         assert_eq!(config.language, crate::i18n::LanguageChoice::Auto);
+    }
+
+    #[test]
+    fn newer_settings_survive_load_modify_save() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let future = serde_json::json!({
+            "version": 1,
+            "port": 8787,
+            "chatgpt_project_url": "https://chatgpt.com/g/g-p-abc123/project",
+            "future_option": {"enabled": true, "limits": [1, 2, 3]},
+            "future_flag": false
+        });
+        fs::write(dir.path().join("config.json"), future.to_string()).unwrap();
+
+        let mut settings = load_from(dir.path()).unwrap();
+        assert_eq!(
+            settings.chatgpt_project_url.as_deref(),
+            Some("https://chatgpt.com/g/g-p-abc123/project")
+        );
+        assert_eq!(
+            settings.unknown_fields["future_option"],
+            future["future_option"]
+        );
+        settings.port = 9000;
+        save_to(&settings, dir.path()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+        assert_eq!(saved["future_option"], future["future_option"]);
+        assert_eq!(saved["future_flag"], future["future_flag"]);
+        assert_eq!(saved["chatgpt_project_url"], future["chatgpt_project_url"]);
+        assert_eq!(saved["port"], 9000);
+        assert_eq!(load_from(dir.path()).unwrap(), settings);
+    }
+
+    #[test]
+    fn unknown_settings_do_not_hide_invalid_known_fields() {
+        assert!(
+            serde_json::from_str::<LocalSettings>(r#"{"port":"not a number","future_field":true}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<LocalSettings>(r#"{"version":2,"future_field":true}"#)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

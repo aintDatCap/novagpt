@@ -60,6 +60,8 @@ Settings are shared across the current operating-system user, regardless of the 
 - **Authorized directories:** Add or remove existing directories explicitly.
 - **Import NovaGPT workspace settings:** Preview and import selected connection preferences from another NovaGPT workspace configuration, with confirmation. Secrets and workspace permissions are not imported.
 
+For compatibility with settings written by a newer NovaGPT release, unknown `config.json` fields are preserved when loading and saving. Known fields and the configuration version are still validated. An older binary released before this behavior was implemented may still fail to load newer settings; update that binary rather than deleting configuration fields.
+
 Changes remain in a draft until saved with `s`. During guided setup, pressing **s** immediately opens the save confirmation, even before the review step; **Enter** accepts this non-destructive save (or select **No** to cancel). Other sensitive confirmations, including installing ngrok, still default to **No**. Enabling Automatic ngrok and/or Start MCP automatically never starts either service during setup and does not prevent saving. If saving fails, the reason appears in a dialog without changing the saved settings. Most changes that affect the running server require stopping and restarting MCP; changing the TUI language or auto-start setting does not alter the already-running server.
 
 ## Activity and diagnostics
