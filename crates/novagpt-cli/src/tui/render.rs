@@ -8,8 +8,12 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{
+        Axis, Bar, BarChart, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem,
+        ListState, Paragraph, Tabs, Wrap,
+    },
 };
 const ACCENT: Color = Color::Rgb(104, 203, 220);
 const MUTED: Color = Color::Rgb(148, 161, 176);
@@ -208,6 +212,11 @@ fn config_value(app: &App, index: usize) -> String {
                 },
             ),
         },
+        18 => format!(
+            "{}{}",
+            on(app.draft.usage_profiler_enabled, lang),
+            dirty_mark(app.draft.usage_profiler_enabled != app.persisted.usage_profiler_enabled)
+        ),
         17 => format!(
             "{}{}",
             app.draft
@@ -469,6 +478,239 @@ fn dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     frame.render_widget(List::new(items).block(panel(&caption)), sections[1]);
 }
+fn usage(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let italian = app.language() == Language::Italian;
+    if app.usage_loading && app.usage_report.is_none() {
+        frame.render_widget(
+            Paragraph::new(if italian {
+                "Caricamento metriche private..."
+            } else {
+                "Loading private usage metrics..."
+            })
+            .block(panel("Usage")),
+            area,
+        );
+        return;
+    }
+    if let Some(error) = &app.usage_error {
+        frame.render_widget(Paragraph::new(error.as_str()).block(panel("Usage")), area);
+        return;
+    }
+    let Some(report) = app.usage_report.as_ref() else {
+        frame.render_widget(Paragraph::new(if italian {
+            "Premi R per caricare i dati. Attiva il profiler nelle impostazioni per raccogliere nuove misure."
+        } else { "Press R to load data. Enable the profiler in Settings to collect new measurements." })
+            .wrap(Wrap { trim: true }).block(panel("Usage")), area);
+        return;
+    };
+    let totals = &report.totals;
+    let estimated = totals
+        .estimated_input
+        .saturating_add(totals.estimated_output);
+    let provider = totals.provider_input.saturating_add(totals.provider_output);
+    let costs = if totals.provider_cost_micros.is_empty() {
+        "n/a".to_string()
+    } else {
+        totals
+            .provider_cost_micros
+            .iter()
+            .map(|(currency, micros)| {
+                format!(
+                    "{currency} {}.{:06}",
+                    micros / 1_000_000,
+                    micros % 1_000_000
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let description = if italian {
+        "Stime: lunghezza richieste/risposte / 4 (NON dati fatturati)"
+    } else {
+        "Estimates: request/response characters / 4 (NOT billed tokens)"
+    };
+    let heading = [
+        Line::from(format!(
+            " {}: {}  |  {}: {}  |  {}: {}",
+            if italian { "Chiamate" } else { "Calls" },
+            totals.calls,
+            if italian { "Errori" } else { "Errors" },
+            totals.errors,
+            if italian {
+                "Non disponibili"
+            } else {
+                "Unavailable"
+            },
+            totals.unavailable_calls
+        )),
+        Line::from(format!(
+            " {}: {}   |   {}: {}",
+            if italian {
+                "Token provider"
+            } else {
+                "Provider tokens"
+            },
+            provider,
+            if italian {
+                "Stima locale"
+            } else {
+                "Local estimate"
+            },
+            estimated
+        )),
+        Line::from(format!(
+            " {}: {}    |    {}: {}",
+            if italian {
+                "Cache input"
+            } else {
+                "Cached input"
+            },
+            totals.cached_input,
+            if italian {
+                "Costo provider"
+            } else {
+                "Provider cost"
+            },
+            costs
+        )),
+        Line::from(Span::styled(description, Style::default().fg(WARN))),
+        Line::from(if app.persisted.usage_profiler_enabled {
+            if italian {
+                " Registrazione attiva · R aggiorna · report fino a 30 giorni"
+            } else {
+                " Recording enabled · R refreshes · up to 30 days retained"
+            }
+        } else if italian {
+            " Registrazione disattivata · abilita nelle impostazioni e riavvia MCP"
+        } else {
+            " Recording disabled · enable in Settings and restart MCP"
+        }),
+    ];
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(2)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(heading.to_vec()).wrap(Wrap { trim: true }),
+        sections[0],
+    );
+    if report.timeline.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if italian {
+                "Nessun record disponibile. Il profiler e disattivato per impostazione predefinita."
+            } else {
+                "No usage records. The profiler is disabled by default."
+            })
+            .block(panel("Usage")),
+            sections[1],
+        );
+        return;
+    }
+    let large = sections[1].width >= 92;
+    let charts = Layout::default()
+        .direction(if large {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(sections[1]);
+    // Recent cumulative tokens for the recorded events, not wall-clock billing.
+    let samples: Vec<_> = report
+        .timeline
+        .iter()
+        .rev()
+        .take(80)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let preceding = report.timeline.len().saturating_sub(samples.len() + 1);
+    let (base_provider, base_estimate) = if report.timeline.len() > samples.len() {
+        let prior = &report.timeline[preceding];
+        (prior.provider_total, prior.estimated_total)
+    } else {
+        (0, 0)
+    };
+    let provider_points: Vec<(f64, f64)> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, point)| {
+            (
+                i as f64,
+                point.provider_total.saturating_sub(base_provider) as f64,
+            )
+        })
+        .collect();
+    let estimate_points: Vec<(f64, f64)> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, point)| {
+            (
+                i as f64,
+                point.estimated_total.saturating_sub(base_estimate) as f64,
+            )
+        })
+        .collect();
+    let max_y = provider_points
+        .iter()
+        .chain(&estimate_points)
+        .map(|(_, y)| *y)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let max_x = samples.len().saturating_sub(1).max(1) as f64;
+    let datasets = vec![
+        Dataset::default()
+            .name("Provider")
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(OK))
+            .data(&provider_points),
+        Dataset::default()
+            .name(if italian { "Stima" } else { "Estimate" })
+            .graph_type(GraphType::Line)
+            .marker(symbols::Marker::Braille)
+            .style(Style::default().fg(ACCENT))
+            .data(&estimate_points),
+    ];
+    let chart = Chart::new(datasets)
+        .block(panel(if italian {
+            "Token cumulativi (ultimi eventi)"
+        } else {
+            "Cumulative tokens (recent events)"
+        }))
+        .x_axis(Axis::default().bounds([0.0, max_x]).labels(vec![
+            Line::from("0"),
+            Line::from(format!("{}", samples.len().saturating_sub(1))),
+        ]))
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, max_y * 1.1])
+                .labels(vec![Line::from("0"), Line::from(format!("{max_y:.0}"))]),
+        );
+    frame.render_widget(chart, charts[0]);
+    let mut top: Vec<_> = report.by_stage.iter().collect();
+    top.sort_by_key(|a| std::cmp::Reverse(a.1.calls));
+    let bars: Vec<Bar<'static>> = top
+        .into_iter()
+        .take(if large { 7 } else { 5 })
+        .map(|(name, total)| Bar::with_label(shorten(name, 11), total.calls))
+        .collect();
+    frame.render_widget(
+        BarChart::new(bars)
+            .block(panel(if italian {
+                "Chiamate per strumento"
+            } else {
+                "Calls by tool"
+            }))
+            .bar_width(if large { 4 } else { 3 })
+            .bar_gap(1)
+            .bar_style(Style::default().fg(ACCENT))
+            .value_style(Style::default().fg(OK)),
+        charts[1],
+    );
+}
+
 fn config_help(index: usize, lang: Language) -> &'static str {
     match index {
         0 => Messages::port_on_which_novagpt_exposes_mcp_locally(lang),
@@ -486,6 +728,7 @@ fn config_help(index: usize, lang: Language) -> &'static str {
         15 => Messages::choose_english_italian_or_automatic_system_language(lang),
         16 => Messages::auto_start_mcp_help(lang),
         17 => Messages::chatgpt_project_url_help(lang),
+        18 => Messages::usage_profiler_help(lang),
         _ => Messages::next_setup_help(lang),
     }
 }
@@ -530,7 +773,7 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut section = "";
     for &i in app.config_order() {
         let group = match i {
-            15 => Messages::settings_general(lang),
+            15 | 18 => Messages::settings_general(lang),
             0 | 16 | 11 | 12 | 10 => Messages::settings_connection(lang),
             2 | 3 | 17 => Messages::settings_browser_heading(lang),
             1 => Messages::virtual_machines(lang),
@@ -1018,6 +1261,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         Messages::tab_activity(lang),
         Messages::tab_settings(lang),
         Messages::tab_chat(lang),
+        Messages::tab_usage(lang),
     ])
     .select(app.tab)
     .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
@@ -1027,7 +1271,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         0 => commands(frame, app, slots[2]),
         1 => dashboard(frame, app, slots[2]),
         2 => config(frame, app, slots[2]),
-        _ => chat(frame, app, slots[2]),
+        3 => chat(frame, app, slots[2]),
+        _ => usage(frame, app, slots[2]),
     }
     let keys = if app.modal.is_some() {
         Messages::enter_confirm_esc_cancel(lang)
@@ -1036,7 +1281,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
             0 => Messages::keys_overview(lang),
             1 => Messages::keys_activity(lang),
             2 => Messages::fields_enter_edit_s_save_tab_views(lang),
-            _ => Messages::chat_input_hint(lang),
+            3 => Messages::chat_input_hint(lang),
+            _ => Messages::usage_refresh_hint(lang),
         }
     };
     let foot = vec![

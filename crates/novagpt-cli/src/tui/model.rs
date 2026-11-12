@@ -28,8 +28,9 @@ pub(super) fn command_label(index: usize, lang: Language) -> &'static str {
     }
 }
 
-pub(super) const CONFIG_ORDER: [usize; 18] =
-    [15, 0, 16, 11, 12, 10, 2, 3, 17, 1, 4, 5, 6, 7, 13, 8, 9, 14];
+pub(super) const CONFIG_ORDER: [usize; 19] = [
+    15, 18, 0, 16, 11, 12, 10, 2, 3, 17, 1, 4, 5, 6, 7, 13, 8, 9, 14,
+];
 pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
     match index {
         0 => i18n::Messages::http_port(lang),
@@ -50,6 +51,7 @@ pub(super) fn config_label(index: usize, lang: Language) -> &'static str {
         15 => i18n::Messages::settings_language(lang),
         16 => i18n::Messages::auto_start_mcp(lang),
         17 => i18n::Messages::chatgpt_project_url(lang),
+        18 => i18n::Messages::usage_profiler(lang),
         _ => "",
     }
 }
@@ -163,6 +165,7 @@ pub(super) enum Effect {
     OpenAgentBrowser(LocalSettings),
     ShowSubagentChrome,
     LoadAudit,
+    LoadUsage,
     ExportAudit,
     LoadSessions,
     ChatSend {
@@ -202,6 +205,7 @@ pub(super) enum OperationEvent {
     BrowserLoginFinished(Result<(), BrowserOpenFailure>),
     BrowserShowFinished(Result<(), ()>),
     AuditLoaded(Result<Vec<novagpt_mcp::AuditEvent>, String>),
+    UsageLoaded(Result<novagpt_core::usage::UsageReport, String>),
     AuditExported(Result<PathBuf, String>),
     ChatFinished(Result<ChatOutcome, String>),
     SessionsLoaded(Vec<SessionRecord>),
@@ -243,6 +247,9 @@ pub(super) struct App {
     pub logs: VecDeque<LogEntry>,
     pub audit_logs: VecDeque<LogEntry>,
     pub audit_view: bool,
+    pub usage_report: Option<novagpt_core::usage::UsageReport>,
+    pub usage_loading: bool,
+    pub usage_error: Option<String>,
     pub log_offset: usize,
     pub status: String,
     pub clipboard_feedback: Option<String>,
@@ -299,6 +306,9 @@ impl App {
             logs: VecDeque::new(),
             audit_logs: VecDeque::new(),
             audit_view: false,
+            usage_report: None,
+            usage_loading: false,
+            usage_error: None,
             log_offset: 0,
             status: "Ready".into(),
             clipboard_feedback: None,
@@ -404,6 +414,18 @@ impl App {
     pub fn on_event(&mut self, event: OperationEvent) {
         match event {
             OperationEvent::Log(level, text) => self.log(level, text),
+            OperationEvent::UsageLoaded(result) => {
+                self.usage_loading = false;
+                match result {
+                    Ok(report) => {
+                        self.usage_report = Some(report);
+                        self.usage_error = None;
+                    }
+                    Err(_) => {
+                        self.usage_error = Some("Unable to read private usage data".into());
+                    }
+                }
+            }
             OperationEvent::AuditLoaded(outcome) => {
                 self.busy = false;
                 match outcome {
@@ -867,13 +889,20 @@ impl App {
             _ => None,
         }
     }
+    fn navigate_tab(&mut self, next: usize) -> Option<Effect> {
+        self.tab = next % 5;
+        if self.tab == 4 {
+            self.usage_loading = true;
+            Some(Effect::LoadUsage)
+        } else {
+            None
+        }
+    }
     fn chat_key(&mut self, key: KeyEvent) -> Option<Effect> {
         match key.code {
             KeyCode::Esc => self.tab = 0,
-            KeyCode::Tab => self.tab = (self.tab + 1) % 4,
-            KeyCode::BackTab => self.tab = (self.tab + 3) % 4,
-            KeyCode::Left => self.tab = 2,
-            KeyCode::Right => self.tab = 0,
+            KeyCode::Tab | KeyCode::Right => return self.navigate_tab(4),
+            KeyCode::BackTab | KeyCode::Left => return self.navigate_tab(2),
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.chat = ChatState::default();
                 self.log_localized(Level::Info, i18n::Messages::chat_new_conversation);
@@ -1074,6 +1103,13 @@ impl App {
     }
     fn config_action(&mut self) -> Option<Effect> {
         match self.config {
+            18 => {
+                self.draft.usage_profiler_enabled = !self.draft.usage_profiler_enabled;
+                self.log(
+                    Level::Info,
+                    "Usage profiler preference changed. Save and restart MCP to apply.",
+                );
+            }
             16 => {
                 self.draft.auto_start_mcp = !self.draft.auto_start_mcp;
                 self.log_localized(Level::Info, i18n::Messages::auto_start_changed);
@@ -1345,10 +1381,12 @@ impl App {
                     self.command = self.visible_commands()[0];
                 }
             }
-            KeyCode::Tab => self.tab = (self.tab + 1) % 4,
-            KeyCode::BackTab => self.tab = (self.tab + 3) % 4,
-            KeyCode::Left => self.tab = (self.tab + 3) % 4,
-            KeyCode::Right => self.tab = (self.tab + 1) % 4,
+            KeyCode::Tab | KeyCode::Right => return self.navigate_tab(self.tab + 1),
+            KeyCode::BackTab | KeyCode::Left => return self.navigate_tab(self.tab + 4),
+            KeyCode::Char('r') if self.tab == 4 && !self.usage_loading => {
+                self.usage_loading = true;
+                return Some(Effect::LoadUsage);
+            }
             KeyCode::Char('h') if self.tab == 1 && !self.busy => {
                 if self.audit_view {
                     self.audit_view = false;
@@ -1390,12 +1428,14 @@ impl App {
                     self.log_offset =
                         (self.log_offset + 1).min(self.visible_logs().len().saturating_sub(1))
                 }
-                _ => self.select_config(-1),
+                2 => self.select_config(-1),
+                _ => {}
             },
             KeyCode::Down => match self.tab {
                 0 => self.select_command(1),
                 1 => self.log_offset = self.log_offset.saturating_sub(1),
-                _ => self.select_config(1),
+                2 => self.select_config(1),
+                _ => {}
             },
             KeyCode::PageUp if self.tab == 1 => {
                 self.log_offset =

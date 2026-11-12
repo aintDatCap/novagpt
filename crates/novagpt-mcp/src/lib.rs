@@ -1,6 +1,7 @@
 //! Official rmcp-based protocol and transport boundary.
 mod audit;
 mod output_store;
+mod usage;
 pub use audit::{AuditEvent, AuditTrail};
 use axum::{
     Router,
@@ -32,6 +33,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::{future::Future, net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
+pub use usage::UsageProfiler;
 
 #[derive(Clone, Default)]
 pub struct NovaExtras {
@@ -42,6 +44,7 @@ pub struct NovaExtras {
     pub browser_bridge: Option<BrowserBridge>,
     pub output_store: OutputStore,
     pub audit: AuditTrail,
+    pub usage: UsageProfiler,
     /// Explicitly approved public tunnel hostname. Never accepts a wildcard.
     pub http_public_hostname: Option<String>,
 }
@@ -75,9 +78,17 @@ impl NovaMcp {
         Self { workspaces, extras }
     }
     fn observed(&self, tool: &'static str, result: CallToolResult) -> CallToolResult {
-        self.extras
-            .audit
-            .record(tool, result.is_error.unwrap_or(false));
+        let failed = result.is_error.unwrap_or(false);
+        self.extras.audit.record(tool, failed);
+        if self.extras.usage.enabled() {
+            // Only the length is retained; response content never reaches telemetry.
+            let chars =
+                serde_json::to_string(&result).map_or(0, |serialized| serialized.chars().count());
+            let repository_id = self.workspaces.default_workspace().workspace_id;
+            self.extras
+                .usage
+                .observe_tool(tool, chars, failed, &repository_id);
+        }
         result
     }
 

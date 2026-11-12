@@ -177,15 +177,24 @@ mod tests {
         assert_eq!(a.tab, 2);
         a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 3);
+        assert!(matches!(a.key(key(KeyCode::Tab)), Some(Effect::LoadUsage)));
+        assert_eq!(a.tab, 4);
         a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 0);
-        a.key(key(KeyCode::BackTab));
+        assert!(matches!(
+            a.key(key(KeyCode::BackTab)),
+            Some(Effect::LoadUsage)
+        ));
+        assert_eq!(a.tab, 4);
+        a.key(key(KeyCode::Left));
         assert_eq!(a.tab, 3);
         a.key(key(KeyCode::Left));
         assert_eq!(a.tab, 2);
         a.key(key(KeyCode::Right));
         assert_eq!(a.tab, 3);
         a.key(key(KeyCode::Tab));
+        a.key(key(KeyCode::Tab));
+        assert_eq!(a.tab, 0);
         let selected = a.key(key(KeyCode::Char('4')));
         assert_eq!(a.command, 2);
         assert!(matches!(selected, Some(Effect::Diagnose(_))));
@@ -828,7 +837,11 @@ mod tests {
         let mut a = app();
         a.tab = 2;
         a.key(key(KeyCode::Up));
+        assert_eq!(a.config, 18);
+        a.key(key(KeyCode::Up));
         assert_eq!(a.config, 15);
+        a.key(key(KeyCode::Down));
+        assert_eq!(a.config, 18);
         a.key(key(KeyCode::Down));
         assert_eq!(a.config, 0);
         a.key(key(KeyCode::Down));
@@ -1322,5 +1335,81 @@ mod tests {
         assert!(shown.contains("CHATGPT SESSIONS"));
         assert!(shown.contains("https://chatgpt.com/c/aaa"));
         assert!(shown.contains("TUI chat"));
+    }
+    #[test]
+    fn usage_tab_shows_labeled_graphs_and_refreshes_without_blocking_input() {
+        let mut a = app();
+        assert!(!a.persisted.usage_profiler_enabled);
+        a.tab = 3;
+        assert!(matches!(a.key(key(KeyCode::Tab)), Some(Effect::LoadUsage)));
+        assert_eq!(a.tab, 4);
+        assert!(a.usage_loading);
+
+        let mut report = novagpt_core::usage::UsageReport::default();
+        report.totals.calls = 2;
+        report.totals.estimated_output = 55;
+        report.by_stage.insert(
+            "read".into(),
+            novagpt_core::usage::UsageTotals {
+                calls: 2,
+                ..Default::default()
+            },
+        );
+        report.timeline = vec![
+            novagpt_core::usage::UsagePoint {
+                unix_seconds: 123,
+                provider_total: 0,
+                estimated_total: 20,
+            },
+            novagpt_core::usage::UsagePoint {
+                unix_seconds: 124,
+                provider_total: 0,
+                estimated_total: 55,
+            },
+        ];
+        a.on_event(OperationEvent::UsageLoaded(Ok(report)));
+        assert!(!a.usage_loading);
+        for (width, height) in [(120, 34), (80, 24), (35, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render::draw(frame, &a)).unwrap();
+            if width == 120 {
+                let buffer: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(buffer.contains("Cumulative tokens"));
+                assert!(buffer.contains("Calls by tool"));
+                assert!(buffer.contains("NOT billed"));
+            }
+        }
+        assert!(matches!(
+            a.key(key(KeyCode::Char('r'))),
+            Some(Effect::LoadUsage)
+        ));
+        assert!(a.usage_loading);
+        assert!(a.key(key(KeyCode::Char('r'))).is_none());
+        a.on_event(OperationEvent::UsageLoaded(Err("private path".into())));
+        assert_eq!(
+            a.usage_error.as_deref(),
+            Some("Unable to read private usage data")
+        );
+        assert!(!a.usage_error.as_ref().unwrap().contains("private path"));
+    }
+
+    #[test]
+    fn usage_profiler_requires_explicit_saved_opt_in() {
+        let mut a = app();
+        a.tab = 2;
+        a.config = 18;
+        assert!(!a.draft.usage_profiler_enabled);
+        a.key(key(KeyCode::Enter));
+        assert!(a.draft.usage_profiler_enabled);
+        assert!(!a.persisted.usage_profiler_enabled);
+        assert!(a.dirty());
+        a.key(key(KeyCode::Enter));
+        assert!(!a.draft.usage_profiler_enabled);
     }
 }

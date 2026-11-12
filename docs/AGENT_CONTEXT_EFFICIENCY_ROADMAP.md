@@ -84,6 +84,8 @@ Every implementation PR must include: fixture identifiers, before/after usage ta
 
 **Done when.** One reproducible baseline report covers a full task; provider numbers reconcile with the supplied usage fixture; estimates are visibly labeled; private retention and opt-out work; existing audit behavior remains unchanged.
 
+**Implementation update (2026-11-12).** Phase A's opt-in accounting foundation and private reporting are implemented in `novagpt-core/src/usage.rs`, `novagpt-mcp/src/usage.rs`, and the CLI/TUI. See [USAGE_PROFILER.md](USAGE_PROFILER.md) for the schema, privacy/retention contract, CLI, and Ratatui usage charts. The fixture tests validate provider amounts, local estimates, idempotency, expiry, and concurrency. The active ChatGPT Web backend does **not** expose provider billing: only explicitly labeled local character-based estimates are recorded. A 20-task comparative benchmark and live API provider reconciliation remain **NOT RUN**; do not claim cost savings or full production billing visibility from this implementation.
+
 ## 4. Phase B (P0): Structured Output Engine
 
 **Need.** Verbose command output can consume context. Blindly truncating logs can hide the exact error an agent needs. NovaGPT already has bounded capture and short-lived output paging, but does not select diagnostics by command semantics.

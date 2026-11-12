@@ -43,6 +43,8 @@ pub struct LocalSettings {
     pub browser_enabled: bool,
     pub chrome_executable: Option<PathBuf>,
     pub auto_start_mcp: bool,
+    /// Opt-in metadata-only tool usage profiler (never records prompts or results).
+    pub usage_profiler_enabled: bool,
     pub ngrok_enabled: bool,
     pub ngrok_domain: Option<String>,
     /// Optional ChatGPT project URL override. When absent, the browser finds
@@ -64,6 +66,7 @@ impl Default for LocalSettings {
             browser_enabled: false,
             chrome_executable: None,
             auto_start_mcp: false,
+            usage_profiler_enabled: false,
             ngrok_enabled: false,
             ngrok_domain: None,
             chatgpt_project_url: None,

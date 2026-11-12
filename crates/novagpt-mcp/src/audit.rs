@@ -65,7 +65,7 @@ fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
-fn private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() || !meta.is_dir() {

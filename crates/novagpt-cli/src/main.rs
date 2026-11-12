@@ -148,6 +148,11 @@ enum Command {
         #[command(subcommand)]
         action: LogsCommand,
     },
+    /// Read the private, metadata-only usage profiler report.
+    Usage {
+        #[command(subcommand)]
+        action: UsageCommand,
+    },
     /// Import an approved qcow2/VHDX disk to NovaGPT's owned VM image store.
     VmImport {
         #[arg(long)]
@@ -192,6 +197,15 @@ enum TokenCommand {
         /// Read the secret from piped standard input instead of a hidden terminal prompt.
         #[arg(long)]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Show provider versus locally estimated token usage and per-tool calls.
+    Report {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -295,6 +309,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("workspace root must be an existing directory".into());
     }
     let local = LocalSettings::load()?;
+    if let Some(Command::Usage { action }) = &cli.command {
+        let directory = logging::audit_directory(&root)?;
+        let report = tokio::task::spawn_blocking(move || {
+            novagpt_mcp::UsageProfiler::persisted_report(&directory)
+        })
+        .await??;
+        match action {
+            UsageCommand::Report { json: true } => {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            UsageCommand::Report { json: false } => {
+                let totals = &report.totals;
+                println!("NovaGPT usage (private metadata, last 30 days)");
+                println!(
+                    "Calls: {} | Errors: {} | Unavailable: {}",
+                    totals.calls, totals.errors, totals.unavailable_calls
+                );
+                println!(
+                    "Provider tokens: input={} output={} cached input={} reasoning output={}",
+                    totals.provider_input,
+                    totals.provider_output,
+                    totals.cached_input,
+                    totals.reasoning_output
+                );
+                println!(
+                    "Local estimates: input={} output={} (NOT provider-billed tokens)",
+                    totals.estimated_input, totals.estimated_output
+                );
+                for (currency, micros) in &totals.provider_cost_micros {
+                    println!(
+                        "Provider cost: {currency} {}.{:06}",
+                        micros / 1_000_000,
+                        micros % 1_000_000
+                    );
+                }
+                if totals.provider_cost_micros.is_empty() {
+                    println!("Provider cost: unavailable");
+                }
+                for (tool, usage) in &report.by_stage {
+                    println!("  {tool}: {} calls, {} errors", usage.calls, usage.errors);
+                }
+            }
+        }
+        return Ok(());
+    }
     if let Some(Command::Logs { action }) = &cli.command {
         let directory = logging::audit_directory(&root)?;
         match action {
@@ -517,9 +576,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None) => None,
         _ => return Err("--chatgpt-chrome and --chatgpt-profile must be supplied together".into()),
     };
-    let audit = novagpt_mcp::AuditTrail::persistent(logging::audit_directory(&root)?)?;
+    let audit_dir = logging::audit_directory(&root)?;
+    let audit = novagpt_mcp::AuditTrail::persistent(audit_dir.clone())?;
+    let usage = if local.usage_profiler_enabled {
+        novagpt_mcp::UsageProfiler::persistent(audit_dir)?
+    } else {
+        novagpt_mcp::UsageProfiler::disabled()
+    };
     let agents = browser.as_ref().map(|browser| {
         let agent_audit = audit.clone();
+        let agent_usage = usage.clone();
         let session_runtime = tokio::runtime::Handle::current();
         AgentManager::new(
             workspaces.clone(),
@@ -528,6 +594,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_diagnostic_reporter(move |id, stage| {
             agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
         })
+        .with_usage_reporter(
+            move |id, repository_id, input_chars, output_chars, failed| {
+                agent_usage.observe_model_turn(
+                    id,
+                    repository_id,
+                    input_chars,
+                    output_chars,
+                    failed,
+                );
+            },
+        )
         .with_conversation_recorder(move |id, url| {
             // Owner-private index only: no prompt or reply is written here.
             let id = id.to_owned();
@@ -558,6 +635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         browser_bridge,
         output_store: novagpt_mcp::OutputStore::default(),
         audit,
+        usage,
         http_public_hostname: None,
     };
     match cli.command {
@@ -681,7 +759,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.bytes
             );
         }
-        Some(Command::Token { .. } | Command::Logs { .. } | Command::ChromeDriver { .. }) => {
+        Some(
+            Command::Token { .. }
+            | Command::Logs { .. }
+            | Command::Usage { .. }
+            | Command::ChromeDriver { .. },
+        ) => {
             unreachable!("local commands handled above")
         }
         Some(

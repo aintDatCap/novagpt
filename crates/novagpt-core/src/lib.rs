@@ -11,6 +11,7 @@ mod inspect_ops;
 mod patch_ops;
 mod pro_context;
 mod process_output;
+pub mod usage;
 mod workspace;
 mod worktree_ops;
 

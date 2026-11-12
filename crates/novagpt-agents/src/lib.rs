@@ -473,6 +473,8 @@ impl Entry {
 type AgentDiagnosticReporter = Arc<dyn Fn(&str, AgentLogStage) + Send + Sync>;
 /// Receives (agent id, conversation URL). Must not block.
 type ConversationRecorder = Arc<dyn Fn(&str, &str) + Send + Sync>;
+/// Opaque agent/repository identifiers, request/reply character counts and failure only.
+type AgentUsageReporter = Arc<dyn Fn(&str, &str, usize, Option<usize>, bool) + Send + Sync>;
 
 struct Inner {
     backend: Arc<dyn AgentBackend>,
@@ -483,6 +485,7 @@ struct Inner {
     /// Monotonic completion order for bounded tab eviction.
     next_completed_seq: AtomicU64,
     reporter: OnceLock<AgentDiagnosticReporter>,
+    usage_reporter: OnceLock<AgentUsageReporter>,
     /// Optional owner-facing session index observer. Receives the agent id and
     /// the validated conversation URL; never prompts or replies.
     conversation_recorder: OnceLock<ConversationRecorder>,
@@ -503,6 +506,7 @@ impl AgentManager {
                 max_live_tabs: MAX_LIVE_TABS,
                 next_completed_seq: AtomicU64::new(1),
                 reporter: OnceLock::new(),
+                usage_reporter: OnceLock::new(),
                 conversation_recorder: OnceLock::new(),
             }),
         }
@@ -515,6 +519,16 @@ impl AgentManager {
         reporter: impl Fn(&str, AgentLogStage) + Send + Sync + 'static,
     ) -> Self {
         let _ = self.inner.reporter.set(Arc::new(reporter));
+        self
+    }
+
+    /// Configure a non-blocking metadata-only usage observer for backend turns.
+    /// No prompt or reply bodies are forwarded; counts are estimates, not billing.
+    pub fn with_usage_reporter(
+        self,
+        reporter: impl Fn(&str, &str, usize, Option<usize>, bool) + Send + Sync + 'static,
+    ) -> Self {
+        let _ = self.inner.usage_reporter.set(Arc::new(reporter));
         self
     }
 
@@ -695,11 +709,18 @@ impl AgentManager {
             );
         }
         self.emit(&id, AgentLogStage::Created);
-        self.start(id, prompt, true, 1);
+        self.start(id, prompt, true, 1, info.workspace_id.clone());
         Ok(info)
     }
 
-    fn start(&self, id: String, prompt: String, must_create: bool, epoch: u64) {
+    fn start(
+        &self,
+        id: String,
+        prompt: String,
+        must_create: bool,
+        epoch: u64,
+        workspace_id: String,
+    ) {
         let manager = self.clone();
         tokio::spawn(async move {
             let outcome = async {
@@ -722,6 +743,15 @@ impl AgentManager {
                     return Err(BackendFailure::Unavailable);
                 }
                 let reply = manager.inner.backend.send(&id, &prompt).await;
+                if let Some(reporter) = manager.inner.usage_reporter.get() {
+                    reporter(
+                        &id,
+                        &workspace_id,
+                        prompt.chars().count(),
+                        reply.as_ref().ok().map(|(text, _)| text.chars().count()),
+                        reply.is_err(),
+                    );
+                }
                 let stage = match &reply {
                     Ok(_) => AgentLogStage::BrowserReplyReceived,
                     Err(BackendFailure::Uncertain(_)) => AgentLogStage::BrowserReplyUncertain,
@@ -981,7 +1011,13 @@ impl AgentManager {
         let created = !entry.ready;
         let info = entry.info.clone();
         drop(agents);
-        self.start(id.to_owned(), prompt, created, epoch);
+        self.start(
+            id.to_owned(),
+            prompt,
+            created,
+            epoch,
+            info.workspace_id.clone(),
+        );
         Ok(info)
     }
 
@@ -2030,6 +2066,55 @@ mod tests {
             seen.as_slice(),
             [(info.id.clone(), "https://chatgpt.com/c/mock".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn usage_observer_reports_bounded_counts_for_spawn_and_followup() {
+        let dir = tempfile::tempdir().expect("fixture");
+        type UsageTuple = (String, String, usize, Option<usize>, bool);
+        let seen: Arc<std::sync::Mutex<Vec<UsageTuple>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).expect("registry"),
+            Arc::new(FakeBackend),
+        )
+        .with_usage_reporter(move |id, repo, input_chars, output_chars, failed| {
+            sink.lock().expect("sink").push((
+                id.to_string(),
+                repo.to_string(),
+                input_chars,
+                output_chars,
+                failed,
+            ));
+        });
+        let first = manager
+            .spawn(SpawnAgent {
+                workspace_id: None,
+                task: "private-only-fixture".into(),
+                role: AgentRole::Explorer,
+                paths: vec![],
+                context: None,
+            })
+            .await
+            .expect("spawn");
+        let finished = manager.wait(&first.id, 2).await.expect("first turn");
+        assert_eq!(finished.agent.state, AgentState::Completed);
+        manager
+            .message(&first.id, "followup")
+            .await
+            .expect("followup");
+        let followed = manager.wait(&first.id, 2).await.expect("second turn");
+        assert_eq!(followed.agent.state, AgentState::Completed);
+        let seen = seen.lock().expect("recorded usage");
+        assert_eq!(seen.len(), 2);
+        for (id, repo, input, output, failed) in seen.iter() {
+            assert_eq!(id, &first.id);
+            assert_eq!(repo, &first.workspace_id);
+            assert!(*input > 8);
+            assert!(output.is_some_and(|chars| chars > 0));
+            assert!(!failed);
+        }
     }
 
     #[tokio::test]

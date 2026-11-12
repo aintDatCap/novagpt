@@ -71,6 +71,15 @@ impl Controller {
                     let _ = tx.send(OperationEvent::NgrokInstallFinished(result));
                 }));
             }
+            Effect::LoadUsage => {
+                let tx = self.tx.clone();
+                self.runtime.spawn_blocking(move || {
+                    let result = crate::logging::audit_directory(&root)
+                        .and_then(|dir| novagpt_mcp::UsageProfiler::persisted_report(&dir))
+                        .map_err(|_| "Saved usage report unavailable".to_string());
+                    let _ = tx.send(OperationEvent::UsageLoaded(result));
+                });
+            }
             Effect::LoadAudit => {
                 let tx = self.tx.clone();
                 self.runtime.spawn_blocking(move || {
@@ -485,14 +494,26 @@ impl Controller {
                         .map_err(|_| "Invalid audit directory.".to_string())?,
                 )
                 .map_err(|_| "Audit storage unavailable or unsafe.".to_string())?;
+                let usage = if config.usage_profiler_enabled {
+                    novagpt_mcp::UsageProfiler::persistent(
+                        crate::logging::audit_directory(&root)
+                            .map_err(|_| "Invalid usage directory.".to_string())?,
+                    ).map_err(|_| "Usage storage unavailable or unsafe.".to_string())?
+                } else {
+                    novagpt_mcp::UsageProfiler::disabled()
+                };
                 let agents = browser.as_ref().map(|browser| {
                     let agent_audit = audit.clone();
+                    let agent_usage = usage.clone();
                     let runtime = session_runtime.clone();
                     novagpt_agents::AgentManager::new(
                         workspaces.clone(),
                         Arc::new(novagpt_agents::ChatGptBackend::new(browser.clone())),
                     ).with_diagnostic_reporter(move |id, stage| {
                         agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+                    })
+                    .with_usage_reporter(move |id, repository_id, input_chars, output_chars, failed| {
+                        agent_usage.observe_model_turn(id, repository_id, input_chars, output_chars, failed);
                     })
                     .with_conversation_recorder(move |id, url| {
                         // Owner-private index only: prompts and replies are never stored.
@@ -523,6 +544,7 @@ impl Controller {
                         output_store: novagpt_mcp::OutputStore::default(),
                         http_public_hostname: None,
                         audit,
+                        usage,
                     },
                     resolved.value,
                 ))
