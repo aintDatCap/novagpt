@@ -56,7 +56,7 @@ Settings are shared across the current operating-system user, regardless of the 
 - **Automatic ngrok:** When enabled, starting MCP normally also starts an owned ngrok tunnel.
 - **ngrok hostname:** Optional hostname already assigned to your ngrok account; only the hostname is accepted, without a scheme or path.
 - **Browser and virtual machines:** Disabled by default; enable only when needed.
-- **ChatGPT subagent project URL:** Optional project page such as `https://chatgpt.com/g/g-p-abc123/project`. When set, every new subagent conversation is created inside that project, so deleting the project in ChatGPT deletes the whole group. Create the project in ChatGPT first; NovaGPT never creates or deletes it. If ChatGPT leaves the project before the first prompt, the send is refused instead of creating a conversation outside it.
+- **ChatGPT subagent project URL:** Optional override, such as `https://chatgpt.com/g/g-p-abc123/project`. Leave it blank for the default: NovaGPT searches for or creates the project **NovaGPT - subagents** in the visible, authenticated Chrome session on the first new subagent chat and reuses it afterward. If project setup cannot be verified, NovaGPT blocks the new worker without sending its prompt; complete any required login or verification manually. Existing chats are not moved, and deleting the project is always a user action in ChatGPT. A supplied URL is never auto-created; the first prompt must remain in that selected project.
 - **Authorized directories:** Add or remove existing directories explicitly.
 - **Import NovaGPT workspace settings:** Preview and import selected connection preferences from another NovaGPT workspace configuration, with confirmation. Secrets and workspace permissions are not imported.
 

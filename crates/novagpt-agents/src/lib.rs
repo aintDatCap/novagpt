@@ -367,6 +367,9 @@ fn map_browser(error: BrowserError) -> BackendFailure {
         BrowserError::ProjectMismatch => BackendFailure::Blocked(
             "ChatGPT left the designated subagent project; no message was sent outside it",
         ),
+        BrowserError::ProjectSetup => BackendFailure::Blocked(
+            "Could not prepare the NovaGPT - subagents project; inspect the visible browser tab. No prompt was sent",
+        ),
         _ => BackendFailure::Unavailable,
     }
 }

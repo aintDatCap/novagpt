@@ -1,7 +1,7 @@
 # ADR 0004 — Browser-mediated TUI chat, session index and subagent project
 
 **Date:** 2026-11-09
-**Status:** Accepted. Deterministic tests implemented; live ChatGPT login, Cloudflare and reply completion remain unverified.
+**Status:** Accepted (manual-only project setup superseded by [ADR 0005](0005-automatic-subagent-project.md)). Deterministic tests implemented; live ChatGPT login, Cloudflare and reply completion remain unverified.
 
 ## Context
 

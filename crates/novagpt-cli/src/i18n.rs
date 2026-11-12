@@ -417,7 +417,7 @@ messages! {
         session_opening_in_browser: { en: "Opening the conversation in the dedicated browser...", it: "Apertura conversazione nel browser dedicato..." },
         session_open_failed: { en: "Could not open the conversation.", it: "Impossibile aprire la conversazione." },
         chatgpt_project_url: { en: "ChatGPT subagent project URL", it: "URL progetto ChatGPT sottoagenti" },
-        chatgpt_project_url_help: { en: "Paste a project URL (https://chatgpt.com/g/g-p-.../project): new subagent chats are created there and can be deleted together.", it: "Incolla l'URL di un progetto (https://chatgpt.com/g/g-p-.../project): le nuove chat dei sottoagenti nascono lì e si eliminano insieme." },
+        chatgpt_project_url_help: { en: "Optional override. Leave blank to find or create the NovaGPT - subagents project automatically. Otherwise paste its ChatGPT project URL.", it: "Opzionale. Lascia vuoto per trovare o creare automaticamente il progetto NovaGPT - subagents. In alternativa, incolla l'URL del progetto ChatGPT." },
         chatgpt_project_invalid: { en: "Enter a project URL like https://chatgpt.com/g/g-p-.../project.", it: "Inserisci un URL progetto come https://chatgpt.com/g/g-p-.../project." },
         chat_role_you: { en: "you", it: "tu" },
         chat_role_chatgpt: { en: "ChatGPT", it: "ChatGPT" },

@@ -85,6 +85,10 @@ cargo run -p novagpt-cli -- \
 
 With this scope, `browser_navigate` can access `http://127.0.0.1:3000/` and its paths. Other loopback ports, hostnames, HTTP-to-HTTPS changes and redirects to unapproved origins are rejected. **Without the flag, explicit localhost/127.0.0.1/[::1] HTTP(S) addresses on any port are permitted.** The port is on the **machine running NovaGPT**, not the ChatGPT client's device; if Vite binds only to `::1`, use `localhost` or `[::1]` rather than `127.0.0.1`. The same dedicated per-user Chrome profile is used for subagents and browsing; its data survives a NovaGPT restart, but cookies/session expiration and identity-provider rules may require renewed **manual** authentication. This does not expose a personal Chrome profile and does not authorize arbitrary JavaScript, local files or internal services. Public HTTPS DNS rebinding remains a known limitation.
 
+### Automatic grouping of subagent conversations
+
+With ChatGPT Browser enabled, NovaGPT uses the visible, authenticated Chrome session to find or create the ChatGPT project **NovaGPT - subagents** before opening the first new worker conversation. All subsequent new worker tabs use its verified project URL. The URL cache stays within the dedicated browser profile, and setup is serialized to prevent duplicate creation under concurrent spawns. An explicit **ChatGPT subagent project URL** in TUI Settings overrides the automatic project. Login and challenges remain manual: if the project cannot be verified, worker startup stops without sending the task. This does not move existing conversations or affect the built-in Chat page. Delete the project yourself in ChatGPT when appropriate. See [ADR 0005](decisions/0005-automatic-subagent-project.md).
+
 Call `subagent_spawn`:
 
 ```json

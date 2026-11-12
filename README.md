@@ -13,7 +13,7 @@ You run NovaGPT on your own machine. ChatGPT connects to it through a protected 
 - **Run commands:** execute development commands in your computer's normal shell.
 - **Connect multiple conversations:** different ChatGPT conversations can access the same project without copying it.
 - **Optional tools:** use a dedicated Chrome browser through NovaGPT-managed ChromeDriver, subagents or virtual machines when configured.
-- **Chat from the terminal:** ask ChatGPT from the built-in Chat page through the same dedicated browser, reopen earlier conversations, and keep subagent chats together in one optional ChatGPT project you can delete in one action.
+- **Chat from the terminal:** ask ChatGPT from the built-in Chat page through the same dedicated browser and reopen earlier conversations. New subagent chats automatically go into the **NovaGPT - subagents** ChatGPT project (created through your visible browser if needed); an optional project URL can override it.
 
 > **Security:** NovaGPT's shell runs with your user account's permissions; it is not sandboxed. Give access only to ChatGPT connections you trust. Keep your connector URL and token secret.
 

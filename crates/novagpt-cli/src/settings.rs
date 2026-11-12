@@ -45,8 +45,8 @@ pub struct LocalSettings {
     pub auto_start_mcp: bool,
     pub ngrok_enabled: bool,
     pub ngrok_domain: Option<String>,
-    /// Optional ChatGPT project page used as the start page for every new
-    /// subagent conversation, so the group can be deleted in one action.
+    /// Optional ChatGPT project URL override. When absent, the browser finds
+    /// or creates the NovaGPT - subagents project before opening a new worker.
     pub chatgpt_project_url: Option<String>,
     /// Preserve options introduced by newer releases when an older NovaGPT
     /// loads and saves the same per-user configuration file.
