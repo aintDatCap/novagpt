@@ -160,7 +160,7 @@ async fn opened_project(tab: &WebDriverTab) -> Result<Option<String>, BrowserErr
     Ok(None)
 }
 
-async fn cached(profile: &Path) -> Option<String> {
+pub(crate) async fn cached(profile: &Path) -> Option<String> {
     let path = profile.join(CACHE);
     let info = fs::symlink_metadata(&path).await.ok()?;
     if !info.is_file() || info.file_type().is_symlink() || info.len() > MAX_CACHE {
@@ -206,12 +206,18 @@ async fn save(profile: &Path, url: &str) {
 
 pub(crate) async fn ensure(tab: &WebDriverTab, profile: &Path) -> Result<String, BrowserError> {
     if let Some(url) = cached(profile).await {
-        tab.goto(&url).await.map_err(BrowserError::from)?;
+        // The worker tab may already be loading the cached project; do not
+        // navigate again if it is on that URL.
+        if tab.current_url().await.map_err(BrowserError::from)? != url {
+            tab.goto(&url).await.map_err(BrowserError::from)?;
+        }
         if verified(tab, &url).await? {
             return Ok(url);
         }
     }
-    tab.goto(HOME).await.map_err(BrowserError::from)?;
+    if tab.current_url().await.map_err(BrowserError::from)? != HOME {
+        tab.goto(HOME).await.map_err(BrowserError::from)?;
+    }
     // Wait for client-side hydration and check existing projects first.
     for _ in 0..8 {
         let existing = inspect(tab, "existing").await?;
