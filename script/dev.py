@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Run NovaGPT in development; rebuild and restart only on explicit MCP request.
 
-Requires Python 3 and Cargo. POSIX only: the owned server runs in a process
-group so unexpected children can be stopped on timeout.
+Requires Python 3 and Cargo. Owns a POSIX process group or a Windows
+process group, so the previous development server is stopped on restart.
+Windows restart control uses a loopback-only socket with a random capability.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import secrets
 from pathlib import Path
 import shutil
 import signal
@@ -35,10 +37,41 @@ def sources(root: Path) -> tuple[tuple[str, int, int], ...]:
     return tuple(sorted(found))
 
 
+def process_group_options() -> dict:
+    """Start a separate owned process group on the current platform."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
 def stop_owned(process: subprocess.Popen[bytes], grace: float = 8.0) -> None:
-    """Ask NovaGPT to drain and stop its ngrok; forcibly stop its group on timeout."""
+    """Stop the owned child gracefully, then its process tree if necessary."""
     if process.poll() is not None:
         process.wait()
+        return
+    if os.name == "nt":
+        try:
+            # Windows console control, scoped to CREATE_NEW_PROCESS_GROUP.
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+            process.wait(timeout=grace)
+            return
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            print("[dev] Windows graceful shutdown unavailable; stopping owned tree", flush=True)
+            if process.poll() is None:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if process.poll() is None:
+                process.kill()
+            process.wait()
         return
     try:
         process.send_signal(signal.SIGTERM)
@@ -70,27 +103,43 @@ class Runner:
         self.control_directory: tempfile.TemporaryDirectory[str] | None = None
         self.control_path: Path | None = None
         self.control_listener: socket.socket | None = None
+        self.control_port: int | None = None
+        self.control_token: str | None = None
         self.restart_due_at: float | None = None
 
     def request_stop(self, _signal: int, _frame: object) -> None:
         self.stopping = True
 
     def open_manual_control(self) -> None:
-        """Create an owner-private local socket; only the owned MCP child gets its path."""
-        self.control_directory = tempfile.TemporaryDirectory(prefix="novagpt-dev-control-")
-        self.control_path = Path(self.control_directory.name) / "restart.sock"
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            listener.bind(str(self.control_path))
-            os.chmod(self.control_path, 0o600)
-            listener.listen(4)
-            listener.setblocking(False)
-        except OSError:
-            listener.close()
-            self.close_manual_control()
-            raise
+        """Open private local restart control; only the MCP child gets access."""
+        if os.name == "nt":
+            # Windows has no portable stdlib Unix listener. An ephemeral
+            # loopback port requires a fresh 256-bit capability in the request.
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(4)
+                listener.setblocking(False)
+            except OSError:
+                listener.close()
+                raise
+            self.control_port = listener.getsockname()[1]
+            self.control_token = secrets.token_hex(32)
+        else:
+            self.control_directory = tempfile.TemporaryDirectory(prefix="novagpt-dev-control-")
+            self.control_path = Path(self.control_directory.name) / "restart.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(self.control_path))
+                os.chmod(self.control_path, 0o600)
+                listener.listen(4)
+                listener.setblocking(False)
+            except OSError:
+                listener.close()
+                self.close_manual_control()
+                raise
         self.control_listener = listener
-        print("[dev] restart only on explicit MCP debug_restart request", flush=True)
+        print("[dev] restart only on explicit authenticated MCP debug_restart request", flush=True)
 
     def close_manual_control(self) -> None:
         if self.control_listener is not None:
@@ -100,9 +149,11 @@ class Runner:
             self.control_directory.cleanup()
             self.control_directory = None
         self.control_path = None
+        self.control_port = None
+        self.control_token = None
 
     def poll_manual_control(self) -> None:
-        """Acknowledge a bounded local request before scheduling a graceful restart."""
+        """Validate one bounded request before scheduling a graceful restart."""
         if self.control_listener is None:
             return
         try:
@@ -112,13 +163,25 @@ class Runner:
         with connection:
             connection.settimeout(0.25)
             try:
-                command = connection.recv(32)
-                if command != b"restart\n":
+                # A TCP request may be split into several packets; stay
+                # bounded even if an unauthenticated peer never sends a newline.
+                request = bytearray()
+                while len(request) < 128 and b"\n" not in request:
+                    chunk = connection.recv(128 - len(request))
+                    if not chunk:
+                        break
+                    request.extend(chunk)
+                if os.name == "nt":
+                    expected = f"{self.control_token} restart\n".encode("ascii")
+                    authorized = secrets.compare_digest(bytes(request), expected)
+                else:
+                    authorized = bytes(request) == b"restart\n"
+                if not authorized:
                     connection.sendall(b"invalid\n")
                 elif self.restart_due_at is not None:
                     connection.sendall(b"pending\n")
                 else:
-                    # Let the MCP success response leave the process before stopping it.
+                    # Let the MCP response leave the process before shutdown.
                     self.restart_due_at = time.monotonic() + 2.0
                     connection.sendall(b"accepted\n")
                     print("[dev] authenticated MCP requested a manual rebuild", flush=True)
@@ -130,7 +193,7 @@ class Runner:
         self.build_process = subprocess.Popen(
             ["cargo", "build", "--target-dir", str(self.target), "-p", "novagpt-cli", "--bin", "novagpt"],
             cwd=self.root,
-            start_new_session=True,
+            **process_group_options(),
         )
         try:
             while self.build_process.poll() is None:
@@ -141,28 +204,37 @@ class Runner:
             if self.build_process.returncode:
                 print("[dev] build failed; keeping the last working NovaGPT running", flush=True)
                 return None
-            original = self.target / "debug" / "novagpt"
+            suffix = ".exe" if os.name == "nt" else ""
+            original = self.target / "debug" / f"novagpt{suffix}"
             if not original.is_file():
                 print("[dev] build succeeded but executable is missing; keeping old server", flush=True)
                 return None
             self.versions.mkdir(parents=True, exist_ok=True)
             self.counter += 1
-            staged = self.versions / f"novagpt-{os.getpid()}-{self.counter}"
+            staged = self.versions / f"novagpt-{os.getpid()}-{self.counter}{suffix}"
             shutil.copy2(original, staged)
             return staged
         finally:
             self.build_process = None
 
+    def binary_command(self, binary: Path) -> list[str]:
+        """Tests can supply a Python fixture; production starts the staged exe."""
+        return [str(binary)]
+
     def start(self, binary: Path) -> subprocess.Popen[bytes] | None:
-        args = [str(binary), "--root", str(self.root), "http", "--port", str(self.port)]
+        args = [*self.binary_command(binary), "--root", str(self.root), "http", "--port", str(self.port)]
         args.append("--ngrok" if self.ngrok else "--no-ngrok")
         if self.domain:
             args.extend(["--ngrok-domain", self.domain])
         environment = os.environ.copy()
-        environment.pop("NOVAGPT_DEV_RESTART_SOCKET", None)
+        for key in ("NOVAGPT_DEV_RESTART_SOCKET", "NOVAGPT_DEV_RESTART_PORT", "NOVAGPT_DEV_RESTART_TOKEN"):
+            environment.pop(key, None)
         if self.control_path is not None:
             environment["NOVAGPT_DEV_RESTART_SOCKET"] = str(self.control_path)
-        process = subprocess.Popen(args, cwd=self.root, env=environment, start_new_session=True)
+        if self.control_port is not None and self.control_token is not None:
+            environment["NOVAGPT_DEV_RESTART_PORT"] = str(self.control_port)
+            environment["NOVAGPT_DEV_RESTART_TOKEN"] = self.control_token
+        process = subprocess.Popen(args, cwd=self.root, env=environment, **process_group_options())
         print(f"[dev] starting build {binary.name} on port {self.port}", flush=True)
         deadline = time.monotonic() + 16.0
         while not self.stopping and time.monotonic() < deadline:
@@ -172,7 +244,7 @@ class Runner:
                 return None
             try:
                 check = subprocess.run(
-                    [str(binary), "--root", str(self.root), "connection-test", "--port", str(self.port)],
+                    [*self.binary_command(binary), "--root", str(self.root), "connection-test", "--port", str(self.port)],
                     cwd=self.root,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -254,9 +326,6 @@ class Runner:
 
 
 def main() -> int:
-    if os.name != "posix":
-        print("This dev runner currently supports Linux/macOS only.", file=sys.stderr)
-        return 2
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--ngrok", action="store_true", default=True)

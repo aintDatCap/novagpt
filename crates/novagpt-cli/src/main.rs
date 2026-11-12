@@ -97,7 +97,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    #[cfg(all(debug_assertions, unix))]
+    #[cfg(all(debug_assertions, any(unix, windows)))]
     /// Explicitly request a rebuild/restart of the supervised development server.
     /// Uses authenticated loopback MCP, not the supervisor socket directly.
     DebugRestart {
@@ -228,7 +228,18 @@ async fn http_stop_signal() {
             let _ = tokio::signal::ctrl_c().await;
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if let Ok(mut break_event) = tokio::signal::windows::ctrl_break() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = break_event.recv() => {},
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
@@ -353,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", tunnel::connector_url(&endpoint, &resolved.value)?);
                 return Ok(());
             }
-            #[cfg(all(debug_assertions, unix))]
+            #[cfg(all(debug_assertions, any(unix, windows)))]
             Command::DebugRestart { port } => {
                 let token = token::resolve()?.value;
                 match connection::restart(port.unwrap_or(local.port), &token).await? {
@@ -683,7 +694,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) => {
             unreachable!("read-only commands handled above")
         }
-        #[cfg(all(debug_assertions, unix))]
+        #[cfg(all(debug_assertions, any(unix, windows)))]
         Some(Command::DebugRestart { .. }) => {
             unreachable!("debug restart was handled above")
         }

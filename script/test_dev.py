@@ -3,13 +3,15 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch
 
-from dev import Runner, sources, stop_owned
+from dev import Runner, sources, stop_owned, process_group_options
 
 
 FAKE_SERVER = """#!/usr/bin/env python3
@@ -38,7 +40,6 @@ while True:
 """
 
 
-@unittest.skipUnless(os.name == "posix", "POSIX process groups required")
 class DevRunnerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -51,17 +52,54 @@ class DevRunnerTests(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         self.runner = Runner(self.root, port, False, None)
+        # Test fixtures are Python scripts rather than platform-specific executables.
+        self.runner.binary_command = lambda binary: [sys.executable, str(binary)]
         self.addCleanup(self.cleanup_server)
 
     def cleanup_server(self):
         if self.runner.process:
             stop_owned(self.runner.process, 2)
 
+    def control_connection(self):
+        if os.name == "nt":
+            return socket.create_connection(("127.0.0.1", self.runner.control_port), timeout=1)
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(1)
+        connection.connect(str(self.runner.control_path))
+        return connection
+
+    def control_command(self, command=b"restart\n", token=None):
+        if os.name == "nt":
+            capability = token if token is not None else self.runner.control_token
+            return capability.encode("ascii") + b" " + command
+        return command
+
     def binary(self, name):
-        path = self.root / name
+        path = self.root / (name + ".py")
         path.write_text(FAKE_SERVER, encoding="utf-8")
         path.chmod(0o700)
         return path
+
+    @unittest.skipUnless(os.name == "nt", "Windows loopback capability required")
+    def test_windows_restart_rejects_wrong_capability(self):
+        self.runner.open_manual_control()
+        self.addCleanup(self.runner.close_manual_control)
+        with self.control_connection() as connection:
+            connection.sendall(self.control_command(token="0" * 64))
+            self.runner.poll_manual_control()
+            self.assertEqual(connection.recv(32), b"invalid\n")
+        self.assertIsNone(self.runner.restart_due_at)
+        with self.control_connection() as connection:
+            connection.sendall(self.control_command())
+            self.runner.poll_manual_control()
+            self.assertEqual(connection.recv(32), b"accepted\n")
+
+    @unittest.skipUnless(os.name == "nt", "Windows process groups required")
+    def test_windows_processes_use_separate_process_group(self):
+        self.assertEqual(
+            process_group_options(),
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP},
+        )
 
     def test_build_snapshot_tracks_sources_not_generated_files(self):
         initial = sources(self.root)
@@ -75,30 +113,28 @@ class DevRunnerTests(unittest.TestCase):
         self.runner.open_manual_control()
         self.addCleanup(self.runner.close_manual_control)
         path = self.runner.control_path
-        self.assertIsNotNone(path)
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        if os.name == "nt":
+            self.assertIsNone(path)
+            self.assertIsNotNone(self.runner.control_port)
+            self.assertEqual(len(self.runner.control_token), 64)
+        else:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertIsNone(self.runner.restart_due_at)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(1)
-            connection.connect(str(path))
-            connection.sendall(b"restart\n")
+        with self.control_connection() as connection:
+            connection.sendall(self.control_command())
             self.runner.poll_manual_control()
             self.assertEqual(connection.recv(32), b"accepted\n")
         self.assertIsNotNone(self.runner.restart_due_at)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as duplicate:
-            duplicate.settimeout(1)
-            duplicate.connect(str(path))
-            duplicate.sendall(b"restart\n")
+        with self.control_connection() as duplicate:
+            duplicate.sendall(self.control_command())
             self.runner.poll_manual_control()
             self.assertEqual(duplicate.recv(32), b"pending\n")
 
     def test_manual_restart_rejects_unknown_commands(self):
         self.runner.open_manual_control()
         self.addCleanup(self.runner.close_manual_control)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(1)
-            connection.connect(str(self.runner.control_path))
-            connection.sendall(b"not-restart\n")
+        with self.control_connection() as connection:
+            connection.sendall(self.control_command(b"not-restart\n"))
             self.runner.poll_manual_control()
             self.assertEqual(connection.recv(32), b"invalid\n")
         self.assertIsNone(self.runner.restart_due_at)
@@ -107,8 +143,12 @@ class DevRunnerTests(unittest.TestCase):
         self.runner.open_manual_control()
         self.addCleanup(self.runner.close_manual_control)
         self.assertIsNotNone(self.runner.control_listener)
-        self.assertIsNotNone(self.runner.control_path)
-        self.assertEqual(self.runner.control_path.stat().st_mode & 0o777, 0o600)
+        if os.name == "nt":
+            self.assertIsNone(self.runner.control_path)
+            self.assertIsNotNone(self.runner.control_port)
+        else:
+            self.assertIsNotNone(self.runner.control_path)
+            self.assertEqual(self.runner.control_path.stat().st_mode & 0o777, 0o600)
         self.assertIsNone(self.runner.restart_due_at)
 
     def test_source_edit_does_not_restart_until_explicit_request(self):
@@ -136,10 +176,9 @@ class DevRunnerTests(unittest.TestCase):
                 self.assertIs(self.runner.process, first)
                 self.assertIsNone(first.poll())
 
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                with self.control_connection() as connection:
                     connection.settimeout(2)
-                    connection.connect(str(self.runner.control_path))
-                    connection.sendall(b"restart\n")
+                    connection.sendall(self.control_command())
                     self.assertEqual(connection.recv(32), b"accepted\n")
 
                 deadline = time.monotonic() + 5
@@ -186,8 +225,8 @@ class DevRunnerTests(unittest.TestCase):
         self.assertIsNotNone(self.runner.process)
         old = self.runner.process
         self.runner.current_binary = first
-        failing = self.root / "failing"
-        failing.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        failing = self.root / "failing.py"
+        failing.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
         failing.chmod(0o700)
         self.runner.compile = lambda: failing
         self.assertFalse(self.runner.rebuild())

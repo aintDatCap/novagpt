@@ -55,11 +55,11 @@ pub struct NovaMcp {
 impl NovaMcp {
     /// The release router contains no reference to the debug-only handler.
     fn configured_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
-        #[cfg(all(debug_assertions, unix))]
+        #[cfg(all(debug_assertions, any(unix, windows)))]
         {
             Self::tool_router() + Self::debug_tool_router()
         }
-        #[cfg(not(all(debug_assertions, unix)))]
+        #[cfg(not(all(debug_assertions, any(unix, windows))))]
         {
             Self::tool_router()
         }
@@ -595,6 +595,99 @@ async fn send_dev_restart(path: &std::path::Path) -> NovaResult<serde_json::Valu
         .map_err(|_| NovaError::InvalidInput("Manual-restart supervisor timed out".into()))?
 }
 
+#[cfg(all(debug_assertions, windows))]
+async fn send_dev_restart_windows(port: u16, token: &str) -> NovaResult<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(NovaError::InvalidInput(
+            "Invalid development restart capability".into(),
+        ));
+    }
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| NovaError::InvalidInput("Manual-restart supervisor unavailable".into()))?;
+        let request = format!("{token} restart\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|_| NovaError::InvalidInput("Could not request manual restart".into()))?;
+        let mut response = Vec::with_capacity(16);
+        let mut reader = tokio::io::BufReader::new(stream.take(16));
+        reader
+            .read_until(b'\n', &mut response)
+            .await
+            .map_err(|_| NovaError::InvalidInput("No manual-restart acknowledgement".into()))?;
+        match response.as_slice() {
+            b"accepted\n" => Ok(serde_json::json!({
+                "scheduled": true,
+                "message": "Rebuild and graceful restart scheduled by the development supervisor"
+            })),
+            b"pending\n" => Ok(serde_json::json!({
+                "scheduled": false,
+                "message": "A manual restart is already scheduled"
+            })),
+            _ => Err(NovaError::InvalidInput(
+                "Invalid manual-restart acknowledgement".into(),
+            )),
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), exchange)
+        .await
+        .map_err(|_| NovaError::InvalidInput("Manual-restart supervisor timed out".into()))?
+}
+
+#[cfg(all(test, debug_assertions, windows))]
+mod debug_restart_windows_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn loopback_acknowledgements_are_checked() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("loopback listener");
+        let port = listener.local_addr().expect("local address").port();
+        let token = "a".repeat(64);
+        let token_copy = token.clone();
+        let worker = tokio::spawn(async move {
+            for response in [b"accepted\n".as_slice(), b"pending\n".as_slice()] {
+                let (mut stream, _) = listener.accept().await.expect("connection");
+                let mut request = vec![0; 64 + b" restart\n".len()];
+                stream.read_exact(&mut request).await.expect("request");
+                assert_eq!(request, format!("{token_copy} restart\n").as_bytes());
+                stream.write_all(response).await.expect("acknowledgement");
+            }
+        });
+        assert_eq!(
+            send_dev_restart_windows(port, &token)
+                .await
+                .expect("accepted")["scheduled"],
+            true
+        );
+        assert_eq!(
+            send_dev_restart_windows(port, &token)
+                .await
+                .expect("pending")["scheduled"],
+            false
+        );
+        worker.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn invalid_token_and_missing_supervisor_fail_closed() {
+        assert!(send_dev_restart_windows(12345, "short").await.is_err());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve a port");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
+        let result = send_dev_restart_windows(port, &"b".repeat(64)).await;
+        assert!(result.is_err(), "unavailable supervisor must fail closed");
+    }
+}
+
 #[cfg(all(test, debug_assertions, unix))]
 mod debug_restart_tests {
     use super::*;
@@ -653,8 +746,10 @@ impl NovaMcp {
                 "audit_mode": self.extras.audit.snapshot(1).mode,
                 "write_mode": "workspace-guarded",
                 "transport_session_is_conversation_identity": false,
-                "debug_manual_restart_enabled": cfg!(all(debug_assertions, unix))
-                    && std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET").is_some(),
+                "debug_manual_restart_enabled": cfg!(all(debug_assertions, any(unix, windows)))
+                    && (std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET").is_some()
+                        || (std::env::var_os("NOVAGPT_DEV_RESTART_PORT").is_some()
+                            && std::env::var_os("NOVAGPT_DEV_RESTART_TOKEN").is_some())),
             }))),
         )
     }
@@ -1652,17 +1747,30 @@ impl NovaMcp {
     }
 }
 
-#[cfg(all(debug_assertions, unix))]
+#[cfg(all(debug_assertions, any(unix, windows)))]
 #[tool_router(router = debug_tool_router)]
 impl NovaMcp {
     #[tool(
-        description = "Request a manual rebuild and graceful MCP restart from the external POSIX development supervisor started by script/dev.py. Source changes never restart it automatically. Unavailable outside this supervised development mode; the current MCP connection may disconnect after acknowledgement."
+        description = "Request a manual rebuild and graceful MCP restart from script/dev.py, supported on POSIX and Windows. Source changes never trigger an automatic restart. The current MCP connection may disconnect after acknowledgement."
     )]
     async fn debug_restart(&self) -> CallToolResult {
+        #[cfg(unix)]
         let result = match std::env::var_os("NOVAGPT_DEV_RESTART_SOCKET") {
             Some(socket) if std::path::Path::new(&socket).is_absolute() => {
                 send_dev_restart(std::path::Path::new(&socket)).await
             }
+            _ => Err(NovaError::InvalidInput(
+                "Manual restart is unavailable; launch NovaGPT through script/dev.py".into(),
+            )),
+        };
+        #[cfg(windows)]
+        let result = match (
+            std::env::var("NOVAGPT_DEV_RESTART_PORT")
+                .ok()
+                .and_then(|value| value.parse::<u16>().ok()),
+            std::env::var("NOVAGPT_DEV_RESTART_TOKEN").ok(),
+        ) {
+            (Some(port), Some(token)) if port > 0 => send_dev_restart_windows(port, &token).await,
             _ => Err(NovaError::InvalidInput(
                 "Manual restart is unavailable; launch NovaGPT through script/dev.py".into(),
             )),
@@ -1848,7 +1956,18 @@ async fn http_shutdown_signal() {
             let _ = tokio::signal::ctrl_c().await;
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if let Ok(mut break_event) = tokio::signal::windows::ctrl_break() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = break_event.recv() => {},
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }

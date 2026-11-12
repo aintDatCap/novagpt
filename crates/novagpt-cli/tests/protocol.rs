@@ -277,7 +277,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             "missing tool: {name}"
         );
     }
-    let development_only = cfg!(all(debug_assertions, unix));
+    let development_only = cfg!(all(debug_assertions, any(unix, windows)));
     assert_eq!(
         listed.iter().any(|tool| tool["name"] == "debug_restart"),
         development_only,
@@ -492,7 +492,7 @@ fn local_debug_restart_command_is_absent_from_release_help() {
     let help = String::from_utf8(output.stdout).expect("UTF-8 help");
     assert_eq!(
         help.contains("debug-restart"),
-        cfg!(all(debug_assertions, unix)),
+        cfg!(all(debug_assertions, any(unix, windows))),
         "release builds must not expose the debug-restart command"
     );
 }

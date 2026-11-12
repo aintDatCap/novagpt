@@ -4,7 +4,7 @@ use std::{error::Error, io, time::Duration};
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
-#[cfg(all(debug_assertions, unix))]
+#[cfg(all(debug_assertions, any(unix, windows)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartStatus {
     Scheduled,
@@ -99,7 +99,7 @@ pub async fn probe(port: u16, token: &str) -> Result<Value, Box<dyn Error>> {
 /// A foreground-only CLI alternative when a ChatGPT connector's cached tool list
 /// has not yet exposed the debug_restart MCP tool. It invokes the same
 /// authenticated, supervisor-owned MCP operation; no direct socket access.
-#[cfg(all(debug_assertions, unix))]
+#[cfg(all(debug_assertions, any(unix, windows)))]
 pub async fn restart(port: u16, token: &str) -> Result<RestartStatus, Box<dyn Error>> {
     validate(port, token)?;
     let client = client()?;
