@@ -119,6 +119,17 @@ async fn click_marked(tab: &WebDriverTab) -> Result<(), BrowserError> {
         .map_err(|_| BrowserError::ProjectSetup)
 }
 
+async fn press_marked_button(tab: &WebDriverTab) -> Result<(), BrowserError> {
+    // The sidebar Add new project button can be hover-only and overlap the
+    // content pane. Keyboard activation avoids an intercepted mouse click.
+    tab.find("button[data-novagpt-subagent-project-target='1']")
+        .await
+        .map_err(|_| BrowserError::ProjectSetup)?
+        .send_keys("\u{E007}")
+        .await
+        .map_err(|_| BrowserError::ProjectSetup)
+}
+
 async fn verified(tab: &WebDriverTab, expected: &str) -> Result<bool, BrowserError> {
     for _ in 0..16 {
         let current = tab.current_url().await.map_err(BrowserError::from)?;
@@ -246,7 +257,7 @@ pub(crate) async fn ensure(tab: &WebDriverTab, profile: &Path) -> Result<String,
     if kind(&start) != "control" {
         return Err(BrowserError::ProjectSetup);
     }
-    click_marked(tab).await?;
+    press_marked_button(tab).await?;
     let mut input_ready = false;
     for _ in 0..20 {
         let input = inspect(tab, "name-input").await?;

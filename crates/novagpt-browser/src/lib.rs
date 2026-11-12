@@ -924,7 +924,9 @@ impl ChatGptBrowser {
         // Validate the owned Chrome process before reusing a remembered tab.
         let _ = self.chrome().await?;
         if self.page(BROWSE_TAB).await.is_err() {
-            match self.open(BROWSE_TAB).await {
+            // Browsing must remain available if subagent project setup fails.
+            // Only worker tabs should enter the automatic project flow.
+            match self.open_url(BROWSE_TAB, HOME, true).await {
                 Ok(()) | Err(BrowserError::Unavailable) => {}
                 Err(error) => return Err(error),
             }
@@ -2309,6 +2311,7 @@ mod tests {
         project_ui_missing: bool,
         project_verification: bool,
         project_creations: usize,
+        project_keyboard_activations: usize,
         project_pending: String,
         project_draft: String,
         logs: Vec<Value>,
@@ -2462,7 +2465,11 @@ mod tests {
             && path.ends_with("/value")
         {
             let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            state.project_draft = parsed["text"].as_str().unwrap_or_default().to_owned();
+            if parsed["text"] == "\u{E007}" && state.project_pending == "new-project" {
+                state.project_keyboard_activations += 1;
+            } else {
+                state.project_draft = parsed["text"].as_str().unwrap_or_default().to_owned();
+            }
             return (200, json!({"value":null}));
         }
         if method == "POST" && path.ends_with("/execute/sync") {
@@ -2796,6 +2803,7 @@ mod tests {
         assert!(mock.project_exists);
         assert_eq!(mock.project_draft, project_setup::NAME);
         assert_eq!(mock.project_creations, 1);
+        assert_eq!(mock.project_keyboard_activations, 1);
         assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
         drop(mock);
         browser.shutdown().await;
@@ -3243,6 +3251,25 @@ mod tests {
                 .any(|event| event == "recovery_blocked_by_verification")
         );
         assert_eq!(diagnostics.manual_check.as_deref(), Some("verification"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn browsing_does_not_require_subagent_project_setup() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.project_ui_enabled = true;
+            mock.project_ui_missing = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.inner.auto_project.store(true, Ordering::Relaxed);
+        browser.browse_open().await.expect("browse without project");
+        let mock = state.lock().await;
+        assert_eq!(mock.project_creations, 0);
+        assert_eq!(mock.url, "about:blank");
+        drop(mock);
+        browser.shutdown().await;
         server.abort();
     }
 
