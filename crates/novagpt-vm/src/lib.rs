@@ -1,4 +1,6 @@
 //! Opt-in disposable VM management. Never touches other application VM state.
+pub mod windows_guest;
+pub mod windows_unattend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
