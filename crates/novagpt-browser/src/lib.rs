@@ -584,7 +584,6 @@ struct Inner {
     /// worker tab, so subagent conversations can be removed together.
     project_url: RwLock<Option<String>>,
     project_setup_lock: Mutex<()>,
-    project_setup_tab: Mutex<Option<WebDriverTab>>,
     auto_project: AtomicBool,
 }
 #[derive(Clone)]
@@ -631,7 +630,6 @@ impl ChatGptBrowser {
                 last_open: Mutex::new(None),
                 project_url: RwLock::new(None),
                 project_setup_lock: Mutex::new(()),
-                project_setup_tab: Mutex::new(None),
                 auto_project: AtomicBool::new(true),
             }),
         })
@@ -660,7 +658,6 @@ impl ChatGptBrowser {
                 last_open: Mutex::new(None),
                 project_url: RwLock::new(None),
                 project_setup_lock: Mutex::new(()),
-                project_setup_tab: Mutex::new(None),
                 auto_project: AtomicBool::new(false),
             }),
         }
@@ -684,9 +681,6 @@ impl ChatGptBrowser {
     pub async fn shutdown(&self) {
         let chrome = self.inner.runtime.lock().await.take();
         self.inner.pages.lock().await.clear();
-        if let Some(setup_tab) = self.inner.project_setup_tab.lock().await.take() {
-            let _ = setup_tab.close().await;
-        }
         if let Some(chrome) = chrome {
             chrome.shutdown().await;
         }
@@ -797,42 +791,48 @@ impl ChatGptBrowser {
             .clone()
     }
 
-    async fn worker_project_url(&self) -> Result<String, BrowserError> {
-        if let Some(url) = self.project_url() {
-            return Ok(url);
-        }
-        if !self.inner.auto_project.load(Ordering::Relaxed) {
-            return Ok(HOME.to_owned());
-        }
-        // Serial setup prevents concurrent workers from creating duplicates.
-        let _guard = self.inner.project_setup_lock.lock().await;
-        if let Some(url) = self.project_url() {
-            return Ok(url);
-        }
-        let chrome = self.chrome().await?;
-        let previous = self.inner.project_setup_tab.lock().await.take();
-        let tab = match previous {
-            Some(tab) if !tab.is_closed() => tab,
-            _ => self.create_tab(&chrome, HOME).await?,
-        };
-        let result = project_setup::ensure(&tab, &self.inner.config.profile).await;
-        if result.is_err() {
-            // Keep one visible setup tab for a manual check or UI failure.
-            *self.inner.project_setup_tab.lock().await = Some(tab);
-        } else {
-            let _ = tab.close().await;
-        }
-        let url = result?;
-        self.set_project_url(Some(&url))?;
-        Ok(url)
-    }
-
     pub async fn open(&self, id: &str) -> Result<(), BrowserError> {
         if !safe_id(id) {
             return Err(BrowserError::Protocol);
         }
-        let project = self.worker_project_url().await?;
-        self.open_url(id, &project, false).await
+        if let Some(project) = self.project_url() {
+            return self.open_url(id, &project, false).await;
+        }
+        if !self.inner.auto_project.load(Ordering::Relaxed) {
+            return self.open_url(id, HOME, false).await;
+        }
+        // Only one worker discovers or creates the project. The first worker's
+        // own tab performs setup and then sends its task; no setup tab is made.
+        let _setup_guard = self.inner.project_setup_lock.lock().await;
+        if let Some(project) = self.project_url() {
+            return self.open_url(id, &project, false).await;
+        }
+        // A manual verification resume reuses the same unsent worker tab.
+        // New workers start at the cached URL when available, otherwise home.
+        let page = if let Ok(page) = self.page(id).await {
+            page
+        } else {
+            let start = project_setup::cached(&self.inner.config.profile)
+                .await
+                .unwrap_or_else(|| HOME.to_owned());
+            self.open_url(id, &start, false).await?;
+            self.page(id).await?
+        };
+        match project_setup::ensure(&page.transport, &self.inner.config.profile).await {
+            Ok(project) => {
+                self.set_project_url(Some(&project))?;
+                Ok(())
+            }
+            Err(error @ BrowserError::Manual(_)) => {
+                // Keep this visible tab for human verification and resume.
+                Err(error)
+            }
+            Err(error) => {
+                // Failed discovery must not leave an orphaned worker tab.
+                let _ = self.close(id).await;
+                Err(error)
+            }
+        }
     }
 
     /// Open a fresh ChatGPT conversation at the account home, deliberately
@@ -924,7 +924,9 @@ impl ChatGptBrowser {
         // Validate the owned Chrome process before reusing a remembered tab.
         let _ = self.chrome().await?;
         if self.page(BROWSE_TAB).await.is_err() {
-            match self.open(BROWSE_TAB).await {
+            // Browsing must remain available if subagent project setup fails.
+            // Only worker tabs should enter the automatic project flow.
+            match self.open_url(BROWSE_TAB, HOME, true).await {
                 Ok(()) | Err(BrowserError::Unavailable) => {}
                 Err(error) => return Err(error),
             }
@@ -2309,6 +2311,8 @@ mod tests {
         project_ui_missing: bool,
         project_verification: bool,
         project_creations: usize,
+        project_keyboard_activations: usize,
+        project_navigations: usize,
         project_pending: String,
         project_draft: String,
         logs: Vec<Value>,
@@ -2427,6 +2431,7 @@ mod tests {
         if method == "POST" && path.ends_with("/url") {
             let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
             state.url = parsed["url"].as_str().unwrap_or("about:blank").to_owned();
+            state.project_navigations += 1;
             return (200, json!({"value":null}));
         }
         if method == "POST" && path.ends_with("/timeouts") {
@@ -2462,7 +2467,11 @@ mod tests {
             && path.ends_with("/value")
         {
             let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-            state.project_draft = parsed["text"].as_str().unwrap_or_default().to_owned();
+            if parsed["text"] == "\u{E007}" && state.project_pending == "new-project" {
+                state.project_keyboard_activations += 1;
+            } else {
+                state.project_draft = parsed["text"].as_str().unwrap_or_default().to_owned();
+            }
             return (200, json!({"value":null}));
         }
         if method == "POST" && path.ends_with("/execute/sync") {
@@ -2796,6 +2805,8 @@ mod tests {
         assert!(mock.project_exists);
         assert_eq!(mock.project_draft, project_setup::NAME);
         assert_eq!(mock.project_creations, 1);
+        assert_eq!(mock.project_keyboard_activations, 1);
+        assert_eq!(mock.handles.len(), 3, "one tab for each of the two workers");
         assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
         drop(mock);
         browser.shutdown().await;
@@ -2818,7 +2829,48 @@ mod tests {
             .expect("existing project");
         let mock = state.lock().await;
         assert_eq!(mock.project_creations, 0);
+        assert_eq!(
+            mock.handles.len(),
+            2,
+            "existing project needs only the worker tab"
+        );
         assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
+        drop(mock);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_project_opens_directly_in_one_worker_tab_after_restart() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.project_ui_enabled = true;
+            mock.project_exists = true;
+        }
+        let profile = tempfile::tempdir().expect("test profile");
+        let project = "https://chatgpt.com/g/g-p-fixture/project";
+        tokio::fs::write(
+            profile.path().join("novagpt-subagent-project.json"),
+            json!({"version": 1, "name": project_setup::NAME, "url": project}).to_string(),
+        )
+        .await
+        .expect("cache fixture");
+        let mut browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        Arc::get_mut(&mut browser.inner)
+            .expect("exclusive test browser")
+            .config
+            .profile = profile.path().to_path_buf();
+        browser.inner.auto_project.store(true, Ordering::Relaxed);
+        browser.open("agent-cached").await.expect("cached project");
+        let mock = state.lock().await;
+        assert_eq!(mock.project_creations, 0);
+        assert_eq!(mock.handles.len(), 2, "only the worker tab is created");
+        assert_eq!(
+            mock.project_navigations, 1,
+            "open directly at the cached URL"
+        );
+        assert_eq!(mock.url, project);
         drop(mock);
         browser.shutdown().await;
         server.abort();
@@ -2864,7 +2916,14 @@ mod tests {
             .open("agent-manual")
             .await
             .expect("retry after human verification");
-        assert_eq!(state.lock().await.project_creations, 1);
+        let mock = state.lock().await;
+        assert_eq!(mock.project_creations, 1);
+        assert_eq!(
+            mock.handles.len(),
+            2,
+            "resume reuses the original worker tab"
+        );
+        drop(mock);
         browser.shutdown().await;
         server.abort();
     }
@@ -3243,6 +3302,25 @@ mod tests {
                 .any(|event| event == "recovery_blocked_by_verification")
         );
         assert_eq!(diagnostics.manual_check.as_deref(), Some("verification"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn browsing_does_not_require_subagent_project_setup() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.project_ui_enabled = true;
+            mock.project_ui_missing = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.inner.auto_project.store(true, Ordering::Relaxed);
+        browser.browse_open().await.expect("browse without project");
+        let mock = state.lock().await;
+        assert_eq!(mock.project_creations, 0);
+        assert_eq!(mock.url, "about:blank");
+        drop(mock);
+        browser.shutdown().await;
         server.abort();
     }
 

@@ -119,6 +119,17 @@ async fn click_marked(tab: &WebDriverTab) -> Result<(), BrowserError> {
         .map_err(|_| BrowserError::ProjectSetup)
 }
 
+async fn press_marked_button(tab: &WebDriverTab) -> Result<(), BrowserError> {
+    // The sidebar Add new project button can be hover-only and overlap the
+    // content pane. Keyboard activation avoids an intercepted mouse click.
+    tab.find("button[data-novagpt-subagent-project-target='1']")
+        .await
+        .map_err(|_| BrowserError::ProjectSetup)?
+        .send_keys("\u{E007}")
+        .await
+        .map_err(|_| BrowserError::ProjectSetup)
+}
+
 async fn verified(tab: &WebDriverTab, expected: &str) -> Result<bool, BrowserError> {
     for _ in 0..16 {
         let current = tab.current_url().await.map_err(BrowserError::from)?;
@@ -149,7 +160,7 @@ async fn opened_project(tab: &WebDriverTab) -> Result<Option<String>, BrowserErr
     Ok(None)
 }
 
-async fn cached(profile: &Path) -> Option<String> {
+pub(crate) async fn cached(profile: &Path) -> Option<String> {
     let path = profile.join(CACHE);
     let info = fs::symlink_metadata(&path).await.ok()?;
     if !info.is_file() || info.file_type().is_symlink() || info.len() > MAX_CACHE {
@@ -195,12 +206,18 @@ async fn save(profile: &Path, url: &str) {
 
 pub(crate) async fn ensure(tab: &WebDriverTab, profile: &Path) -> Result<String, BrowserError> {
     if let Some(url) = cached(profile).await {
-        tab.goto(&url).await.map_err(BrowserError::from)?;
+        // The worker tab may already be loading the cached project; do not
+        // navigate again if it is on that URL.
+        if tab.current_url().await.map_err(BrowserError::from)? != url {
+            tab.goto(&url).await.map_err(BrowserError::from)?;
+        }
         if verified(tab, &url).await? {
             return Ok(url);
         }
     }
-    tab.goto(HOME).await.map_err(BrowserError::from)?;
+    if tab.current_url().await.map_err(BrowserError::from)? != HOME {
+        tab.goto(HOME).await.map_err(BrowserError::from)?;
+    }
     // Wait for client-side hydration and check existing projects first.
     for _ in 0..8 {
         let existing = inspect(tab, "existing").await?;
@@ -246,7 +263,7 @@ pub(crate) async fn ensure(tab: &WebDriverTab, profile: &Path) -> Result<String,
     if kind(&start) != "control" {
         return Err(BrowserError::ProjectSetup);
     }
-    click_marked(tab).await?;
+    press_marked_button(tab).await?;
     let mut input_ready = false;
     for _ in 0..20 {
         let input = inspect(tab, "name-input").await?;

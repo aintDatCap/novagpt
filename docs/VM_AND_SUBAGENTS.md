@@ -32,7 +32,37 @@ Then call `vm` with `{"action":"images"}` to inspect approved images; `{"action"
 
 On Linux/macOS the same CLI import accepts a `.qcow2` base image and the host backend runs `qemu-img` and `qemu-system-x86_64`. A running QEMU process is owned by the live server process; after a restart, an orphaned or unowned process is not killed by guessing a PID. QEMU guest control, architecture/accelerator options and reliable restart recovery remain pending.
 
-**Do not use production or personal guest disks for validation.** No real Hyper-V creation/destruction, QEMU boot, guest agent or PowerShell Direct operation has been run as part of this work. Only tests using disposable fixture files were run. Hyper-V privileges, Windows command behavior, secure boot, guest login and native disk provisioning need controlled hardware/VM tests.
+### Windows 11 ISO provisioning on Linux (experimental)
+
+NovaGPT can now provision a persistent Windows 11 installer guest through user-session libvirt. This path is **separate** from the existing MCP `vm` image registry until Windows finishes installing and a qcow2 disk is imported. The CLI uses the installed host packages `virt-install`, `xorriso`, QEMU/KVM, `swtpm`, and OVMF. Run:
+
+```bash
+cargo run -p novagpt-cli -- \
+  --root /path/to/novagpt \
+  --vm-home "$HOME/.local/state/NovaGPT/vms" \
+  vm-install-windows \
+  --name win11-ace-test \
+  --iso "$HOME/Downloads/Windows11_Client_x64_en-us_26300_9457.iso" \
+  --username AceTester --cpus 4 --memory-mb 16384 --disk-gib 80
+```
+
+This command creates a new qcow2 disk and a second ISO containing `Autounattend.xml`; it never modifies the original Windows ISO. The answer file configures virtual Disk 0, installs image index 1, accepts the EULA, creates a local Administrator account for **disposable testing only**, and hides selected setup/OOBE screens. **Security limitation:** the current experimental answer file encodes a fixed, weak account password (`Password`) rather than generating a unique credential. It is only suitable for a throwaway guest behind QEMU user-mode NAT with no inbound ports; change the password before any external access or production use. The guest has a SPICE display bound to loopback. OOBE can still show an optional error that needs `Skip`, and Windows may perform normal updates after installation.
+
+The libvirt domain name is `novagpt-install-<name>`. Use `virsh -c qemu:///session list --all` and `virt-viewer --connect qemu:///session novagpt-install-<name>` to inspect it. Boot media may display `Press any key to boot from CD or DVD`; use the VM console or `virsh send-key` to select the installer. The installation stays registered across NovaGPT server restarts. After Windows finishes and you verify that the guest boots, shut it down and create the baseline snapshot with `cargo run -p novagpt-cli -- --root /path/to/novagpt --vm-home "$HOME/.local/state/NovaGPT/vms" vm-snapshot-windows --name win11-ace-test --snapshot baseline`. The command refuses a running guest. Do not run a second import until the installed disk is known bootable.
+
+A QEMU Guest Agent channel is configured for new installer VMs. Install the official VirtIO guest tools **inside Windows with Administrator privileges** using `virtio-win-guest-tools.exe /install /quiet /norestart`; `/s /qn` is not a working substitute. Verify `virsh -c qemu:///session qemu-agent-command novagpt-install-<name> '{"execute":"guest-ping"}'`. The installer path has a separate, local-only `vm-exec-windows` CLI; it verifies that the named libvirt domain uses a disk in the owned VM directory, then runs a bounded program through QEMU Guest Agent. Example:
+
+```bash
+cargo run -p novagpt-cli -- \
+  --root /path/to/novagpt --vm-home "$HOME/.local/state/NovaGPT/vms" \
+  vm-exec-windows --name win11-ace-test \
+  --program 'C:\Windows\System32\cmd.exe' \
+  --arg /c --arg 'whoami && sc query QEMU-GA'
+```
+
+The existing MCP `vm_guest_status` still reports guest control unavailable; this installed-libvirt-guest workflow is not registered in the MCP `vm` lifecycle.
+
+**Live validation (2026-11-13):** Windows 11 build 26300.9457 installed to a disposable KVM/UEFI/TPM VM with 4 vCPU, 16 GiB RAM and 80 GiB virtual disk. The guest reached the desktop; `baseline` is an internal qcow2 snapshot verified under libvirt. QEMU Guest Agent `guest-ping` and a real `vm-exec-windows` call returned successfully. Ace Blocker 0.1.0's historical November 1 Windows MSI installed with exit code 0. Its engine and watchdog services started, and Windows created the Ace Blocker Tunnel interface. However, the *historical* watchdog repeatedly rejected the heartbeat with `deserialize_any is unsupported`, restarted the engine and left the UI intermittently offline. The protocol defect was already corrected in Ace Blocker source commit `393414c` (November 3); the historical installer predates that fix. A current Windows candidate, baseline revert and end-to-end blocked-site test are **not yet validated**. Do not use production or personal guest disks for validation.
 
 ## ChatGPT Browser subagent setup
 
@@ -87,7 +117,7 @@ With this scope, `browser_navigate` can access `http://127.0.0.1:3000/` and its 
 
 ### Automatic grouping of subagent conversations
 
-With ChatGPT Browser enabled, NovaGPT uses the visible, authenticated Chrome session to find or create the ChatGPT project **NovaGPT - subagents** before opening the first new worker conversation. All subsequent new worker tabs use its verified project URL. The URL cache stays within the dedicated browser profile, and setup is serialized to prevent duplicate creation under concurrent spawns. An explicit **ChatGPT subagent project URL** in TUI Settings overrides the automatic project. Login and challenges remain manual: if the project cannot be verified, worker startup stops without sending the task. This does not move existing conversations or affect the built-in Chat page. Delete the project yourself in ChatGPT when appropriate. See [ADR 0005](decisions/0005-automatic-subagent-project.md).
+With ChatGPT Browser enabled, NovaGPT uses the **first worker's own tab** to find or create the ChatGPT project **NovaGPT - subagents**. No separate setup tab opens. If a validated project URL is already known, new worker tabs open directly at that project; persisted URLs are reverified in the first worker tab after a server restart. The URL cache stays within the dedicated browser profile, and setup is serialized to prevent duplicate creation under concurrent spawns. An explicit **ChatGPT subagent project URL** in TUI Settings overrides the automatic project. Login and challenges remain manual: if the project cannot be verified, worker startup stops without sending the task. This does not move existing conversations or affect the built-in Chat page. Delete the project yourself in ChatGPT when appropriate. See [ADR 0005](decisions/0005-automatic-subagent-project.md).
 
 Call `subagent_spawn`:
 

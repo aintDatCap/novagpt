@@ -17,7 +17,9 @@ use novagpt_agents::{AgentManager, ChatGptBackend};
 use novagpt_browser::{BrowserBridge, ChatGptBrowser};
 use novagpt_core::WorkspaceRegistry;
 use novagpt_mcp::NovaExtras;
-use novagpt_vm::VmManager;
+use novagpt_vm::{
+    VmManager, windows_guest::WindowsGuestExecRequest, windows_unattend::WindowsInstallRequest,
+};
 use settings::LocalSettings;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -163,6 +165,41 @@ enum Command {
         cpus: u8,
         #[arg(long, default_value_t = 4096)]
         memory_mb: u32,
+    },
+    /// Provision a disposable Windows 11 guest from a local installer ISO on Linux.
+    VmInstallWindows {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        iso: PathBuf,
+        #[arg(long, default_value = "AceTester")]
+        username: String,
+        #[arg(long, default_value_t = 4)]
+        cpus: u8,
+        #[arg(long, default_value_t = 16_384)]
+        memory_mb: u32,
+        #[arg(long, default_value_t = 80)]
+        disk_gib: u32,
+    },
+    /// Snapshot an installed, powered-off Windows 11 libvirt test guest.
+    VmSnapshotWindows {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "baseline")]
+        snapshot: String,
+    },
+    /// Execute a program inside an owned Windows installer VM through QEMU Guest Agent.
+    VmExecWindows {
+        #[arg(long)]
+        name: String,
+        /// Absolute path to executable inside the Windows guest.
+        #[arg(long)]
+        program: String,
+        /// Repeat --arg for each argument; does not use a host shell.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        #[arg(long, default_value_t = 120)]
+        timeout_secs: u64,
     },
 }
 
@@ -758,6 +795,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.name,
                 image.bytes
             );
+        }
+        Some(Command::VmInstallWindows {
+            name,
+            iso,
+            username,
+            cpus,
+            memory_mb,
+            disk_gib,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let result = vm
+                .install_windows_iso(WindowsInstallRequest {
+                    name,
+                    iso,
+                    username,
+                    cpus,
+                    memory_mb,
+                    disk_gib,
+                })
+                .await?;
+            println!(
+                "Created Windows installer VM: {} ({} vCPU, {} MiB RAM, {} GiB disk, unattended={})",
+                result.domain, result.cpus, result.memory_mb, result.disk_gib, result.unattended
+            );
+        }
+        Some(Command::VmSnapshotWindows { name, snapshot }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            vm.snapshot_windows_installer(&name, &snapshot).await?;
+            println!("Created stopped-guest snapshot {snapshot} for novagpt-install-{name}");
+        }
+        Some(Command::VmExecWindows {
+            name,
+            program,
+            args,
+            timeout_secs,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let result = vm
+                .exec_windows_installer_guest(WindowsGuestExecRequest {
+                    name,
+                    program,
+                    args,
+                    timeout_secs,
+                })
+                .await?;
+            print!("{}", result.stdout);
+            eprint!("{}", result.stderr);
+            if result.truncated {
+                eprintln!("[guest output truncated]");
+            }
+            println!("\nGuest process exited with code {}", result.exit_code);
+            if result.exit_code != 0 {
+                return Err(
+                    format!("Guest process failed with exit code {}", result.exit_code).into(),
+                );
+            }
         }
         Some(
             Command::Token { .. }
