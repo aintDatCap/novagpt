@@ -386,11 +386,21 @@ struct IdArgs {
 
 // Operation-scoped Windows guest authentication: no persistence or audit of
 // credential contents. Only the destination VM receives the requested action.
+// These request types must remain in the MCP schema on Unix, but their fields
+// are read only by the Windows Hyper-V handlers.
+#[cfg_attr(
+    not(windows),
+    expect(dead_code, reason = "Windows-only guest arguments")
+)]
 #[derive(Deserialize, schemars::JsonSchema)]
 struct VmGuestCredentialArgs {
     username: String,
     password: String,
 }
+#[cfg_attr(
+    not(windows),
+    expect(dead_code, reason = "Windows-only guest arguments")
+)]
 #[derive(Deserialize, schemars::JsonSchema)]
 struct VmGuestExecArgs {
     id: String,
@@ -401,6 +411,10 @@ struct VmGuestExecArgs {
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
+#[cfg_attr(
+    not(windows),
+    expect(dead_code, reason = "Windows-only guest arguments")
+)]
 #[derive(Deserialize, schemars::JsonSchema)]
 struct VmGuestFileArgs {
     id: String,
