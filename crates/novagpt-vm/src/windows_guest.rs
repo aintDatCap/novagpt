@@ -1,10 +1,16 @@
 //! Execute commands inside a NovaGPT-owned, already-installed Windows libvirt VM.
 //! Requires the trusted QEMU guest agent inside the guest; CLI-only (no MCP exposure).
-use crate::{VmError, VmManager, VmResult, valid_name};
+#[cfg(target_os = "linux")]
+use crate::valid_name;
+use crate::{VmError, VmManager, VmResult};
+#[cfg(target_os = "linux")]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
 use std::{fs, time::Instant};
+#[cfg(target_os = "linux")]
 use tokio::{
     process::Command,
     time::{Duration, sleep, timeout},
@@ -26,6 +32,7 @@ pub struct WindowsGuestExecResult {
     pub truncated: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn valid_guest_program(program: &str) -> bool {
     let bytes = program.as_bytes();
     (4..=512).contains(&bytes.len())
@@ -35,6 +42,7 @@ fn valid_guest_program(program: &str) -> bool {
         && !bytes.iter().any(|b| b.is_ascii_control())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn valid_guest_args(args: &[String]) -> bool {
     args.len() <= 32
         && args.iter().all(|arg| {
@@ -42,6 +50,7 @@ fn valid_guest_args(args: &[String]) -> bool {
         })
 }
 
+#[cfg(target_os = "linux")]
 async fn virsh(domain: &str, args: &[&str]) -> VmResult<Vec<u8>> {
     let out = timeout(
         Duration::from_secs(20),
@@ -64,6 +73,7 @@ async fn virsh(domain: &str, args: &[&str]) -> VmResult<Vec<u8>> {
     Ok(out.stdout)
 }
 
+#[cfg(target_os = "linux")]
 async fn guest_agent(domain: &str, request: Value) -> VmResult<Value> {
     let payload = serde_json::to_string(&request).map_err(|_| VmError::InvalidData)?;
     let out = virsh(
@@ -75,6 +85,7 @@ async fn guest_agent(domain: &str, request: Value) -> VmResult<Value> {
     result.get("return").cloned().ok_or(VmError::CommandFailed)
 }
 
+#[cfg(target_os = "linux")]
 fn decode_output(value: &Value, key: &str) -> VmResult<String> {
     let base64 = value.get(key).and_then(Value::as_str).unwrap_or("");
     if base64.len() > 90 * 1024 {
@@ -95,7 +106,7 @@ impl VmManager {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = request;
-            return Err(VmError::Unsupported("Linux user-session libvirt only"));
+            Err(VmError::Unsupported("Linux user-session libvirt only"))
         }
         #[cfg(target_os = "linux")]
         {

@@ -1,9 +1,14 @@
 //! Linux-only disposable Windows 11 ISO provisioning through user-session libvirt.
 //! Unattended answer-file approach adapted from CodexPro (MIT license).
 //! Copyright (c) 2026 CodexPro contributors. See LICENSE in that project.
-use crate::{VmError, VmManager, VmResult, resources, valid_name};
+#[cfg(target_os = "linux")]
+use crate::resources;
+use crate::{VmError, VmManager, VmResult, valid_name};
 use serde::Serialize;
-use std::{fs, path::PathBuf};
+#[cfg(target_os = "linux")]
+use std::fs;
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use tokio::{
     process::Command,
     time::{Duration, timeout},
@@ -99,6 +104,7 @@ pub fn unattended_xml(username: &str) -> VmResult<String> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 async fn run(program: &str, args: &[String], max_secs: u64) -> VmResult<()> {
     let output = timeout(
         Duration::from_secs(max_secs),
@@ -120,12 +126,34 @@ impl VmManager {
         &self,
         request: WindowsInstallRequest,
     ) -> VmResult<WindowsInstallResult> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = request;
             return Err(VmError::Unsupported(
-                "Windows ISO installation is currently Linux-only",
+                "Windows ISO installation requires Linux or Windows",
             ));
+        }
+        #[cfg(windows)]
+        {
+            use crate::windows_hyperv::{HostGuestOs, HostIsoRequest};
+            let result = self
+                .install_host_iso(HostIsoRequest {
+                    name: request.name,
+                    iso: request.iso,
+                    os: HostGuestOs::Windows,
+                    username: Some(request.username),
+                    cpus: request.cpus,
+                    memory_mb: request.memory_mb,
+                    disk_gib: request.disk_gib,
+                })
+                .await?;
+            Ok(WindowsInstallResult {
+                domain: result.domain,
+                cpus: result.cpus,
+                memory_mb: result.memory_mb,
+                disk_gib: result.disk_gib,
+                unattended: result.unattended,
+            })
         }
         #[cfg(target_os = "linux")]
         {
@@ -241,10 +269,16 @@ impl VmManager {
     /// Create a persistent, named libvirt snapshot only after the guest is
     /// fully shut off. This does not expose arbitrary libvirt domains via MCP.
     pub async fn snapshot_windows_installer(&self, name: &str, snapshot: &str) -> VmResult<()> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (name, snapshot);
-            return Err(VmError::Unsupported("Linux libvirt only"));
+            return Err(VmError::Unsupported(
+                "Linux libvirt or Windows Hyper-V required",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            self.snapshot_host_iso(name, snapshot).await
         }
         #[cfg(target_os = "linux")]
         {

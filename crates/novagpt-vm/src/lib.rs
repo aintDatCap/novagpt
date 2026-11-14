@@ -1,5 +1,7 @@
 //! Opt-in disposable VM management. Never touches other application VM state.
 pub mod windows_guest;
+#[cfg(windows)]
+pub mod windows_hyperv;
 pub mod windows_unattend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -650,7 +652,13 @@ async fn start_hyperv(
     memory: u32,
 ) -> VmResult<()> {
     let name = quote_ps(&hyperv_name(id));
+    #[cfg(windows)]
+    let src = quote_ps(&windows_hyperv::hyperv_path(source)?);
+    #[cfg(not(windows))]
     let src = quote_ps(&source.display().to_string());
+    #[cfg(windows)]
+    let dest = quote_ps(&windows_hyperv::hyperv_path(overlay)?);
+    #[cfg(not(windows))]
     let dest = quote_ps(&overlay.display().to_string());
     let script = format!(
         "New-VHD -Path {dest} -ParentPath {src} -Differencing -ErrorAction Stop | Out-Null; \

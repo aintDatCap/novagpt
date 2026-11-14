@@ -32,6 +32,26 @@ Then call `vm` with `{"action":"images"}` to inspect approved images; `{"action"
 
 On Linux/macOS the same CLI import accepts a `.qcow2` base image and the host backend runs `qemu-img` and `qemu-system-x86_64`. A running QEMU process is owned by the live server process; after a restart, an orphaned or unowned process is not killed by guessing a PID. QEMU guest control, architecture/accelerator options and reliable restart recovery remain pending.
 
+### Windows ISO provisioning on Windows (experimental)
+
+On Windows, NovaGPT uses **Hyper-V Generation 2** for disposable installer VMs. The local CLI accepts only explicitly selected ISO files, never remote MCP paths. Use a fresh, empty, NovaGPT-owned VM directory on a local NTFS drive. Guests have no external virtual switch by default.
+
+~~~powershell
+cargo run -p novagpt-cli -- --root C:\Projects\novagpt --vm-home E:\NovaGPT-VM-Tests vm-install-iso --name win11-test --iso C:\OS\Win11_25H2_English_x64_v2.iso --os windows --cpus 4 --memory-mb 8192 --disk-gib 80
+cargo run -p novagpt-cli -- --root C:\Projects\novagpt --vm-home E:\NovaGPT-VM-Tests vm-iso-status --name win11-test
+
+cargo run -p novagpt-cli -- --root C:\Projects\novagpt --vm-home E:\NovaGPT-VM-Tests vm-install-iso --name cachyos-test --iso C:\OS\cachyos-desktop-linux-260809.iso --os linux --cpus 4 --memory-mb 8192 --disk-gib 80
+
+# Run only when the guest is powered off:
+cargo run -p novagpt-cli -- --root C:\Projects\novagpt --vm-home E:\NovaGPT-VM-Tests vm-iso-snapshot --name cachyos-test --snapshot baseline
+~~~
+
+Each guest receives a dynamic VHDX of the requested *virtual capacity* in a dedicated installer directory on E:. Windows 11 additionally receives a small ISO9660 disc containing Autounattend.xml, virtual TPM, and Windows Secure Boot. NovaGPT sends an initial virtual-keyboard Space key to confirm the EFI DVD boot prompt. Linux ISO guests default to Secure Boot off. No source ISO is modified.
+
+The unattended Windows account currently uses the same **weak disposable-only password** noted in the Linux provisioning section below; never connect it to an untrusted network. ISO VM status/checkpoints validate the registered VM's configuration location. **Not implemented for these ISO guests:** Windows PowerShell Direct guest execution, deletion/rollback of partially created VMs, arbitrary network connections, or exposed MCP installer operations. An active Hyper-V VM does not alone prove that its guest OS installed successfully.
+
+**Live Windows-host evidence (2026-11-14):** CachyOS reached its graphical live desktop under Hyper-V with 4 vCPUs, 8192 MiB and an 80 GiB virtual disk on E:. A powered-on snapshot was denied and a powered-off baseline snapshot succeeded. Windows 11 25H2 completed unattended installation and reached the NovaTester desktop; the Hyper-V Heartbeat reported OK, and an off-guest baseline checkpoint succeeded. A second fresh Windows 11 ISO VM reached setup automatically without manual keyboard input and was then removed.
+
 ### Windows 11 ISO provisioning on Linux (experimental)
 
 NovaGPT can now provision a persistent Windows 11 installer guest through user-session libvirt. This path is **separate** from the existing MCP `vm` image registry until Windows finishes installing and a qcow2 disk is imported. The CLI uses the installed host packages `virt-install`, `xorriso`, QEMU/KVM, `swtpm`, and OVMF. Run:

@@ -12,11 +12,15 @@ mod token;
 mod tui;
 mod tunnel;
 
+#[cfg(windows)]
+use clap::ValueEnum;
 use clap::{Parser, Subcommand};
 use novagpt_agents::{AgentManager, ChatGptBackend};
 use novagpt_browser::{BrowserBridge, ChatGptBrowser};
 use novagpt_core::WorkspaceRegistry;
 use novagpt_mcp::NovaExtras;
+#[cfg(windows)]
+use novagpt_vm::windows_hyperv::{HostGuestOs, HostIsoRequest};
 use novagpt_vm::{
     VmManager, windows_guest::WindowsGuestExecRequest, windows_unattend::WindowsInstallRequest,
 };
@@ -166,7 +170,7 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         memory_mb: u32,
     },
-    /// Provision a disposable Windows 11 guest from a local installer ISO on Linux.
+    /// Provision a disposable Windows 11 guest from a local installer ISO.
     VmInstallWindows {
         #[arg(long)]
         name: String,
@@ -181,14 +185,44 @@ enum Command {
         #[arg(long, default_value_t = 80)]
         disk_gib: u32,
     },
-    /// Snapshot an installed, powered-off Windows 11 libvirt test guest.
+    /// Create a checkpoint of a powered-off Windows test guest.
     VmSnapshotWindows {
         #[arg(long)]
         name: String,
         #[arg(long, default_value = "baseline")]
         snapshot: String,
     },
-    /// Execute a program inside an owned Windows installer VM through QEMU Guest Agent.
+    /// Provision an isolated ISO installer guest with Hyper-V (Windows host only).
+    #[cfg(windows)]
+    VmInstallIso {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        iso: PathBuf,
+        #[arg(long, value_enum)]
+        os: VmIsoOs,
+        #[arg(long, default_value_t = 4)]
+        cpus: u8,
+        #[arg(long, default_value_t = 8192)]
+        memory_mb: u32,
+        #[arg(long, default_value_t = 80)]
+        disk_gib: u32,
+    },
+    /// Inspect an owned Hyper-V ISO guest.
+    #[cfg(windows)]
+    VmIsoStatus {
+        #[arg(long)]
+        name: String,
+    },
+    /// Checkpoint an owned, powered-off Hyper-V ISO guest.
+    #[cfg(windows)]
+    VmIsoSnapshot {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "baseline")]
+        snapshot: String,
+    },
+    /// Execute a program inside an owned Linux-hosted Windows guest through QEMU Guest Agent.
     VmExecWindows {
         #[arg(long)]
         name: String,
@@ -201,6 +235,13 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
     },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum VmIsoOs {
+    Windows,
+    Linux,
 }
 
 #[derive(Subcommand)]
@@ -795,6 +836,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 image.name,
                 image.bytes
             );
+        }
+        #[cfg(windows)]
+        Some(Command::VmInstallIso {
+            name,
+            iso,
+            os,
+            cpus,
+            memory_mb,
+            disk_gib,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let result = vm
+                .install_host_iso(HostIsoRequest {
+                    name,
+                    iso,
+                    os: match os {
+                        VmIsoOs::Windows => HostGuestOs::Windows,
+                        VmIsoOs::Linux => HostGuestOs::Linux,
+                    },
+                    username: None,
+                    cpus,
+                    memory_mb,
+                    disk_gib,
+                })
+                .await?;
+            println!(
+                "Created Hyper-V ISO guest: {} ({} CPU, {} MiB RAM, {} GiB VHDX, unattended={})",
+                result.domain, result.cpus, result.memory_mb, result.disk_gib, result.unattended
+            );
+        }
+        #[cfg(windows)]
+        Some(Command::VmIsoStatus { name }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            println!("{}", vm.host_iso_status(&name).await?);
+        }
+        #[cfg(windows)]
+        Some(Command::VmIsoSnapshot { name, snapshot }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            vm.snapshot_host_iso(&name, &snapshot).await?;
+            println!("Created powered-off checkpoint {snapshot} for NovaGPT-install-{name}");
         }
         Some(Command::VmInstallWindows {
             name,
