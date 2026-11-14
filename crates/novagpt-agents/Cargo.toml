@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 novagpt-core = { path = "../novagpt-core" }
 novagpt-browser = { path = "../novagpt-browser" }
+novagpt-vm = { path = "../novagpt-vm" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

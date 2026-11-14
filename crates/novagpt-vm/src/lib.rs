@@ -1,4 +1,7 @@
 //! Opt-in disposable VM management. Never touches other application VM state.
+pub mod image_promotion;
+#[cfg(windows)]
+pub mod windows_direct;
 pub mod windows_guest;
 #[cfg(windows)]
 pub mod windows_hyperv;
@@ -78,6 +81,15 @@ impl VmBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VmBootProfile {
+    #[default]
+    Legacy,
+    WindowsUefi,
+    LinuxUefi,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmImage {
     pub name: String,
@@ -87,6 +99,8 @@ pub struct VmImage {
     pub default_cpus: u8,
     pub default_memory_mb: u32,
     pub human_approved: bool,
+    #[serde(default)]
+    pub boot_profile: VmBootProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +305,7 @@ impl VmManager {
             default_cpus: cpus,
             default_memory_mb: memory_mb,
             human_approved: true,
+            boot_profile: VmBootProfile::Legacy,
         };
         write_json_new(&dir.join("manifest.json"), &image)?;
         Ok(image)
@@ -308,6 +323,11 @@ impl VmManager {
         let cpus = req.cpus.unwrap_or(image.default_cpus);
         let memory = req.memory_mb.unwrap_or(image.default_memory_mb);
         resources(cpus, memory)?;
+        if image.backend == VmBackend::Qemu && image.boot_profile != VmBootProfile::Legacy {
+            return Err(VmError::Unsupported(
+                "UEFI/TPM fork support for promoted Linux-hosted installer disks is not yet available",
+            ));
+        }
         let id = format!("vm-{}", &Uuid::new_v4().simple().to_string()[..16]);
         let dir = self.inner.root.join("instances").join(&id);
         fs::create_dir(&dir)?;
@@ -340,7 +360,7 @@ impl VmManager {
         };
         write_json_new(&dir.join("instance.json"), &instance)?;
         let result = if image.backend == VmBackend::Hyperv {
-            start_hyperv(&id, &source, &overlay, cpus, memory).await
+            start_hyperv(&id, &source, &overlay, cpus, memory, image.boot_profile).await
         } else {
             self.start_qemu(&id, &source, &overlay, cpus, memory).await
         };
@@ -401,10 +421,31 @@ impl VmManager {
         let instance = self.load_instance(id)?;
         if instance.backend == VmBackend::Hyperv {
             let name = quote_ps(&hyperv_name(id));
-            let script = format!(
-                "$vm = Get-VM -Name {name} -ErrorAction SilentlyContinue; if ($vm) {{ if ($vm.State -ne 'Off') {{ Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }}; Remove-VM -VM $vm -Force -ErrorAction Stop }}"
+            #[cfg(windows)]
+            let disk = quote_ps(&windows_hyperv::hyperv_path(
+                &self.instance_dir(id).join("disk.vhdx"),
+            )?);
+            #[cfg(not(windows))]
+            let disk = quote_ps(
+                &self
+                    .instance_dir(id)
+                    .join("disk.vhdx")
+                    .display()
+                    .to_string(),
             );
-            powershell(&script, Duration::from_secs(60)).await?;
+            // Never authorize destruction using a display name alone. The
+            // attached VHDX must match the owned instance's exact disk.
+            let script = format!(
+                "$ErrorActionPreference = 'Stop'; \
+                 $vm = Get-VM -Name {name} -ErrorAction Stop; \
+                 $attached = @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop); \
+                 if ($attached.Count -ne 1 -or [IO.Path]::GetFullPath($attached[0].Path) -ine [IO.Path]::GetFullPath({disk})) {{ \
+                   throw 'The VM no longer uses its NovaGPT-owned disk' \
+                 }}; \
+                 if ($vm.State -ne 'Off') {{ Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }}; \
+                 Remove-VM -VM $vm -Force -ErrorAction Stop"
+            );
+            powershell(&script, Duration::from_secs(90)).await?;
         } else {
             let mut children = self.inner.children.lock().await;
             if let Some(mut child) = children.remove(id) {
@@ -428,9 +469,24 @@ impl VmManager {
     }
 
     pub fn guest_status(&self, id: &str) -> VmResult<VmGuestStatus> {
-        self.load_instance(id)?;
-        Ok(VmGuestStatus { action: "guest_status", id: id.to_owned(), available: false,
-            reason: "Guest agent / PowerShell Direct control is not enabled in this first Rust VM slice; host operations only".to_owned() })
+        let instance = self.load_instance(id)?;
+        let profile = self
+            .images()?
+            .images
+            .into_iter()
+            .find(|image| image.name == instance.image)
+            .map(|image| image.boot_profile);
+        let reason = if cfg!(windows) && profile == Some(VmBootProfile::WindowsUefi) {
+            "Windows guest control requires explicit operation-scoped PowerShell Direct credentials; use vm_exec, vm_upload or vm_download"
+        } else {
+            "Guest control is unavailable for this VM backend or image profile"
+        };
+        Ok(VmGuestStatus {
+            action: "guest_status",
+            id: id.to_owned(),
+            available: false,
+            reason: reason.to_owned(),
+        })
     }
 
     pub fn validate_exec(
@@ -650,6 +706,7 @@ async fn start_hyperv(
     overlay: &Path,
     cpus: u8,
     memory: u32,
+    boot_profile: VmBootProfile,
 ) -> VmResult<()> {
     let name = quote_ps(&hyperv_name(id));
     #[cfg(windows)]
@@ -660,13 +717,28 @@ async fn start_hyperv(
     let dest = quote_ps(&windows_hyperv::hyperv_path(overlay)?);
     #[cfg(not(windows))]
     let dest = quote_ps(&overlay.display().to_string());
-    let script = format!(
-        "New-VHD -Path {dest} -ParentPath {src} -Differencing -ErrorAction Stop | Out-Null; \
+    let mut script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         if (Get-VM -Name {name} -ErrorAction SilentlyContinue) {{ throw 'VM already exists' }}; \
+         New-VHD -Path {dest} -ParentPath {src} -Differencing -ErrorAction Stop | Out-Null; \
          New-VM -Name {name} -Generation 2 -VHDPath {dest} -MemoryStartupBytes {}MB -ErrorAction Stop | Out-Null; \
          Set-VMProcessor -VMName {name} -Count {cpus} -ErrorAction Stop; \
-         Start-VM -Name {name} -ErrorAction Stop",
-        memory
+         Set-VMMemory -VMName {name} -DynamicMemoryEnabled $false -StartupBytes {}MB -ErrorAction Stop; \
+         Set-VM -Name {name} -AutomaticStartAction Nothing -AutomaticCheckpointsEnabled $false -ErrorAction Stop; ",
+        memory, memory
     );
+    match boot_profile {
+        VmBootProfile::WindowsUefi => script.push_str(&format!(
+            "Set-VMFirmware -VMName {name} -EnableSecureBoot On -SecureBootTemplate 'MicrosoftWindows' -ErrorAction Stop; \
+             Set-VMKeyProtector -VMName {name} -NewLocalKeyProtector -ErrorAction Stop; \
+             Enable-VMTPM -VMName {name} -ErrorAction Stop; "
+        )),
+        VmBootProfile::LinuxUefi => script.push_str(&format!(
+            "Set-VMFirmware -VMName {name} -EnableSecureBoot Off -ErrorAction Stop; "
+        )),
+        VmBootProfile::Legacy => {}
+    }
+    script.push_str(&format!("Start-VM -Name {name} -ErrorAction Stop"));
     powershell(&script, Duration::from_secs(90))
         .await
         .map(|_| ())

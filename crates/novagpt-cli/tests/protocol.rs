@@ -247,6 +247,9 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         "load_skill",
         "vm",
         "vm_guest_status",
+        "vm_exec",
+        "vm_upload",
+        "vm_download",
         "browser_open",
         "browser_navigate",
         "browser_read",
@@ -283,7 +286,7 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
         development_only,
         "debug_restart must not exist in production tool discovery"
     );
-    assert_eq!(listed.len(), if development_only { 58 } else { 57 });
+    assert_eq!(listed.len(), if development_only { 61 } else { 60 });
     // MCP server tool registration is distinct from the ChatGPT client's
     // selected connector schema. Ensure new callers can discover the actual
     // arguments for optional authenticated no-write capability probes.
@@ -294,6 +297,10 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
             .expect("registered tool")
     };
     assert!(tool("subagent_spawn")["inputSchema"]["properties"]["connector_name"].is_object());
+    assert!(tool("subagent_spawn")["inputSchema"]["properties"]["vm_image"].is_object());
+    assert!(tool("vm_exec")["inputSchema"]["properties"]["credential"].is_object());
+    assert!(tool("vm_upload")["inputSchema"]["properties"]["guest_path"].is_object());
+    assert!(tool("vm_download")["inputSchema"]["properties"]["guest_path"].is_object());
     assert!(tool("subagent_apply_patch")["inputSchema"]["properties"]["probe"].is_object());
     assert!(tool("subagent_create_file")["inputSchema"]["properties"]["probe"].is_object());
     assert!(

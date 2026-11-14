@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use novagpt_browser::{BrowserError, ChatGptBrowser};
 use novagpt_core::WorkspaceRegistry;
+use novagpt_vm::{VmCreate, VmManager};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -85,6 +86,10 @@ pub enum AgentError {
     Manual(&'static str),
     #[error("Subagent backend is unavailable or failed")]
     Backend,
+    #[error("An approved VM image and an enabled VM manager are required")]
+    VmUnavailable,
+    #[error("The bound disposable VM has finished; start a new subagent for another fork")]
+    VmLeaseEnded,
 }
 pub type AgentResult<T> = Result<T, AgentError>;
 
@@ -160,6 +165,22 @@ pub struct AgentOutput {
     pub applied_to_workspace: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentVmState {
+    Active,
+    Cleaning,
+    Destroyed,
+    CleanupFailed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentVmLease {
+    pub image: String,
+    pub id: String,
+    pub state: AgentVmState,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
     pub id: String,
@@ -170,6 +191,8 @@ pub struct AgentInfo {
     pub model: String,
     /// Parent-selected connector display name, never inferred from the MCP namespace.
     pub connector_name: Option<String>,
+    /// Explicitly requested throwaway guest, never implied by MCP session identity.
+    pub vm: Option<AgentVmLease>,
     /// unchecked (legacy local API), probing, verified, unavailable, not_required.
     pub capability_status: String,
     pub result: Option<AgentOutput>,
@@ -479,6 +502,8 @@ type AgentUsageReporter = Arc<dyn Fn(&str, &str, usize, Option<usize>, bool) + S
 struct Inner {
     backend: Arc<dyn AgentBackend>,
     workspaces: WorkspaceRegistry,
+    vm: OnceLock<VmManager>,
+    spawn_gate: Mutex<()>,
     entries: Mutex<HashMap<String, Entry>>,
     max_agents: usize,
     max_live_tabs: usize,
@@ -501,6 +526,8 @@ impl AgentManager {
             inner: Arc::new(Inner {
                 backend,
                 workspaces,
+                vm: OnceLock::new(),
+                spawn_gate: Mutex::new(()),
                 entries: Mutex::new(HashMap::new()),
                 max_agents: MAX_AGENTS,
                 max_live_tabs: MAX_LIVE_TABS,
@@ -510,6 +537,13 @@ impl AgentManager {
                 conversation_recorder: OnceLock::new(),
             }),
         }
+    }
+
+    /// Enable explicit per-subagent disposable VM forks. Without this opt-in,
+    /// a spawn request naming a VM image fails before opening a browser tab.
+    pub fn with_vm_manager(self, vm: VmManager) -> Self {
+        let _ = self.inner.vm.set(vm);
+        self
     }
 
     /// Configure one optional fixed-schema diagnostic observer before spawning agents.
@@ -561,7 +595,7 @@ impl AgentManager {
     /// Trusted in-process interface for embedders and test fixtures.
     /// MCP entrypoints pass optional connector metadata separately.
     pub async fn spawn(&self, request: SpawnAgent) -> AgentResult<AgentInfo> {
-        self.spawn_internal(request, None).await
+        self.spawn_internal(request, None, None).await
     }
 
     /// The authenticated parent passes the display name shown by its selected
@@ -575,13 +609,25 @@ impl AgentManager {
         if connector_name.is_some_and(|name| name.trim().is_empty()) {
             return Err(AgentError::ConnectorMissing);
         }
-        self.spawn_internal(request, connector_name).await
+        self.spawn_internal(request, connector_name, None).await
+    }
+
+    /// A VM is created only when the parent explicitly chooses a previously
+    /// approved base. Its lifetime is bound to this single worker execution.
+    pub async fn spawn_with_connector_vm(
+        &self,
+        request: SpawnAgent,
+        connector_name: Option<&str>,
+        vm_image: Option<&str>,
+    ) -> AgentResult<AgentInfo> {
+        self.spawn_internal(request, connector_name, vm_image).await
     }
 
     async fn spawn_internal(
         &self,
         request: SpawnAgent,
         connector_name: Option<&str>,
+        vm_image: Option<&str>,
     ) -> AgentResult<AgentInfo> {
         let connector_name = connector_name.map(str::trim);
         if connector_name.is_some_and(|name| {
@@ -619,6 +665,41 @@ impl AgentManager {
                 allowed_paths.push(resolved);
             }
         }
+        // Admission is serialized only across spawns. VM conversion/startup is
+        // allowed to await without locking any unrelated agent actions.
+        let _spawn_guard = self.inner.spawn_gate.lock().await;
+        {
+            let agents = self.inner.entries.lock().await;
+            if agents.len() >= MAX_RECORDS
+                || agents
+                    .values()
+                    .filter(|entry| {
+                        matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
+                    })
+                    .count()
+                    >= self.inner.max_agents
+            {
+                return Err(AgentError::Capacity);
+            }
+        }
+        let vm_lease = if let Some(image) = vm_image {
+            let manager = self.inner.vm.get().ok_or(AgentError::VmUnavailable)?;
+            let guest = manager
+                .create(VmCreate {
+                    image: image.to_owned(),
+                    cpus: None,
+                    memory_mb: None,
+                })
+                .await
+                .map_err(|_| AgentError::VmUnavailable)?;
+            Some(AgentVmLease {
+                image: image.to_owned(),
+                id: guest.instance.id,
+                state: AgentVmState::Active,
+            })
+        } else {
+            None
+        };
         let id = format!("agent-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let code = completion_code();
         let instructions = match request.role {
@@ -652,7 +733,13 @@ impl AgentManager {
             serde_json::to_string(name).unwrap_or_default(),
         )).unwrap_or_else(|| "**NovaGPT workspace tools**\nThe parent cannot supply a ChatGPT connector display name. Discover actual connected NovaGPT tools by their advertised capabilities; do not invent any display name or derive a tool namespace. Report missing tools explicitly and never claim unverified edits.".to_owned());
         // The task is sent as the first browser turn, without a separate preflight.
-        let prompt = format!("{tool_instructions}\n\n{prompt}");
+        let mut prompt = format!("{tool_instructions}\n\n{prompt}");
+        if let Some(lease) = &vm_lease {
+            prompt.push_str(&format!(
+                "\n\nISOLATED TEST GUEST: VM id={}, approved base={}. This guest is disposable, independent of the host workspace. The VM will be destroyed after completion, failure or cancellation. Never claim you ran tests inside it without a successful VM guest-tool receipt; Windows Hyper-V forks support vm_exec/vm_upload/vm_download with operation-scoped credentials supplied explicitly by the parent, never from the host workspace or prompt. If credentials are unavailable, report guest access unavailable rather than claiming tests ran. Do not expose host secrets or credentials to the guest.",
+                lease.id, lease.image
+            ));
+        }
         let info = AgentInfo {
             id: id.clone(),
             workspace_id: workspace.workspace_id,
@@ -661,6 +748,7 @@ impl AgentManager {
             backend: self.inner.backend.name().into(),
             model: self.inner.backend.model().into(),
             connector_name: connector_name.map(str::to_owned),
+            vm: vm_lease,
             capability_status: "unchecked".into(),
             result: None,
             error: None,
@@ -851,6 +939,9 @@ impl AgentManager {
             if failed_tab {
                 manager.inner.backend.close(&id).await;
             }
+            if matches!(terminal, Some(AgentState::Completed | AgentState::Failed)) {
+                manager.cleanup_vm(&id).await;
+            }
         });
     }
 
@@ -950,6 +1041,17 @@ impl AgentManager {
         if entry.info.state == AgentState::Cancelled {
             return Err(AgentError::Cancelled);
         }
+        if entry.info.vm.is_some() && !resume {
+            return Err(AgentError::VmLeaseEnded);
+        }
+        if entry
+            .info
+            .vm
+            .as_ref()
+            .is_some_and(|vm| vm.state != AgentVmState::Active)
+        {
+            return Err(AgentError::VmLeaseEnded);
+        }
         if resume && !entry.waiting_manual {
             return Err(AgentError::NotWaiting);
         }
@@ -1021,6 +1123,45 @@ impl AgentManager {
         Ok(info)
     }
 
+    /// Destroy a VM lease once, independently of the browser task outcome.
+    /// A failed cleanup remains visible in the returned agent record. A crash
+    /// may leave a disk and instance manifest for explicit owner recovery.
+    async fn cleanup_vm(&self, id: &str) {
+        let vm_id = {
+            let mut entries = self.inner.entries.lock().await;
+            let Some(entry) = entries.get_mut(id) else {
+                return;
+            };
+            let Some(lease) = entry.info.vm.as_mut() else {
+                return;
+            };
+            if lease.state != AgentVmState::Active {
+                return;
+            }
+            lease.state = AgentVmState::Cleaning;
+            let vm_id = lease.id.clone();
+            entry.updates.send_replace(entry.info.clone());
+            vm_id
+        };
+        let result = match self.inner.vm.get() {
+            Some(vm) => vm.destroy(&vm_id).await.is_ok(),
+            None => false,
+        };
+        let mut entries = self.inner.entries.lock().await;
+        if let Some(entry) = entries.get_mut(id)
+            && let Some(lease) = entry.info.vm.as_mut()
+            && lease.id == vm_id
+            && lease.state == AgentVmState::Cleaning
+        {
+            lease.state = if result {
+                AgentVmState::Destroyed
+            } else {
+                AgentVmState::CleanupFailed
+            };
+            entry.updates.send_replace(entry.info.clone());
+        }
+    }
+
     pub async fn cancel(&self, id: &str) -> AgentResult<AgentInfo> {
         let gate = self.patch_gate(id).await?;
         let _patch_guard = gate.lock().await;
@@ -1037,7 +1178,15 @@ impl AgentManager {
         };
         self.inner.backend.cancel(id).await;
         self.inner.backend.close(id).await;
-        Ok(info)
+        self.cleanup_vm(id).await;
+        Ok(self
+            .inner
+            .entries
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| entry.info.clone())
+            .unwrap_or(info))
     }
 
     pub async fn status(&self, id: Option<&str>) -> AgentResult<AgentStatus> {
@@ -1118,6 +1267,7 @@ impl AgentManager {
         };
         drop(agents);
         self.emit(&ack.id, AgentLogStage::Completed);
+        self.cleanup_vm(&ack.id).await;
         Ok(ack)
     }
 
@@ -2007,6 +2157,116 @@ mod tests {
             serde_json::json!({"ready":true})
         }
     }
+    #[tokio::test]
+    async fn vm_fork_requires_explicit_approval_and_configured_manager() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(root.path(), &[]).expect("registry"),
+            Arc::new(FakeBackend),
+        );
+        let request = SpawnAgent {
+            workspace_id: None,
+            task: "test isolated guest".into(),
+            role: AgentRole::Tester,
+            paths: vec![],
+            context: None,
+        };
+        assert!(matches!(
+            manager
+                .spawn_with_connector_vm(request.clone(), None, Some("approved-windows"))
+                .await,
+            Err(AgentError::VmUnavailable)
+        ));
+        assert!(
+            manager
+                .status(None)
+                .await
+                .expect("status")
+                .agents
+                .is_empty()
+        );
+        let ordinary = manager.spawn(request).await.expect("no VM needed");
+        assert!(ordinary.vm.is_none());
+    }
+
+    #[test]
+    fn vm_lease_states_are_visible_without_host_file_paths() {
+        let lease = AgentVmLease {
+            image: "base".into(),
+            id: "vm-0123456789abcdef".into(),
+            state: AgentVmState::CleanupFailed,
+        };
+        let value = serde_json::to_value(&lease).expect("serialize");
+        assert_eq!(value["state"], "cleanup_failed");
+        assert!(value.get("host_path").is_none());
+    }
+
+    /// Opt-in host test: exercises the real Hyper-V fork from an approved base
+    /// without Chrome or guest credentials. Never runs in ordinary CI.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires NOVAGPT_LIVE_VM_HOME and NOVAGPT_LIVE_VM_IMAGE on a Hyper-V host"]
+    async fn live_agent_vm_fork_is_released_after_backend_completion() {
+        let home = std::env::var("NOVAGPT_LIVE_VM_HOME").expect("explicit VM home");
+        let image = std::env::var("NOVAGPT_LIVE_VM_IMAGE").expect("approved base name");
+        let vm = VmManager::new(&home).expect("owned VM home");
+        let ws = tempfile::tempdir().expect("workspace");
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(ws.path(), &[]).expect("registry"),
+            Arc::new(FakeBackend),
+        )
+        .with_vm_manager(vm.clone());
+        let info = manager
+            .spawn_with_connector_vm(
+                SpawnAgent {
+                    workspace_id: None,
+                    task: "Report on isolated guest lifecycle".into(),
+                    role: AgentRole::Tester,
+                    paths: vec![],
+                    context: None,
+                },
+                None,
+                Some(&image),
+            )
+            .await
+            .expect("create VM-backed subagent");
+        let lease = info.vm.as_ref().expect("VM lease");
+        assert_eq!(lease.image, image);
+        assert_eq!(lease.state, AgentVmState::Active);
+        let vm_id = lease.id.clone();
+        let completed = manager.wait(&info.id, 25).await.expect("agent wait");
+        assert_eq!(completed.agent.state, AgentState::Completed);
+        let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let state = manager
+                    .result(&info.id)
+                    .await
+                    .expect("status")
+                    .vm
+                    .expect("VM lease")
+                    .state;
+                if state == AgentVmState::Destroyed || state == AgentVmState::CleanupFailed {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("cleanup timeout");
+        assert_eq!(terminal, AgentVmState::Destroyed);
+        assert!(
+            vm.status(&vm_id).await.is_err(),
+            "fork must no longer be registered"
+        );
+        assert!(
+            vm.images()
+                .expect("image registry")
+                .images
+                .iter()
+                .any(|entry| entry.name == image)
+        );
+    }
+
     struct UrlBackend;
     #[async_trait]
     impl AgentBackend for UrlBackend {

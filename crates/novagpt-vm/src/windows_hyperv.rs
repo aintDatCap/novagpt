@@ -256,8 +256,38 @@ impl VmManager {
     }
 }
 
-// The domain and its configuration location must both match our owned record.
-// This prevents operations on similarly named VMs belonging to other software.
+impl VmManager {
+    /// Copy an offline, snapshot-aware Hyper-V installer disk into a new
+    /// self-contained dynamic VHDX. Never merges or removes the source chain.
+    pub(crate) async fn convert_hyperv_installer(
+        &self,
+        installer: &str,
+        destination: &Path,
+    ) -> VmResult<(crate::VmBootProfile, u8, u32)> {
+        let (owned, home) = self.load_host_iso(installer)?;
+        let dest = ps_string(&hyperv_path(destination)?);
+        let action = format!(
+            "if ($vm.State -ne 'Off') {{ throw 'Installer VM must be powered off' }}; \
+             Convert-VHD -Path $activeDisk -DestinationPath {dest} -VHDType Dynamic -ErrorAction Stop | Out-Null; \
+             $converted = Get-VHD -Path {dest} -ErrorAction Stop; \
+             if ($converted.VhdType -ne 'Dynamic') {{ throw 'Converted base must be standalone' }}"
+        );
+        powershell(
+            &checked_vm_script(&owned.domain, &home, &action)?,
+            Duration::from_secs(600),
+        )
+        .await?;
+        let profile = match owned.os {
+            HostGuestOs::Windows => crate::VmBootProfile::WindowsUefi,
+            HostGuestOs::Linux => crate::VmBootProfile::LinuxUefi,
+        };
+        Ok((profile, owned.cpus, owned.memory_mb))
+    }
+}
+
+// Verify both VM configuration and its full disk/backing chain. Hyper-V
+// checkpoints can change the attached path from installed.vhdx to *.avhdx,
+// but the terminal parent must still be this exact NovaGPT-owned base.
 fn checked_vm_script(domain: &str, home: &Path, action: &str) -> VmResult<String> {
     let name = ps_string(domain);
     let path = ps_string(&hyperv_path(home)?);
@@ -265,13 +295,28 @@ fn checked_vm_script(domain: &str, home: &Path, action: &str) -> VmResult<String
     Ok(format!(
         "$ErrorActionPreference = 'Stop'; \
          $vm = Get-VM -Name {name} -ErrorAction Stop; \
-         if ([IO.Path]::GetFullPath($vm.Path).TrimEnd('\') -ine [IO.Path]::GetFullPath((Join-Path {path} {name})).TrimEnd('\')) {{ \
+         $vmHome = [IO.Path]::GetFullPath({path}).TrimEnd('\'); \
+         if ([IO.Path]::GetFullPath($vm.Path).TrimEnd('\') -ine [IO.Path]::GetFullPath((Join-Path $vmHome {name})).TrimEnd('\')) {{ \
            throw 'VM configuration is outside the NovaGPT installer home' \
          }}; \
          $disks = @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop); \
-         if ($disks.Count -ne 1 -or [IO.Path]::GetFullPath($disks[0].Path) -ine [IO.Path]::GetFullPath({disk})) {{ \
-           throw 'VM disk is outside the NovaGPT installer home' \
-         }}; {action}"
+         if ($disks.Count -ne 1) {{ throw 'Unexpected installer disk count' }}; \
+         $activeDisk = [IO.Path]::GetFullPath($disks[0].Path); \
+         $current = $activeDisk; $foundBase = $false; \
+         $seen = @{{}}; \
+         for ($index=0; $index -lt 16; $index++) {{ \
+           if ($seen.ContainsKey($current)) {{ throw 'Cyclic disk chain' }}; \
+           $seen[$current] = $true; \
+           if ($current -ieq [IO.Path]::GetFullPath({disk})) {{ $foundBase = $true; break }}; \
+           if (-not $current.StartsWith($vmHome + '\', [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetExtension($current) -ine '.avhdx') {{ \
+             throw 'Installer disk escapes the owned snapshot chain' \
+           }}; \
+           $vhd = Get-VHD -Path $current -ErrorAction Stop; \
+           if ($vhd.VhdType -ne 'Differencing' -or -not $vhd.ParentPath) {{ throw 'Invalid installer checkpoint chain' }}; \
+           $current = [IO.Path]::GetFullPath($vhd.ParentPath); \
+         }}; \
+         if (-not $foundBase) {{ throw 'Installer base is not a parent of the active disk' }}; \
+         {action}"
     ))
 }
 

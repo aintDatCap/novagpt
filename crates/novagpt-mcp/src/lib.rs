@@ -384,6 +384,32 @@ struct IdArgs {
     id: String,
 }
 
+// Operation-scoped Windows guest authentication: no persistence or audit of
+// credential contents. Only the destination VM receives the requested action.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct VmGuestCredentialArgs {
+    username: String,
+    password: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct VmGuestExecArgs {
+    id: String,
+    credential: VmGuestCredentialArgs,
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct VmGuestFileArgs {
+    id: String,
+    credential: VmGuestCredentialArgs,
+    guest_path: String,
+    #[serde(default)]
+    data_base64: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BrowserReadArgs {
     /// Explicit CDP target ID from browser_tabs, not a URL or free-form JavaScript.
@@ -423,6 +449,9 @@ struct BrowserTypeArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct AgentSpawnArgs {
+    /// An optional human-approved base image; a disposable fork is created for this worker only.
+    #[serde(default)]
+    vm_image: Option<String>,
     #[serde(default)]
     workspace_id: Option<String>,
     task: String,
@@ -1497,7 +1526,100 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Spawn a persistent asynchronous untrusted subagent. connector_name is an OPTIONAL parent-selected connected-app display-name hint; omit it if unknown, never guess it from a tool namespace. The initial prompt contains the assignment immediately; there is no separate capability-preflight turn. File edits still require authenticated, credential-bound tool callbacks and verified receipts. If child tools are unavailable, the agent must report NOT APPLIED; no text-only auto-apply."
+        description = "Execute a bounded Windows executable inside a NovaGPT-owned Windows Hyper-V fork using operation-scoped PowerShell Direct credentials. No network or host shell paths."
+    )]
+    async fn vm_exec(&self, Parameters(args): Parameters<VmGuestExecArgs>) -> CallToolResult {
+        #[cfg(windows)]
+        let response = match &self.extras.vm {
+            Some(vm) => external_reply(
+                vm.exec_windows_fork(
+                    &args.id,
+                    &novagpt_vm::windows_direct::GuestCredential {
+                        username: args.credential.username,
+                        password: args.credential.password,
+                    },
+                    &args.program,
+                    &args.args,
+                    args.timeout_ms.unwrap_or(30_000),
+                )
+                .await,
+            ),
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+        };
+        #[cfg(not(windows))]
+        let response = {
+            let _ = args;
+            external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
+                "Windows Hyper-V only",
+            )))
+        };
+        self.observed("vm_exec", response)
+    }
+
+    #[tool(
+        description = "Upload at most 24 KiB of canonical base64 into an owned Windows Hyper-V fork through PowerShell Direct. Never reads a host path. Credentials are operation-scoped."
+    )]
+    async fn vm_upload(&self, Parameters(args): Parameters<VmGuestFileArgs>) -> CallToolResult {
+        #[cfg(windows)]
+        let response = match (&self.extras.vm, args.data_base64) {
+            (Some(vm), Some(data)) => external_reply(
+                vm.upload_windows_fork(
+                    &args.id,
+                    &novagpt_vm::windows_direct::GuestCredential {
+                        username: args.credential.username,
+                        password: args.credential.password,
+                    },
+                    &args.guest_path,
+                    &data,
+                )
+                .await,
+            ),
+            (None, _) => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            (_, None) => {
+                tool_reply::<()>(Err(NovaError::InvalidInput("data_base64 required".into())))
+            }
+        };
+        #[cfg(not(windows))]
+        let response = {
+            let _ = args;
+            external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
+                "Windows Hyper-V only",
+            )))
+        };
+        self.observed("vm_upload", response)
+    }
+
+    #[tool(
+        description = "Download at most 24 KiB as base64 from an owned Windows Hyper-V fork through PowerShell Direct. Never writes a host path. Credentials are operation-scoped."
+    )]
+    async fn vm_download(&self, Parameters(args): Parameters<VmGuestFileArgs>) -> CallToolResult {
+        #[cfg(windows)]
+        let response = match &self.extras.vm {
+            Some(vm) => external_reply(
+                vm.download_windows_fork(
+                    &args.id,
+                    &novagpt_vm::windows_direct::GuestCredential {
+                        username: args.credential.username,
+                        password: args.credential.password,
+                    },
+                    &args.guest_path,
+                )
+                .await,
+            ),
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+        };
+        #[cfg(not(windows))]
+        let response = {
+            let _ = args;
+            external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
+                "Windows Hyper-V only",
+            )))
+        };
+        self.observed("vm_download", response)
+    }
+
+    #[tool(
+        description = "Spawn a persistent asynchronous untrusted subagent. vm_image optionally creates a disposable fork from an approved VM base (destroyed on completion/cancel/failure). connector_name is an OPTIONAL parent-selected connected-app display-name hint; omit it if unknown, never guess it from a tool namespace. The initial prompt contains the assignment immediately; there is no separate capability-preflight turn. File edits still require authenticated, credential-bound tool callbacks and verified receipts. If child tools are unavailable, the agent must report NOT APPLIED; no text-only auto-apply."
     )]
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
         let response = async {
@@ -1519,7 +1641,7 @@ impl NovaMcp {
             // validate the worker credential and assigned paths independently.
             external_reply(
                 manager
-                    .spawn_with_connector(
+                    .spawn_with_connector_vm(
                         SpawnAgent {
                             workspace_id: args.workspace_id,
                             task: args.task,
@@ -1528,6 +1650,7 @@ impl NovaMcp {
                             context: args.context,
                         },
                         args.connector_name.as_deref(),
+                        args.vm_image.as_deref(),
                     )
                     .await,
             )

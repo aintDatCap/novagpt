@@ -20,9 +20,12 @@ use novagpt_browser::{BrowserBridge, ChatGptBrowser};
 use novagpt_core::WorkspaceRegistry;
 use novagpt_mcp::NovaExtras;
 #[cfg(windows)]
+use novagpt_vm::windows_direct::GuestCredential;
+#[cfg(windows)]
 use novagpt_vm::windows_hyperv::{HostGuestOs, HostIsoRequest};
 use novagpt_vm::{
-    VmManager, windows_guest::WindowsGuestExecRequest, windows_unattend::WindowsInstallRequest,
+    VmCreate, VmManager, image_promotion::VmPromoteRequest, windows_guest::WindowsGuestExecRequest,
+    windows_unattend::WindowsInstallRequest,
 };
 use settings::LocalSettings;
 use std::{
@@ -170,6 +173,32 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         memory_mb: u32,
     },
+    /// Flatten a powered-off ISO installer into a separate reusable approved base.
+    VmPromoteIso {
+        #[arg(long)]
+        installer: String,
+        #[arg(long)]
+        image: String,
+    },
+    /// Start a disposable copy-on-write fork from an approved base image.
+    VmFork {
+        #[arg(long)]
+        image: String,
+        #[arg(long)]
+        cpus: Option<u8>,
+        #[arg(long)]
+        memory_mb: Option<u32>,
+    },
+    /// Read the status of an owned disposable fork.
+    VmForkStatus {
+        #[arg(long)]
+        id: String,
+    },
+    /// Remove only an owned disposable fork and its writable disk.
+    VmForkDestroy {
+        #[arg(long)]
+        id: String,
+    },
     /// Provision a disposable Windows 11 guest from a local installer ISO.
     VmInstallWindows {
         #[arg(long)]
@@ -184,6 +213,21 @@ enum Command {
         memory_mb: u32,
         #[arg(long, default_value_t = 80)]
         disk_gib: u32,
+    },
+    /// Execute inside an owned Hyper-V Windows fork using an ephemeral
+    /// credential from the NOVAGPT_VM_PASSWORD environment variable.
+    #[cfg(windows)]
+    VmGuestExec {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        program: String,
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        #[arg(long, default_value_t = 30_000)]
+        timeout_ms: u64,
     },
     /// Create a checkpoint of a powered-off Windows test guest.
     VmSnapshotWindows {
@@ -694,6 +738,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         })
     });
+    let agents = agents.map(|manager| match &vm {
+        Some(vm_manager) => manager.with_vm_manager(vm_manager.clone()),
+        None => manager,
+    });
     let browser_bridge = match (
         cli.browser_bridge_port,
         cli.browser_bridge_origin.as_deref(),
@@ -816,6 +864,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 novagpt_mcp::run_http_with(workspaces, address, token, extras).await?;
             }
+        }
+        Some(Command::VmPromoteIso { installer, image }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let registered = vm
+                .promote_iso(VmPromoteRequest { installer, image })
+                .await?;
+            println!(
+                "Registered immutable base {} ({} bytes, {:?}). Installer VM preserved.",
+                registered.name, registered.bytes, registered.boot_profile
+            );
+        }
+        Some(Command::VmFork {
+            image,
+            cpus,
+            memory_mb,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let fork = vm
+                .create(VmCreate {
+                    image,
+                    cpus,
+                    memory_mb,
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&fork)?);
+        }
+        Some(Command::VmForkStatus { id }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            println!("{}", serde_json::to_string_pretty(&vm.status(&id).await?)?);
+        }
+        #[cfg(windows)]
+        Some(Command::VmGuestExec {
+            id,
+            username,
+            program,
+            args,
+            timeout_ms,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            // The password is never accepted as a CLI flag or written to logs.
+            let password = std::env::var("NOVAGPT_VM_PASSWORD")
+                .map_err(|_| "Set NOVAGPT_VM_PASSWORD in the invoking process environment")?;
+            let result = vm
+                .exec_windows_fork(
+                    &id,
+                    &GuestCredential { username, password },
+                    &program,
+                    &args,
+                    timeout_ms,
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if result.exit_code != 0 {
+                return Err(format!("Guest program exited with {}", result.exit_code).into());
+            }
+        }
+        Some(Command::VmForkDestroy { id }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            println!("{}", serde_json::to_string_pretty(&vm.destroy(&id).await?)?);
         }
         Some(Command::VmImport {
             name,

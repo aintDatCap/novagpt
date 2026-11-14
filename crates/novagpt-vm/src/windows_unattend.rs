@@ -323,6 +323,91 @@ impl VmManager {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl VmManager {
+    /// Flatten a stopped, owned libvirt installer disk. Snapshot metadata and
+    /// the original domain are not touched by this operation.
+    pub(crate) async fn convert_linux_installer(
+        &self,
+        name: &str,
+        dest: &std::path::Path,
+    ) -> VmResult<(crate::VmBootProfile, u8, u32)> {
+        if !valid_name(name, 48) {
+            return Err(VmError::InvalidName);
+        }
+        let home = self.root().join("installers").join(name);
+        if fs::canonicalize(&home)? != home {
+            return Err(VmError::NotOwned);
+        }
+        let disk = home.join("installed.qcow2");
+        if disk.symlink_metadata()?.file_type().is_symlink() || !disk.is_file() {
+            return Err(VmError::NotOwned);
+        }
+        let domain = format!("novagpt-install-{name}");
+        let state = crate::run_command(
+            "virsh",
+            &[
+                "-c".into(),
+                "qemu:///session".into(),
+                "domstate".into(),
+                domain.clone(),
+            ],
+            Duration::from_secs(20),
+        )
+        .await?;
+        if !state.status.success() || String::from_utf8_lossy(&state.stdout).trim() != "shut off" {
+            return Err(VmError::Busy);
+        }
+        let attached = crate::run_command(
+            "virsh",
+            &[
+                "-c".into(),
+                "qemu:///session".into(),
+                "domblklist".into(),
+                "--details".into(),
+                domain,
+            ],
+            Duration::from_secs(20),
+        )
+        .await?;
+        if !attached.status.success() {
+            return Err(VmError::CommandFailed);
+        }
+        let current = String::from_utf8_lossy(&attached.stdout);
+        let disk_text = disk.to_str().ok_or(VmError::InvalidData)?;
+        if !current.lines().any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.len() >= 4
+                && fields[0] == "file"
+                && fields[1] == "disk"
+                && fields.last() == Some(&disk_text)
+        }) {
+            return Err(VmError::NotOwned);
+        }
+        let result = crate::run_command(
+            "qemu-img",
+            &[
+                "convert".into(),
+                "-f".into(),
+                "qcow2".into(),
+                "-O".into(),
+                "qcow2".into(),
+                disk.display().to_string(),
+                dest.display().to_string(),
+            ],
+            Duration::from_secs(600),
+        )
+        .await?;
+        if !result.status.success() {
+            return Err(VmError::CommandFailed);
+        }
+        // The libvirt ISO installer defaults from its CLI are 4 CPU and
+        // 16 GiB RAM. There is no existing manifest for older installers;
+        // users may override these defaults for each fork.
+        Ok((crate::VmBootProfile::WindowsUefi, 4, 16_384))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

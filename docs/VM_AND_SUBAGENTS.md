@@ -6,8 +6,8 @@
 
 | Component | Rust crate | Current behavior |
 | --- | --- | --- |
-| VM storage/lifecycle | `novagpt-vm` | Dedicated ownership-marked image/instance directories; human-only local disk import; image listing; create/status/destroy host VM via Hyper-V (Windows) or QEMU (Linux/macOS); guarded IDs/resources and isolated overlays |
-| VM guest control | `novagpt-vm` | `vm_guest_status` reports **unavailable** for registered VMs; guest exec/upload/download not implemented or registered |
+| VM storage/lifecycle | `novagpt-vm` | Approved immutable imported/promoted bases, snapshot-aware Windows ISO flattening, forked VHDX/qcow2 overlays, create/status/destroy and opt-in per-subagent VM lifecycle; Linux UEFI/TPM fork support is pending |
+| VM guest control | `novagpt-vm` | Credential-scoped PowerShell Direct guest exec/upload/download for Windows Hyper-V forks (24 KiB transfers); credential-free status cannot authenticate a guest |
 | Subagent manager | `novagpt-agents` | Async spawn, message, status, result, cancel, resume after human confirmation, browser diagnostics; roles explorer/reviewer/tester/implementer; bounded shared registry |
 | Chrome/ChromeDriver driver | `novagpt-browser-driver` | Rust-native, visible Chrome process and exclusively owned persistent profile; patched ChromeDriver, W3C sessions/tabs, physical input, screenshots, bounded timeouts, crash/relaunch recovery, atomic click/Enter transactions; real Chrome and local adapter fixtures tested on Linux |
 | ChatGPT Web adapter | `novagpt-browser` | Dedicated browsing tab with URL/origin guards, visible UI inspection, responsive viewport tests, form interactions and bounded diagnostics; ChatGPT selectors and human login/challenge detection |
@@ -51,6 +51,29 @@ Each guest receives a dynamic VHDX of the requested *virtual capacity* in a dedi
 The unattended Windows account currently uses the same **weak disposable-only password** noted in the Linux provisioning section below; never connect it to an untrusted network. ISO VM status/checkpoints validate the registered VM's configuration location. **Not implemented for these ISO guests:** Windows PowerShell Direct guest execution, deletion/rollback of partially created VMs, arbitrary network connections, or exposed MCP installer operations. An active Hyper-V VM does not alone prove that its guest OS installed successfully.
 
 **Live Windows-host evidence (2026-11-14):** CachyOS reached its graphical live desktop under Hyper-V with 4 vCPUs, 8192 MiB and an 80 GiB virtual disk on E:. A powered-on snapshot was denied and a powered-off baseline snapshot succeeded. Windows 11 25H2 completed unattended installation and reached the NovaTester desktop; the Hyper-V Heartbeat reported OK, and an off-guest baseline checkpoint succeeded. A second fresh Windows 11 ISO VM reached setup automatically without manual keyboard input and was then removed.
+
+### Promote a Windows installer and fork immutable bases (Windows host)
+
+The local CLI can flatten a trusted powered-off installer VM into an approved image:
+
+~~~powershell
+novagpt --vm-home E:\NovaGPT-VM-Tests vm-promote-iso --installer win11-live1 --image win11-base
+novagpt --vm-home E:\NovaGPT-VM-Tests vm-fork --image win11-base --cpus 4 --memory-mb 8192
+novagpt --vm-home E:\NovaGPT-VM-Tests vm-fork-status --id vm-0123456789abcdef
+novagpt --vm-home E:\NovaGPT-VM-Tests vm-fork-destroy --id vm-0123456789abcdef
+~~~
+
+Promotion never overwrites existing images and does not delete the installer VM, snapshots or disk. It checks the owned VM name, configuration location, backing VHDX/AVHDX chain, and powered-off state. It converts the active disk to an independent dynamic VHDX, records its SHA-256 and boot profile, and marks the base read-only. A failed conversion may leave an unregistered image directory for inspection. The original installer remains for recovery and is retired manually only after validation; do not remove a parent disk while snapshots still depend on it.
+
+A Windows fork receives a new differencing VHDX pointing at that immutable base, a distinct TPM/key protector, Windows Secure Boot, and the image's CPU/RAM defaults (overridable). Destroy validates the exact owned disk before removing the VM and only its instance files, never the base. Owned Hyper-V forks can be inspected and destroyed across NovaGPT restarts.
+
+A parent can opt in to VM isolation by specifying vm_image on subagent_spawn. Both VM and subagent services must be enabled. NovaGPT creates a fork before the worker starts; the VM ID and base appear in the parent-visible agent record and task. The fork is cleaned up on completion, failure or cancellation. Lease states: active, cleaning, destroyed, cleanup_failed. Completed VM-backed agents reject follow-ups: spawn a new worker to get a new fork. Cleanup failures retain resources for explicit owner recovery; they are never silently reported as successful.
+
+On Windows Hyper-V, the MCP tools vm_exec, vm_upload and vm_download operate inside owned Windows guests through PowerShell Direct with guest credentials supplied separately for each operation. The password is not saved to the image, manifest, logs or process command line. All operations check the registered attached VHDX before contacting the guest. The execution tool accepts an absolute Windows executable and bounded arguments for up to 300 seconds. Each transfer uses canonical base64 and a 24 KiB limit, with guest paths only. Credential-free vm_guest_status cannot authenticate the guest and does not claim guest execution works. A worker cannot obtain credentials merely by inheriting the MCP connection.
+
+Live Windows-host verification: Windows 11 25H2 with an existing Hyper-V baseline checkpoint was flattened to a standalone 23.1 GB read-only base.vhdx. NovaGPT created a fresh 4-vCPU, 8192-MiB, 80-GiB differencing fork. The guest booted and Hyper-V Heartbeat reported OK. vm-fork-status and vm-fork-destroy succeeded; the instance directory was removed, while the approved base and installer snapshots remained. An additional ignored live integration test passed with `NOVAGPT_LIVE_VM_HOME=E:\\NovaGPT-VM-Tests-20261114` and `NOVAGPT_LIVE_VM_IMAGE=win11-base-20261114` using `cargo test --release -p novagpt-agents live_agent_vm_fork_is_released_after_backend_completion -- --ignored --nocapture`: the test backend completed and its subagent-owned Hyper-V fork was removed while the approved base remained registered. Guest command/file transfer still needs separate authenticated live testing.
+
+Limits: On Linux, the existing QEMU fork backend does not configure UEFI/TPM for Windows guest profiles. Such images are rejected rather than silently booted with incorrect firmware. Legacy qcow2 images keep their existing behavior. Installer retirement, crash recovery, guest credential provisioning and cross-host base portability are not automated.
 
 ### Windows 11 ISO provisioning on Linux (experimental)
 
@@ -207,7 +230,7 @@ The Rust-native driver and ChatGPT Web adapter use a visible, genuinely editable
 
 ## Important technical gaps
 
-1. **Guest operations:** `vm_exec`, `vm_upload`, `vm_download`, QEMU guest agent and credential-scoped Hyper-V PowerShell Direct must be implemented before guest control. No credential transport is implemented in this initial slice.
+1. **Guest operations:** Windows Hyper-V forks have credential-scoped PowerShell Direct `vm_exec`, `vm_upload`, and `vm_download` (limited to 24 KiB transfers), but a live authenticated guest command and file-transfer test is still required. Linux/QEMU managed-fork guest execution and file transfer are not integrated into these MCP tools.
 2. **Native VM interoperability:** image import intentionally does not claim other image manifest formats, boot-tested images, real Hyper-V/QEMU integration, recovery or secure boot. Windows disk creation and cleanup need smoke tests on isolated hardware.
 3. **ChatGPT Browser:** `novagpt-browser-driver` uses Rust, ChromeDriver and WebDriver rather than Node.js/Patchright. Four-tab isolation, input, screenshot, close, driver reconnect and Chrome crash/relaunch passed against disposable local HTML fixtures on Linux/Chrome 156; the ChatGPT adapter's local browsing path also passed; agent result association and cancellation were additionally checked by deterministic mocks. It has **not** been validated against a real ChatGPT account, authenticated profile persistence across separate server invocations, dynamic ChatGPT UI changes, project auto-creation, relogin, anti-bot gates, multi-tab races against live ChatGPT or actual response completion. Human verification remains manual. Chrome is launched with Blink's automation feature disabled so the page does not report `navigator.webdriver`; this is a launch switch, not a JavaScript identity patch, and it does not guarantee that a provider accepts the session.
 4. **Tool visibility:** optional tool names are present in `tools/list` even when a subsystem is disabled; invocation fails explicitly. Disabled-tool visibility needs its own policy and tests.
