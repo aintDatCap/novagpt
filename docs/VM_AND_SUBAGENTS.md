@@ -54,7 +54,9 @@ The unattended Windows account currently uses the same **weak disposable-only pa
 
 ### Promote a Windows installer and fork immutable bases (Windows host)
 
-The local CLI can flatten a trusted powered-off installer VM into an approved image:
+The local CLI can flatten a trusted powered-off installer VM into an approved image. To make this VM store available to the running MCP server and to VM-backed subagents, select it once with `novagpt vm-set-home --path E:\\NovaGPT-VM-Tests-20261114` and restart the server. This changes the per-user VM home setting without copying or moving any images. The explicit `--vm-home` CLI flag still overrides the saved selection for individual commands.
+
+The local CLI can then promote and fork an installer:
 
 ~~~powershell
 novagpt --vm-home E:\NovaGPT-VM-Tests vm-promote-iso --installer win11-live1 --image win11-base

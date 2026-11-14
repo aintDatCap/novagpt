@@ -447,9 +447,11 @@ impl Controller {
                 let vm = if config.vm_enabled {
                     Some(
                         novagpt_vm::VmManager::new(
-                            settings::global_dir()
-                                .map_err(|_| "Global VM directory unavailable".to_string())?
-                                .join("vms"),
+                            config.vm_home.clone().unwrap_or(
+                                settings::global_dir()
+                                    .map_err(|_| "Global VM directory unavailable".to_string())?
+                                    .join("vms"),
+                            ),
                         )
                         .map_err(|_| "Unable to initialize VM.".to_string())?,
                     )

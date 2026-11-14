@@ -40,6 +40,8 @@ pub struct LocalSettings {
     pub port: u16,
     pub allowed_roots: Vec<PathBuf>,
     pub vm_enabled: bool,
+    /// Optional user-approved VM store. If absent, use the private per-user default.
+    pub vm_home: Option<PathBuf>,
     pub browser_enabled: bool,
     pub chrome_executable: Option<PathBuf>,
     pub auto_start_mcp: bool,
@@ -63,6 +65,7 @@ impl Default for LocalSettings {
             port: 8787,
             allowed_roots: Vec::new(),
             vm_enabled: false,
+            vm_home: None,
             browser_enabled: false,
             chrome_executable: None,
             auto_start_mcp: false,
@@ -201,6 +204,16 @@ impl LocalSettings {
                     "allowed root must be an existing absolute directory",
                 ));
             }
+        }
+        if self.vm_home.as_ref().is_some_and(|path| {
+            !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+        }) {
+            return Err(invalid(
+                "VM home must be an absolute path without parent traversal",
+            ));
         }
         if self
             .ngrok_domain
@@ -389,6 +402,25 @@ mod tests {
         save_to(&cfg, dir.path()).unwrap();
         assert_eq!(load_from(dir.path()).unwrap(), cfg);
     }
+    #[test]
+    fn configured_vm_home_persists_and_rejects_relative_paths() {
+        let config_dir = tempfile::tempdir().expect("config");
+        let store = tempfile::tempdir().expect("VM store");
+        let mut saved = LocalSettings {
+            vm_enabled: true,
+            vm_home: Some(store.path().to_path_buf()),
+            ..LocalSettings::default()
+        };
+        saved.validate().expect("valid absolute VM home");
+        save_to(&saved, config_dir.path()).expect("save");
+        assert_eq!(
+            load_from(config_dir.path()).expect("load").vm_home,
+            saved.vm_home
+        );
+        saved.vm_home = Some(PathBuf::from("relative/vms"));
+        assert!(saved.validate().is_err());
+    }
+
     #[test]
     fn imports_only_connection_settings_from_other_novagpt_directory() {
         let source = tempfile::tempdir().expect("source");

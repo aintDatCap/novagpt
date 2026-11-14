@@ -162,6 +162,11 @@ enum Command {
         #[command(subcommand)]
         action: UsageCommand,
     },
+    /// Save an explicitly chosen NovaGPT-owned VM store for future MCP and TUI sessions.
+    VmSetHome {
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Import an approved qcow2/VHDX disk to NovaGPT's owned VM image store.
     VmImport {
         #[arg(long)]
@@ -630,6 +635,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+    if let Some(Command::VmSetHome { path }) = &cli.command {
+        let canonical = std::fs::canonicalize(path)?;
+        // Refuse arbitrary directories and foreign hypervisor storage.
+        VmManager::new(&canonical)?;
+        let mut saved = LocalSettings::load()?;
+        saved.vm_home = Some(canonical.clone());
+        saved.vm_enabled = true;
+        saved.save()?;
+        println!(
+            "Configured NovaGPT VM home: {}. Restart the MCP server to use it.",
+            canonical.display()
+        );
+        return Ok(());
+    }
     if cli.setup || cli.command.is_none() {
         let mut profiles = Vec::new();
         if let Some(folder) = cli.novagpt_source.as_deref() {
@@ -658,7 +677,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspaces = WorkspaceRegistry::new(&root, &approved_roots)?;
     let vm_home = match cli.vm_home {
         Some(dir) => Some(dir),
-        None if local.vm_enabled => Some(settings::global_dir()?.join("vms")),
+        None if local.vm_enabled => Some(match local.vm_home.as_ref() {
+            Some(path) => path.clone(),
+            None => settings::global_dir()?.join("vms"),
+        }),
         None => None,
     };
     let vm = vm_home.map(VmManager::new).transpose()?;
@@ -1071,7 +1093,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             unreachable!("local commands handled above")
         }
         Some(
-            Command::Doctor { .. }
+            Command::VmSetHome { .. }
+            | Command::Doctor { .. }
             | Command::Inspect { .. }
             | Command::Review { .. }
             | Command::ConnectionTest { .. }
