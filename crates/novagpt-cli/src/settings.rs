@@ -405,6 +405,12 @@ mod tests {
     #[test]
     fn configured_vm_home_persists_and_rejects_relative_paths() {
         let config_dir = tempfile::tempdir().expect("config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(config_dir.path(), fs::Permissions::from_mode(0o700))
+                .expect("private config directory");
+        }
         let store = tempfile::tempdir().expect("VM store");
         let mut saved = LocalSettings {
             vm_enabled: true,
@@ -419,6 +425,20 @@ mod tests {
         );
         saved.vm_home = Some(PathBuf::from("relative/vms"));
         assert!(saved.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_settings_save_rejects_nonprivate_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config_dir = tempfile::tempdir().expect("config");
+        fs::set_permissions(config_dir.path(), fs::Permissions::from_mode(0o755))
+            .expect("make config directory shared");
+        let error = save_to(&LocalSettings::default(), config_dir.path())
+            .expect_err("shared config directory must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!config_dir.path().join("config.json").exists());
     }
 
     #[test]
