@@ -330,7 +330,6 @@ impl VmManager {
         }
         let id = format!("vm-{}", &Uuid::new_v4().simple().to_string()[..16]);
         let dir = self.inner.root.join("instances").join(&id);
-        fs::create_dir(&dir)?;
         let source = self
             .inner
             .root
@@ -349,6 +348,9 @@ impl VmManager {
         if digest != expected {
             return Err(VmError::InvalidData);
         }
+        // An interrupted or rejected hash check must not leave an empty
+        // instance directory that later looks like an incomplete VM.
+        fs::create_dir(&dir)?;
         let overlay = dir.join(format!("disk.{}", image.backend.disk_ext()));
         let instance = VmInstance {
             id: id.clone(),
@@ -824,6 +826,41 @@ mod tests {
             manager.import_image("test-image", &source, 2, 1024),
             Err(VmError::Io(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn tampered_base_is_rejected_without_empty_instance_directory() {
+        let store = tempfile::tempdir().expect("store");
+        let input = tempfile::tempdir().expect("image input");
+        let manager = VmManager::new(store.path()).expect("owned VM home");
+        let source = input
+            .path()
+            .join(format!("fixture.{}", manager.backend().disk_ext()));
+        fs::write(&source, b"approved-image").expect("source fixture");
+        manager
+            .import_image("approved", &source, 2, 1024)
+            .expect("import");
+        let base = manager
+            .root()
+            .join("images")
+            .join("approved")
+            .join(format!("base.{}", manager.backend().disk_ext()));
+        fs::write(base, b"changed-after-approval").expect("simulate tampering");
+        let result = manager
+            .create(VmCreate {
+                image: "approved".into(),
+                cpus: None,
+                memory_mb: None,
+            })
+            .await;
+        assert!(matches!(result, Err(VmError::InvalidData)));
+        assert_eq!(
+            fs::read_dir(manager.root().join("instances"))
+                .expect("instances")
+                .count(),
+            0,
+            "Hash rejection must not reserve a VM instance directory"
+        );
     }
 
     #[test]
