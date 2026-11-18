@@ -1610,6 +1610,7 @@ dependencies = [
 name = "novagpt-cli"
 version = "0.5.0"
 dependencies = [
+ "axum",
  "clap",
  "crossterm",
  "fs2",
@@ -1624,6 +1625,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "subtle",
  "sys-locale",
  "tempfile",
  "tokio",

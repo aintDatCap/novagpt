@@ -1,4 +1,5 @@
 //! Independent NovaGPT command-line entrypoint.
+mod chat_api;
 mod chrome;
 mod clipboard;
 mod connection;
@@ -126,6 +127,9 @@ enum Command {
         /// Explicit port overrides the workspace's saved port.
         #[arg(long)]
         port: Option<u16>,
+        /// Opt in to a narrow, loopback-only Nova Chat HTTP API.
+        #[arg(long)]
+        chat_api_port: Option<u16>,
         /// Explicitly expose token-protected MCP HTTP through an owned ngrok process.
         #[arg(long, conflicts_with = "no_ngrok")]
         ngrok: bool,
@@ -853,6 +857,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Stdio) => novagpt_mcp::run_stdio_with(workspaces, extras).await?,
         Some(Command::Http {
             port,
+            chat_api_port,
             ngrok,
             no_ngrok,
             ngrok_domain,
@@ -866,6 +871,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let token = resolved.value;
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let chat_server = if let Some(chat_port) = chat_api_port {
+                if ngrok {
+                    return Err("Nova Chat API requires local-only MCP HTTP (--no-ngrok)".into());
+                }
+                let browser = extras
+                    .browser
+                    .clone()
+                    .ok_or("Nova Chat API requires enabled browser")?;
+                let router = chat_api::router(browser, &token)?;
+                let listener = tokio::net::TcpListener::bind(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    chat_port,
+                ))
+                .await?;
+                Some((listener, router))
+            } else {
+                None
+            };
             if ngrok {
                 let mut shutdown = Box::pin(http_stop_signal());
                 // Own the loopback socket BEFORE starting a public tunnel.
@@ -947,7 +970,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             } else {
-                novagpt_mcp::run_http_with(workspaces, address, token, extras).await?;
+                if let Some((listener, router)) = chat_server {
+                    tokio::select! {
+                        result = novagpt_mcp::run_http_with(workspaces, address, token, extras) => result?,
+                        result = axum::serve(listener, router) => result?,
+                    }
+                } else {
+                    novagpt_mcp::run_http_with(workspaces, address, token, extras).await?;
+                }
             }
         }
         Some(Command::VmImportIso { name, source }) => {
