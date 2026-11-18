@@ -213,6 +213,7 @@ impl VmManager {
         if meta.file_type().is_symlink() || !meta.is_file() {
             return Err(VmError::NotOwned);
         }
+        self.verify_overlay(&instance).await?;
         Ok(disk)
     }
 

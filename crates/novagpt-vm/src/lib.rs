@@ -701,6 +701,7 @@ impl VmManager {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(VmError::NotOwned);
         }
+        self.verify_overlay(&instance).await?;
         self.launch_qemu(id, &disk, instance.cpus, instance.memory_mb)
             .await?;
         let (qemu_pid, qemu_start_ticks) = self.running_qemu_identity(id).await?;
@@ -1283,6 +1284,63 @@ impl VmManager {
         }
     }
 
+    /// Re-attest the owned QCOW2 overlay before offline inspection, restoration
+    /// or launch. A stopped disk must not be rebased to host-private files.
+    pub(crate) async fn verify_overlay(&self, instance: &VmInstance) -> VmResult<()> {
+        if instance.backend != VmBackend::Qemu {
+            return Err(VmError::Unsupported("QEMU QCOW2 overlay only"));
+        }
+        let approved = self
+            .images()?
+            .images
+            .into_iter()
+            .find(|image| image.name == instance.image)
+            .ok_or(VmError::NotFound)?;
+        let dir = self.instance_dir(&instance.id);
+        if fs::canonicalize(&dir)? != dir {
+            return Err(VmError::NotOwned);
+        }
+        let disk = dir.join("disk.qcow2");
+        let base = self
+            .root()
+            .join("images")
+            .join(&approved.name)
+            .join("base.qcow2");
+        for file in [&disk, &base] {
+            let meta = file.symlink_metadata()?;
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                return Err(VmError::NotOwned);
+            }
+        }
+        let output = run_command(
+            "qemu-img",
+            &[
+                "info".into(),
+                "--output=json".into(),
+                disk.display().to_string(),
+            ],
+            Duration::from_secs(15),
+        )
+        .await?;
+        if !output.status.success() {
+            return Err(VmError::InvalidData);
+        }
+        let info: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|_| VmError::InvalidData)?;
+        if info["format"].as_str() != Some("qcow2")
+            || info["filename"].as_str() != disk.to_str()
+            || info["backing-filename"].as_str() != base.to_str()
+            || info["full-backing-filename"].as_str() != base.to_str()
+            || info["backing-filename-format"].as_str() != Some("qcow2")
+            || info.get("data-file").is_some()
+            || info["encrypted"].as_bool() == Some(true)
+            || info["format-specific"]["data"]["corrupt"].as_bool() == Some(true)
+        {
+            return Err(VmError::InvalidData);
+        }
+        Ok(())
+    }
+
     fn linux_options(&self, id: &str) -> VmResult<linux_qemu::LinuxVmOptions> {
         let file = self.instance_dir(id).join("vm.toml");
         if !file.exists() {
@@ -1723,6 +1781,50 @@ mod tests {
         assert!(matches!(VmManager::new(temp.path()), Err(VmError::Busy)));
         drop(first);
         assert!(VmManager::new(temp.path()).is_ok());
+    }
+
+    /// A local writer must not be able to redirect a stopped overlay to a
+    /// different backing disk and then make NovaGPT launch or snapshot it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn rejects_tampered_overlay_backing_on_start_and_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = temp.path().join("approved.qcow2");
+        make_fixture_disk(&initial);
+        let vm = VmManager::new(temp.path().join("owned")).unwrap();
+        vm.import_image("approved", &initial, 1, 512).unwrap();
+        let created = vm
+            .create(VmCreate {
+                image: "approved".into(),
+                cpus: None,
+                memory_mb: None,
+                linux_options: None,
+                installer_iso: None,
+            })
+            .await
+            .unwrap();
+        let id = created.instance.id;
+        vm.stop(&id).await.unwrap();
+        let rogue_base = temp.path().join("external.qcow2");
+        make_fixture_disk(&rogue_base);
+        let disk = vm.instance_dir(&id).join("disk.qcow2");
+        let rebase = tokio::process::Command::new("qemu-img")
+            .args(["rebase", "-u", "-f", "qcow2", "-F", "qcow2", "-b"])
+            .arg(&rogue_base)
+            .arg(&disk)
+            .output()
+            .await
+            .unwrap();
+        assert!(rebase.status.success());
+        assert!(matches!(vm.start(&id).await, Err(VmError::InvalidData)));
+        assert!(matches!(
+            vm.snapshot_list(&id).await,
+            Err(VmError::InvalidData)
+        ));
+        // No host-owned or unrelated disk is ever deleted during cleanup.
+        vm.destroy(&id).await.unwrap();
+        assert!(rogue_base.exists());
+        assert!(initial.exists());
     }
 
     #[test]
