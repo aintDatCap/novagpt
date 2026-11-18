@@ -34,7 +34,7 @@ On Linux the local CLI accepts approved `.qcow2` bases and ISO images. QEMU fork
 
 ## Linux QEMU managed VM lab (2026-11-18, partially verified)
 
-The optional VM store is explicitly selected with `--vm-home`; it must be **dedicated, outside agent-writable workspace roots, and never a personal or production VM directory**. A cross-process exclusive lease blocks two NovaGPT managers from claiming the same home simultaneously. To run the human-only import/blank-base CLI commands, first stop the MCP process using that home, then restart it with the same home. Existing bases are checksummed and immutable; QCOW2 bases with external backing/data file references are rejected.
+The optional VM store is explicitly selected with `--vm-home`; it must be **dedicated, outside agent-writable workspace roots, and never a personal or production VM directory**. A cross-process exclusive lease blocks two NovaGPT managers from claiming the same home simultaneously. To run the human-only import/blank-base CLI commands, first stop the MCP process using that home, then restart it with the same home. Existing bases are checksummed and immutable; QCOW2 bases with external backing/data file references are rejected. Stopped QCOW2 fork overlays are re-attested on start and before snapshot operations: their exact backing image must remain the owned, approved base, so an altered overlay pointing at another host file is rejected.
 
 ### Human-approved installation media and blank bases
 
