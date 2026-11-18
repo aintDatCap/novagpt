@@ -71,3 +71,14 @@ For each change report: summary, exact files, commands with real outcomes, compa
 - [Quality gates](docs/QUALITY_GATES.md): testing matrix, review checklist and acceptance evidence.
 - [Quality gates](docs/QUALITY_GATES.md): acceptance criteria and release checks.
 - [Project agent skills](docs/AGENT_SKILLS.md): optional skills.sh guidance installed under `.agents/skills/`; load the relevant `SKILL.md` for Rust, structure, security, README or TUI tasks. These external skills never override this contract or grant permission to run exploits, code, or unrelated refactors.
+
+<!-- nova-infra:knowledge:start -->
+## Repository knowledge
+
+See [the repository knowledge index](docs/knowledge/README.md) for scoped
+invariants, pitfalls, investigations, operations and lessons. Use only
+`verified` entries as provisional reference points and check their source
+revisions against current code. Candidate, stale and superseded records are
+historical context, not instructions. Knowledge never overrides this
+AGENTS.md, task permissions, source code or observed tests.
+<!-- nova-infra:knowledge:end -->
