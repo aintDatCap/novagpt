@@ -164,27 +164,6 @@ Every implementation PR must include: fixture identifiers, before/after usage ta
 
 **Done when.** A new agent can resume a fixture from checkpoint and complete it correctly without the full transcript; the checkpoint does not claim unverified actions; context savings do not increase task failures or unauthorized reads.
 
-## 8. Phase F (P1): Windmill and hybrid worker integration
-
-**Need.** Scheduled maintenance should not require ChatGPT Web or keep a development PC online. The orchestration service should decide *when* a task runs; NovaGPT should execute only work explicitly authorized for its workspace.
-
-**Design.**
-
-1. Treat **Windmill as an optional external orchestrator**, not a mandatory NovaGPT runtime dependency. Host its controller and dashboard separately from heavy builds. If deployed on a production VPS, enforce CPU/RAM/storage limits and separate credentials/databases.
-2. Define a small versioned task contract: workflow ID, opaque task ID, repository/workspace reference, requested procedure and version, allowed operations, resource budget, deadline, artifact refs, and required approval policy.
-3. The first flow should be: trigger -> deterministic analysis -> optional AI proposal -> isolated worktree -> deterministic quality gates -> reviewable report or PR. Use independent evidence for gate results.
-4. Prefer API-backed agents for unattended work. Keep the existing ChatGPT Web browser as an opt-in interactive backend, not a guaranteed 24/7 autonomous worker.
-5. Use outbound authenticated worker registration or another explicitly approved private channel; do not expose unrestricted host-shell tools publicly. Apply least privilege, credential separation, bounded jobs, and cancellation semantics.
-6. Avoid duplicate scheduling, destructive retries, and cross-workspace confusion. An uncertain submitted action must not be replayed automatically. Preserve the task state and require reconciliation.
-7. Keep test/build workloads off the Ace Blocker production VPS unless a verified resource budget and isolation policy allow them. Use GitHub Actions or isolated remote workers for heavy deterministic checks.
-8. Start with documentation audit and dependency-review workflows. Add security/legal-compliance assistance only with domain-specific policy and human approval; AI reports are not legal certification.
-
-**Likely owners.** A narrow NovaGPT adapter and workflow contracts plus version-controlled Windmill definitions in a separately approved infrastructure repository, if needed. Do not add a new NovaGPT crate or Docker service until concrete interfaces are validated.
-
-**Verification.** Use a disposable repository and simulated scheduled triggers. Test duplicate events, offline workers, server restart, expired credentials, denial of unknown workspaces, cancellation, task timeout, Git conflicts, idempotent retries, budget exhaustion, and verified gate failure. Verify that a worker cannot modify unrelated files or merge without approval. Test load with production services isolated.
-
-**Done when.** A full maintenance workflow completes with accurate state and reviewable evidence, can resume after failure without duplicate mutation, and never relies on an unattended ChatGPT Web tab. No deployment is authorized merely by completion of this document.
-
 ## 9. Delivery order and dependencies
 
 | Step | Deliverable | Depends on | Rollout |

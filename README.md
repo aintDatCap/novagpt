@@ -83,7 +83,6 @@ You can also start a local-only server using `novagpt http --no-ngrok`, or start
 - [Detailed installation, ngrok and troubleshooting](docs/INSTALLATION.md)
 - [Terminal interface and keyboard shortcuts](docs/TUI_SETUP.md)
 - [Security, architecture and development](docs/ARCHITECTURE.md)
-- [Optional Nova Infrastructure integration roadmap](docs/NOVA_INFRA_INTEGRATION_ROADMAP.md)
 - [Contributing](CONTRIBUTING.md)
 
 NovaGPT is under active development. Some optional capabilities need additional configuration and have not yet been verified in every environment.
