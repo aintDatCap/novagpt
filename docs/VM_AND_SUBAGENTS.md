@@ -6,13 +6,13 @@
 
 | Component | Rust crate | Current behavior |
 | --- | --- | --- |
-| VM storage/lifecycle | `novagpt-vm` | Approved immutable imported/promoted bases, snapshot-aware Windows ISO flattening, forked VHDX/qcow2 overlays, create/status/destroy and opt-in per-subagent VM lifecycle; Linux UEFI/TPM fork support is pending |
-| VM guest control | `novagpt-vm` | Credential-scoped PowerShell Direct guest exec/upload/download for Windows Hyper-V forks (24 KiB transfers); credential-free status cannot authenticate a guest |
+| VM storage/lifecycle | `novagpt-vm` | Approved immutable imported/promoted bases, QEMU copy-on-write forks with NAT/isolated multi-NIC, Linux UEFI, private QMP display, bounded lifecycle, offline QCOW2 snapshots, separate approved ISO registry and conservative store quotas. Windows UEFI/TPM QEMU fork support remains pending. |
+| VM guest control | `novagpt-vm` | Unix-domain QEMU Guest Agent ping, bounded guest exec, upload/download inside Linux-hosted QEMU forks; PowerShell Direct for Windows Hyper-V forks (24 KiB). A real installed Linux guest control smoke remains pending. |
 | Subagent manager | `novagpt-agents` | Async spawn, message, status, result, cancel, resume after human confirmation, browser diagnostics; roles explorer/reviewer/tester/implementer; bounded shared registry |
 | Chrome/ChromeDriver driver | `novagpt-browser-driver` | Rust-native, visible Chrome process and exclusively owned persistent profile; patched ChromeDriver, W3C sessions/tabs, physical input, screenshots, bounded timeouts, crash/relaunch recovery, atomic click/Enter transactions; real Chrome and local adapter fixtures tested on Linux |
 | ChatGPT Web adapter | `novagpt-browser` | Dedicated browsing tab with URL/origin guards, visible UI inspection, responsive viewport tests, form interactions and bounded diagnostics; ChatGPT selectors and human login/challenge detection |
-| MCP wiring | `novagpt-mcp` | Official `rmcp` schemas/structured results; 2 VM tools, 9 subagent tools and 10 dedicated browser tools; explicit errors when optional subsystems are disabled |
-| CLI wiring | `novagpt-cli` | Flags `--vm-home`, `--chatgpt-chrome`, `--chatgpt-profile`; human-only `vm-import` command |
+| MCP wiring | `novagpt-mcp` | Official `rmcp` schemas/structured results; `vm`, `vm_image`, `vm_iso`, `vm_snapshot`, `vm_guest_status`, `vm_exec`, `vm_upload`, `vm_download`, `vm_desktop_screenshot`, `vm_desktop_input`; existing subagent and browser tools preserved. |
+| CLI wiring | `novagpt-cli` | Existing flags and installer workflows, plus `vm-import-iso`, `vm-init-base`, `vm-fork` NIC/ISO options, `vm-fork-start`, `vm-fork-stop`, `vm-fork-snapshot`. |
 
 The crates follow the direction `novagpt-cli -> novagpt-mcp -> optional domain adapters`; `novagpt-core` stays independent of browser and VM. Subagent records are server-scoped, **not tied to individual ChatGPT transports**.
 
@@ -30,7 +30,71 @@ cargo run -p novagpt-cli -- --root C:\Projects\your-repo --vm-home C:\NovaGPT-VM
 
 Then call `vm` with `{"action":"images"}` to inspect approved images; `{"action":"create","image":"win-test"}`, followed by `{"action":"status","id":"vm-..."}` and, when **explicitly requested**, `{"action":"destroy","id":"vm-..."}`. NovaGPT names Hyper-V guests `NovaGPT-vm-<16-hex>`; instances use a differencing disk, preserving imported bases. Destroy stops/removes **only the named managed VM**, then deletes its expected owned instance files, never arbitrary paths. If unknown files or symlinks appear in an instance directory, cleanup refuses rather than deleting them.
 
-On Linux/macOS the same CLI import accepts a `.qcow2` base image and the host backend runs `qemu-img` and `qemu-system-x86_64`. A running QEMU process is owned by the live server process; after a restart, an orphaned or unowned process is not killed by guessing a PID. QEMU guest control, architecture/accelerator options and reliable restart recovery remain pending.
+On Linux the local CLI accepts approved `.qcow2` bases and ISO images. QEMU forks now support per-VM guest-agent and QMP Unix sockets, bounded virtual networking, boot-time Linux UEFI variables, and an exclusive store lease. Existing QEMU child handles remain process-local: after a server crash/restart, a previously running guest is reported failed/unowned rather than killing an unverified host PID. Automatic orphan adoption and Windows UEFI/TPM forks remain pending. The new Linux QEMU path has not been validated on macOS.
+
+## Linux QEMU managed VM lab (2026-11-18, partially verified)
+
+The optional VM store is explicitly selected with `--vm-home`; it must be **dedicated, outside agent-writable workspace roots, and never a personal or production VM directory**. A cross-process exclusive lease blocks two NovaGPT managers from claiming the same home simultaneously. To run the human-only import/blank-base CLI commands, first stop the MCP process using that home, then restart it with the same home. Existing bases are checksummed and immutable; QCOW2 bases with external backing/data file references are rejected.
+
+### Human-approved installation media and blank bases
+
+The following commands are run by the human on the NovaGPT host, **not** by an MCP agent. `vm-import-iso` makes an immutable, SHA-256-verified copy of a locally approved ISO; `vm-init-base` creates a separate sparse QCOW2 base for installation. Use distinct base names for Ubuntu, Arch and CachyOS. The default blank base uses **Linux UEFI** (OVMF), while `--legacy` creates a BIOS base suitable for disk-only environment snapshots. Windows 11 Linux-hosted raw QEMU UEFI/TPM install forks are **not supported by this new workflow**; use the existing Windows installer procedure below or a Windows-hosted Hyper-V disposable test VM.
+
+```bash
+novagpt --vm-home "$HOME/.local/state/NovaGPT/vms" vm-import-iso \
+  --name ubuntu-approved --source /path/to/human-approved-ubuntu.iso
+novagpt --vm-home "$HOME/.local/state/NovaGPT/vms" vm-init-base \
+  --name ubuntu-empty --disk-gib 50 --cpus 4 --memory-mb 8192
+# Optional BIOS-based installation if disk-only QCOW2 snapshots are required:
+novagpt --vm-home "$HOME/.local/state/NovaGPT/vms" vm-init-base \
+  --name ubuntu-bios-empty --disk-gib 50 --cpus 4 --memory-mb 8192 --legacy
+```
+
+The new MCP tools `vm_image` and `vm_iso` list approved names only. From the restarted MCP server an agent can issue:
+
+```json
+{"action":"create","image":"ubuntu-empty","installer_iso":"ubuntu-approved",
+ "cpus":4,"memory_mb":8192,"networks":["none"],"display":true,"guest_agent":true}
+```
+
+This is an example of the **`vm` tool arguments**, not a shell command. `networks:["none"]` provides no NIC and no internet egress; select `["nat"]` explicitly when installation needs network access. New QEMU forks run with a private Unix QMP monitor, virtual USB keyboard/tablet, optional VNC socket and a virtio Guest Agent channel. The guest OS must still be installed via its own installer; install and enable `qemu-guest-agent` **inside** the Linux guest (Ubuntu/Arch/CachyOS package instructions vary). The channel being present does not mean the guest service is ready. System ISO installation, user account creation, guest-agent package installation, desktop login and guest network configuration are **not yet unattended**.
+
+Once the OS installer finishes, call `vm` `{"action":"stop","id":"vm-..."}` to request ACPI power-off (up to 10 seconds). If it does not stop, a deliberate `{"action":"stop","id":"vm-...","force":true}` terminates the disposable QEMU process but gives **only crash-consistent disks**. While stopped, call `{"action":"eject_iso","id":"vm-..."}` and then `{"action":"start","id":"vm-..."}`. Retain the instance ID returned by `create`.
+
+### Guest control and desktop tools
+
+`vm_guest_status` calls a real QGA `guest-ping`; it does not infer readiness from a socket pathname. `vm_exec` on Linux-hosted QEMU takes `id`, an **absolute guest executable path** (such as `/usr/bin/true`), bounded `args` and optional `timeout_ms` (100–300000); `vm_upload` and `vm_download` take `id`, absolute `guest_path` and canonical `data_base64` for uploads. These are guest paths only; no host filesystem paths, host shell or arbitrary QMP commands are accepted. Upload/download are bounded to 1 MiB with 12 KiB guest-agent chunks. Uploaded data may be partial if a transfer fails. **QGA cannot cancel `guest-exec` on timeout**; the fork is marked failed/tainted until an explicit stop.
+
+`vm_desktop_screenshot` returns a bounded base64 PNG plus dimensions of the *guest* display, never the host screen. `vm_desktop_input` accepts `{"action":"keys","keys":["ctrl","a"],"id":"vm-..."}` or `{"action":"pointer","x":10000,"y":10000,"button":"left","id":"vm-..."}` (virtual tablet coordinates 0–32767; optional left/right/middle button). Guest screen resolution is still controlled by the guest OS or virtual GPU and does not have a dedicated runtime MCP setter. VNC, QMP and QGA sockets are private within the owned VM directory and must not be forwarded to public interfaces.
+
+### Offline snapshots and reusable environments
+
+`vm_snapshot` supports `create`, `list`, `restore`, `delete` on **stopped legacy-BIOS QEMU QCOW2 forks**. Names should identify environment configurations (`clean-os`, `wireguard-ready`, `tor-proxy-ready`), not individual test cases. `promote` additionally converts one stopped named snapshot into an immutable, SHA-256-hashed approved base, for example:
+
+```json
+{"action":"promote","id":"vm-...","name":"wireguard-ready","image":"ubuntu-wireguard"}
+```
+
+A worker can then request `subagent_spawn` with `vm_image="ubuntu-wireguard"`, causing a disposable QCOW2 fork of that approved image with cleanup on worker completion/cancellation (cleanup failure remains visible). The snapshot conversion is deliberately full/flattened once; subsequent forks share the immutable base incrementally. **UEFI VARS and TPM state are not captured by QCOW2 internal snapshots**: UEFI/TPM snapshot/restore/promote requests are rejected. A forced stop is crash-consistent, not a guest filesystem quiesce, so reboot and verify the filesystem/application state before promoting a meaningful environment.
+
+### Network policy and resource boundaries
+
+`vm(create)` accepts up to four virtual NICs: `nat` (QEMU user-mode outbound NAT), `none` (only as a single entry, no NIC), `listen:segment-name` and `connect:segment-name` (private Unix point-to-point Ethernet stream). A pair of owned VMs may share an isolated segment without editing host TAP devices, routing, DNS or firewall. These connections are **point-to-point, not a multi-VM switch or a routed/VPN gateway product**; creating VPN gateways, dynamic routing policies, leak-proof enforcement, per-interface packet capture and paid VPN credential injection remain future work. For VPN no-leak phases, provision a completely disconnected or isolated environment, and intentionally enable NAT only in a separate test environment. Never interpret QEMU NAT alone as a VPN kill switch.
+
+The owned store enforces at most 32 registered forks, four active forks, 16 active vCPUs and 32 GiB total configured active guest RAM; these are conservative software admission limits, **not** host cgroup or disk-growth quotas. The VM-home lock protects against concurrent independent NovaGPT processes. VM process handles remain process-local: an abrupt server restart may leave an unowned QEMU process, and NovaGPT refuses to kill it by guessing a PID. A stopped guest is safe to restart through MCP; orphan process adoption, automated cleanup of every interrupted launch, Windows QEMU swtpm state, full snapshot transactions, runtime guest resolution changes and complete Windows/Linux installer automation are **not yet implemented**.
+
+### Tests actually executed for this upgrade
+
+On the local Linux host, the new QEMU test suites exercised a blank disposable QCOW2/ISO pair, QEMU start/stop/destroy, offline snapshot round-trip and promotion, actual private QMP screenshot/keyboard/tablet input, guest-status denial without a QGA, ISO detach, exclusive VM-home lease, backing-file denial, quotas, and mock-Unix-socket QGA command/file transfer. An MCP stdio integration test called `vm`, `vm_image`, `vm_snapshot`, `vm_desktop_screenshot` and `vm_desktop_input` end to end against a new disposable blank fork and verified cleanup. A **real installed Linux guest with QGA was not booted**, and none of these tests demonstrates full Windows 11/Ubuntu/Arch/CachyOS installation, VPN leak detection, real Tor networking, paid VPN setup or server-crash recovery.
+
+```bash
+cargo test -p novagpt-vm --lib
+cargo test -p novagpt-cli --test protocol --test vm_mcp_live
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace
+cargo test --workspace
+```
 
 ### Windows ISO provisioning on Windows (experimental)
 
@@ -232,12 +296,12 @@ The Rust-native driver and ChatGPT Web adapter use a visible, genuinely editable
 
 ## Important technical gaps
 
-1. **Guest operations:** Windows Hyper-V forks have credential-scoped PowerShell Direct `vm_exec`, `vm_upload`, and `vm_download` (limited to 24 KiB transfers), but a live authenticated guest command and file-transfer test is still required. Linux/QEMU managed-fork guest execution and file transfer are not integrated into these MCP tools.
+1. **Guest operations:** Windows Hyper-V forks retain credential-scoped PowerShell Direct `vm_exec`, `vm_upload`, and `vm_download` (24 KiB transfers). On Unix, these MCP tools now use a bounded QEMU Guest Agent protocol with up to 1 MiB file transfers and 48 KiB output. QGA operations have passed socket-level mock tests; live installed Ubuntu/Arch/CachyOS and Windows QGA end-to-end tests remain **NOT RUN**. Guest-exec timeout cannot cancel the guest process; the VM is tainted until stopped.
 2. **Native VM interoperability:** image import intentionally does not claim other image manifest formats, boot-tested images, real Hyper-V/QEMU integration, recovery or secure boot. Windows disk creation and cleanup need smoke tests on isolated hardware.
 3. **ChatGPT Browser:** `novagpt-browser-driver` uses Rust, ChromeDriver and WebDriver rather than Node.js/Patchright. Four-tab isolation, input, screenshot, close, driver reconnect and Chrome crash/relaunch passed against disposable local HTML fixtures on Linux/Chrome 156; the ChatGPT adapter's local browsing path also passed; agent result association and cancellation were additionally checked by deterministic mocks. It has **not** been validated against a real ChatGPT account, authenticated profile persistence across separate server invocations, dynamic ChatGPT UI changes, project auto-creation, relogin, anti-bot gates, multi-tab races against live ChatGPT or actual response completion. Human verification remains manual. Chrome is launched with Blink's automation feature disabled so the page does not report `navigator.webdriver`; this is a launch switch, not a JavaScript identity patch, and it does not guarantee that a provider accepts the session.
 4. **Tool visibility:** optional tool names are present in `tools/list` even when a subsystem is disabled; invocation fails explicitly. Disabled-tool visibility needs its own policy and tests.
 5. **Subagent completeness:** no DeepSeek backend, scoped file-context snippets, isolated implementer worktree, automated approval/rollback or browser project auto-create. Explicit authenticated single-existing-file patch application is implemented; full multi-file transactions and a live ChatGPT Web patch-callback test remain pending. Subagent registry is bounded to 64 entries, six running/waiting agents; no persistence across NovaGPT process restarts.
-6. **Reliability:** browser profile ownership is checked but full symlink/reparse-point and process-handoff audits remain; VM image checksum is checked before create, but launch + metadata commit is not transactionally atomic. No real guest credentials should ever be passed to a tool until their secure ephemeral handling is implemented.
+6. **Reliability:** VM home has an exclusive OS file lease, and approved bases and ISOs are checksummed; the QEMU fork's process/metadata lifecycle and snapshot promotion are still not crash-atomic. External crash/restart recovery, in-guest atomic uploads and private VPN secret injection remain incomplete. Do not pass real paid VPN credentials to LLM prompts. Browser profile symlink/reparse and process-handoff audits remain pending.
 7. **Performance/limits:** browser polls every ~300 ms with a 180-second response bound, a maximum prompt/reply size and serialized tab creation. These are provisional defaults, not verified in every environment.
 
 ## Reproducible real-Chrome smoke test
