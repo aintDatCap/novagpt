@@ -689,6 +689,8 @@ impl AgentManager {
                     image: image.to_owned(),
                     cpus: None,
                     memory_mb: None,
+                    linux_options: None,
+                    installer_iso: None,
                 })
                 .await
                 .map_err(|_| AgentError::VmUnavailable)?;
@@ -736,7 +738,7 @@ impl AgentManager {
         let mut prompt = format!("{tool_instructions}\n\n{prompt}");
         if let Some(lease) = &vm_lease {
             prompt.push_str(&format!(
-                "\n\nISOLATED TEST GUEST: VM id={}, approved base={}. This guest is disposable, independent of the host workspace. The VM will be destroyed after completion, failure or cancellation. Never claim you ran tests inside it without a successful VM guest-tool receipt; Windows Hyper-V forks support vm_exec/vm_upload/vm_download with operation-scoped credentials supplied explicitly by the parent, never from the host workspace or prompt. If credentials are unavailable, report guest access unavailable rather than claiming tests ran. Do not expose host secrets or credentials to the guest.",
+                "\n\nISOLATED TEST GUEST: VM id={}, approved base={}. This guest is disposable, independent of the host workspace. The VM will be destroyed after completion, failure or cancellation. Never claim you ran tests inside it without a successful VM guest-tool receipt; On Linux-hosted managed QEMU forks, use vm_guest_status and vm_exec/vm_upload/vm_download through the QEMU Guest Agent only after the guest has installed and started qemu-guest-agent; guest control is unavailable otherwise. On Windows-hosted Hyper-V forks, these tools require operation-scoped guest credentials provided explicitly by the parent, never from the host workspace or prompt. Never invent guest readiness or credentials; report unavailable access. Do not expose host secrets or credentials to the guest.",
                 lease.id, lease.image
             ));
         }

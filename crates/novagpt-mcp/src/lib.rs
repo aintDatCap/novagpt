@@ -363,6 +363,9 @@ enum VmAction {
     Images,
     Create,
     Status,
+    Start,
+    Stop,
+    EjectIso,
     Destroy,
 }
 
@@ -377,6 +380,78 @@ struct VmArgs {
     cpus: Option<u8>,
     #[serde(default)]
     memory_mb: Option<u32>,
+    /// Approved ISO image name from vm_iso, not a host path.
+    #[serde(default)]
+    installer_iso: Option<String>,
+    /// Up to four NICs: nat, listen:SEGMENT or connect:SEGMENT. No host routing changes.
+    #[serde(default)]
+    networks: Option<Vec<String>>,
+    /// Enable private VNC Unix-socket display within the owned instance.
+    #[serde(default)]
+    display: Option<bool>,
+    /// Enable virtio QEMU Guest Agent channel (guest package installed separately).
+    #[serde(default)]
+    guest_agent: Option<bool>,
+    /// Destructive SIGKILL fallback. false requests ACPI poweroff and fails on timeout.
+    #[serde(default)]
+    force: Option<bool>,
+}
+
+fn vm_linux_options(args: &VmArgs) -> NovaResult<Option<novagpt_vm::linux_qemu::LinuxVmOptions>> {
+    if args.networks.is_none() && args.display.is_none() && args.guest_agent.is_none() {
+        return Ok(None);
+    }
+    novagpt_vm::linux_qemu::LinuxVmOptions::from_network_specs(
+        args.networks.as_deref(),
+        args.display.unwrap_or(false),
+        args.guest_agent.unwrap_or(true),
+    )
+    .map(Some)
+    .map_err(|_| NovaError::InvalidInput("Invalid VM network or display options".into()))
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum VmSnapshotAction {
+    Create,
+    List,
+    Restore,
+    Delete,
+    Promote,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct VmSnapshotArgs {
+    action: VmSnapshotAction,
+    id: String,
+    /// Name of the approved immutable base when promoting a snapshot.
+    #[serde(default)]
+    image: Option<String>,
+    /// Environment checkpoint name (not a test case).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum VmDesktopInputAction {
+    Keys,
+    Pointer,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct VmDesktopInputArgs {
+    id: String,
+    action: VmDesktopInputAction,
+    #[serde(default)]
+    keys: Option<Vec<String>>,
+    /// Absolute tablet coordinate 0..32767.
+    #[serde(default)]
+    x: Option<u16>,
+    #[serde(default)]
+    y: Option<u16>,
+    #[serde(default)]
+    button: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -397,28 +472,22 @@ struct VmGuestCredentialArgs {
     username: String,
     password: String,
 }
-#[cfg_attr(
-    not(windows),
-    expect(dead_code, reason = "Windows-only guest arguments")
-)]
 #[derive(Deserialize, schemars::JsonSchema)]
 struct VmGuestExecArgs {
     id: String,
-    credential: VmGuestCredentialArgs,
+    #[serde(default)]
+    credential: Option<VmGuestCredentialArgs>,
     program: String,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
-#[cfg_attr(
-    not(windows),
-    expect(dead_code, reason = "Windows-only guest arguments")
-)]
 #[derive(Deserialize, schemars::JsonSchema)]
 struct VmGuestFileArgs {
     id: String,
-    credential: VmGuestCredentialArgs,
+    #[serde(default)]
+    credential: Option<VmGuestCredentialArgs>,
     guest_path: String,
     #[serde(default)]
     data_base64: Option<String>,
@@ -1486,12 +1555,16 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Manage explicitly imported disposable NovaGPT VM images/instances: images, create, status or destroy. Disabled unless --vm-home is provided."
+        description = "Manage owned disposable VM forks: images/create/status/start/stop/eject_iso/destroy. Stop is graceful by default; force=true explicitly kills the disposable guest. Create accepts an optional human-approved installer_iso name, networks=[nat,none,listen:SEGMENT,connect:SEGMENT], up to four NICs; optional private display and guest_agent. Linux QEMU networking never modifies host interfaces. --vm-home required."
     )]
     async fn vm(&self, Parameters(args): Parameters<VmArgs>) -> CallToolResult {
         let response = async {
             let Some(vm) = self.extras.vm.clone() else {
                 return external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled));
+            };
+            let linux_options = match vm_linux_options(&args) {
+                Ok(value) => value,
+                Err(error) => return tool_reply::<()>(Err(error)),
             };
             match args.action {
                 VmAction::Images => external_reply(vm.images()),
@@ -1501,6 +1574,8 @@ impl NovaMcp {
                             image,
                             cpus: args.cpus,
                             memory_mb: args.memory_mb,
+                            linux_options,
+                            installer_iso: args.installer_iso,
                         })
                         .await,
                     ),
@@ -1512,6 +1587,34 @@ impl NovaMcp {
                     Some(id) => external_reply(vm.status(&id).await),
                     None => tool_reply::<()>(Err(NovaError::InvalidInput(
                         "id is required for status".into(),
+                    ))),
+                },
+                VmAction::Start => match args.id {
+                    Some(id) => external_reply(vm.start(&id).await),
+                    None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "id is required for start".into(),
+                    ))),
+                },
+                VmAction::Stop => match args.id {
+                    Some(id) => {
+                        #[cfg(unix)]
+                        let result = if args.force.unwrap_or(false) {
+                            vm.stop(&id).await
+                        } else {
+                            vm.graceful_stop(&id).await
+                        };
+                        #[cfg(not(unix))]
+                        let result = vm.stop(&id).await;
+                        external_reply(result)
+                    }
+                    None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "id is required for stop".into(),
+                    ))),
+                },
+                VmAction::EjectIso => match args.id {
+                    Some(id) => external_reply(vm.eject_iso(&id).await),
+                    None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "id is required for eject_iso".into(),
                     ))),
                 },
                 VmAction::Destroy => match args.id {
@@ -1527,30 +1630,144 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Check VM guest control availability without reading operation-scoped credentials"
+        description = "List approved ISO installation media by name. Import ISO is CLI-only; MCP never accepts an arbitrary host ISO path."
     )]
-    fn vm_guest_status(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+    fn vm_iso(&self) -> CallToolResult {
         self.observed(
-            "vm_guest_status",
+            "vm_iso",
             match &self.extras.vm {
-                Some(vm) => external_reply(vm.guest_status(&args.id)),
+                Some(vm) => external_reply(vm.isos()),
                 None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
             },
         )
     }
 
     #[tool(
-        description = "Execute a bounded Windows executable inside a NovaGPT-owned Windows Hyper-V fork using operation-scoped PowerShell Direct credentials. No network or host shell paths."
+        description = "List human-approved immutable NovaGPT VM base images. Import/promote remains local CLI-only; MCP never accepts host image paths."
+    )]
+    fn vm_image(&self) -> CallToolResult {
+        self.observed(
+            "vm_image",
+            match &self.extras.vm {
+                Some(vm) => external_reply(vm.images()),
+                None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            },
+        )
+    }
+
+    #[tool(
+        description = "Offline environment snapshot of an owned stopped QEMU QCOW2 fork: create/list/restore/delete/promote. Promote creates an immutable shared base image for subagent_spawn(vm_image). Snapshot names identify reusable test environments. UEFI/TPM snapshots are rejected until matching device state is supported."
+    )]
+    async fn vm_snapshot(&self, Parameters(args): Parameters<VmSnapshotArgs>) -> CallToolResult {
+        let response = match &self.extras.vm {
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            Some(vm) => {
+                let name = args.name.as_deref().unwrap_or("");
+                match args.action {
+                    VmSnapshotAction::Create => {
+                        external_reply(vm.snapshot_create(&args.id, name).await)
+                    }
+                    VmSnapshotAction::List => external_reply(vm.snapshot_list(&args.id).await),
+                    VmSnapshotAction::Restore => {
+                        external_reply(vm.snapshot_restore(&args.id, name).await)
+                    }
+                    VmSnapshotAction::Delete => {
+                        external_reply(vm.snapshot_delete(&args.id, name).await)
+                    }
+                    VmSnapshotAction::Promote => match args.image.as_deref() {
+                        Some(image) => {
+                            external_reply(vm.snapshot_promote(&args.id, name, image).await)
+                        }
+                        None => tool_reply::<()>(Err(NovaError::InvalidInput(
+                            "image is required for snapshot promotion".into(),
+                        ))),
+                    },
+                }
+            }
+        };
+        self.observed("vm_snapshot", response)
+    }
+
+    #[tool(
+        description = "Capture PNG screenshot of the owned running QEMU guest virtual display via private QMP socket. Returns width, height and base64 PNG; cannot see host desktop."
+    )]
+    async fn vm_desktop_screenshot(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+        #[cfg(unix)]
+        let result = match &self.extras.vm {
+            Some(vm) => external_reply(vm.desktop_screenshot(&args.id).await),
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+        };
+        #[cfg(not(unix))]
+        let result = {
+            let _ = args;
+            external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
+                "QMP desktop screenshot requires Unix QEMU",
+            )))
+        };
+        self.observed("vm_desktop_screenshot", result)
+    }
+
+    #[tool(
+        description = "Send bounded keyboard QCodes or absolute tablet pointer events to an owned running QEMU guest via private QMP. Keys: keys=[ctrl,a]; pointer: x,y in 0..32767 and optional left/right/middle button. Does not control the host desktop."
+    )]
+    async fn vm_desktop_input(
+        &self,
+        Parameters(args): Parameters<VmDesktopInputArgs>,
+    ) -> CallToolResult {
+        #[cfg(unix)]
+        let result = match &self.extras.vm {
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            Some(vm) => match args.action {
+                VmDesktopInputAction::Keys => external_reply(
+                    vm.desktop_keys(&args.id, &args.keys.unwrap_or_default())
+                        .await,
+                ),
+                VmDesktopInputAction::Pointer => match (args.x, args.y) {
+                    (Some(x), Some(y)) => external_reply(
+                        vm.desktop_pointer(&args.id, x, y, args.button.as_deref())
+                            .await,
+                    ),
+                    _ => tool_reply::<()>(Err(NovaError::InvalidInput(
+                        "x and y are required for pointer".into(),
+                    ))),
+                },
+            },
+        };
+        #[cfg(not(unix))]
+        let result = {
+            let _ = args;
+            external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
+                "QMP desktop input requires Unix QEMU",
+            )))
+        };
+        self.observed("vm_desktop_input", result)
+    }
+
+    #[tool(
+        description = "Check VM guest control availability without reading operation-scoped credentials"
+    )]
+    async fn vm_guest_status(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
+        self.observed(
+            "vm_guest_status",
+            match &self.extras.vm {
+                Some(vm) => external_reply(vm.guest_status_live(&args.id).await),
+                None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            },
+        )
+    }
+
+    #[tool(
+        description = "Execute a bounded program INSIDE an owned QEMU Linux/Windows guest through QEMU Guest Agent (absolute program path, args, timeout_ms); or Hyper-V Windows through PowerShell Direct with an optional operation-scoped credential required there. No host shell execution. QGA timeout may leave guest process running; VM is marked failed until stopped."
     )]
     async fn vm_exec(&self, Parameters(args): Parameters<VmGuestExecArgs>) -> CallToolResult {
         #[cfg(windows)]
-        let response = match &self.extras.vm {
-            Some(vm) => external_reply(
+        let response = match (&self.extras.vm, args.credential) {
+            (Some(vm), Some(credential)) => external_reply(
                 vm.exec_windows_fork(
                     &args.id,
                     &novagpt_vm::windows_direct::GuestCredential {
-                        username: args.credential.username,
-                        password: args.credential.password,
+                        username: credential.username,
+                        password: credential.password,
                     },
                     &args.program,
                     &args.args,
@@ -1558,75 +1775,123 @@ impl NovaMcp {
                 )
                 .await,
             ),
-            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            (None, _) => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            (_, None) => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Hyper-V requires credential".into(),
+            ))),
         };
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        let response = match &self.extras.vm {
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            Some(vm) if args.credential.is_none() => external_reply(
+                vm.exec_qemu_fork(
+                    &args.id,
+                    &args.program,
+                    &args.args,
+                    args.timeout_ms.unwrap_or(30_000),
+                )
+                .await,
+            ),
+            Some(_) => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "QEMU guest agent does not accept a Windows credential".into(),
+            ))),
+        };
+        #[cfg(not(any(windows, unix)))]
         let response = {
             let _ = args;
             external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
-                "Windows Hyper-V only",
+                "Guest execution unavailable",
             )))
         };
         self.observed("vm_exec", response)
     }
 
     #[tool(
-        description = "Upload at most 24 KiB of canonical base64 into an owned Windows Hyper-V fork through PowerShell Direct. Never reads a host path. Credentials are operation-scoped."
+        description = "Upload canonical base64 into an owned guest path (never a host path). QEMU Guest Agent on Unix supports 1 MiB transfers in bounded chunks; Windows Hyper-V PowerShell Direct supports 24 KiB with operation-scoped credential."
     )]
     async fn vm_upload(&self, Parameters(args): Parameters<VmGuestFileArgs>) -> CallToolResult {
         #[cfg(windows)]
-        let response = match (&self.extras.vm, args.data_base64) {
-            (Some(vm), Some(data)) => external_reply(
+        let response = match (&self.extras.vm, args.data_base64, args.credential) {
+            (Some(vm), Some(data), Some(credential)) => external_reply(
                 vm.upload_windows_fork(
                     &args.id,
                     &novagpt_vm::windows_direct::GuestCredential {
-                        username: args.credential.username,
-                        password: args.credential.password,
+                        username: credential.username,
+                        password: credential.password,
                     },
                     &args.guest_path,
                     &data,
                 )
                 .await,
             ),
+            (None, _, _) => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            (_, None, _) => {
+                tool_reply::<()>(Err(NovaError::InvalidInput("data_base64 required".into())))
+            }
+            (_, _, None) => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Hyper-V requires credential".into(),
+            ))),
+        };
+        #[cfg(unix)]
+        let response = match (&self.extras.vm, args.data_base64) {
             (None, _) => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
             (_, None) => {
                 tool_reply::<()>(Err(NovaError::InvalidInput("data_base64 required".into())))
             }
+            (Some(vm), Some(data)) if args.credential.is_none() => {
+                external_reply(vm.upload_qemu_fork(&args.id, &args.guest_path, &data).await)
+            }
+            (Some(_), Some(_)) => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "QEMU guest agent does not accept a Windows credential".into(),
+            ))),
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, unix)))]
         let response = {
             let _ = args;
             external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
-                "Windows Hyper-V only",
+                "Guest file transfer unavailable",
             )))
         };
         self.observed("vm_upload", response)
     }
 
     #[tool(
-        description = "Download at most 24 KiB as base64 from an owned Windows Hyper-V fork through PowerShell Direct. Never writes a host path. Credentials are operation-scoped."
+        description = "Download bounded base64 from an owned guest path without creating host files. QEMU Guest Agent Unix supports 1 MiB; Hyper-V PowerShell Direct supports 24 KiB with operation-scoped Windows credentials."
     )]
     async fn vm_download(&self, Parameters(args): Parameters<VmGuestFileArgs>) -> CallToolResult {
         #[cfg(windows)]
-        let response = match &self.extras.vm {
-            Some(vm) => external_reply(
+        let response = match (&self.extras.vm, args.credential) {
+            (Some(vm), Some(credential)) => external_reply(
                 vm.download_windows_fork(
                     &args.id,
                     &novagpt_vm::windows_direct::GuestCredential {
-                        username: args.credential.username,
-                        password: args.credential.password,
+                        username: credential.username,
+                        password: credential.password,
                     },
                     &args.guest_path,
                 )
                 .await,
             ),
-            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            (None, _) => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            (_, None) => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "Hyper-V requires credential".into(),
+            ))),
         };
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        let response = match &self.extras.vm {
+            None => external_reply::<(), _>(Err(novagpt_vm::VmError::Disabled)),
+            Some(vm) if args.credential.is_none() => {
+                external_reply(vm.download_qemu_fork(&args.id, &args.guest_path).await)
+            }
+            Some(_) => tool_reply::<()>(Err(NovaError::InvalidInput(
+                "QEMU guest agent does not accept a Windows credential".into(),
+            ))),
+        };
+        #[cfg(not(any(windows, unix)))]
         let response = {
             let _ = args;
             external_reply::<(), _>(Err(novagpt_vm::VmError::Unsupported(
-                "Windows Hyper-V only",
+                "Guest file transfer unavailable",
             )))
         };
         self.observed("vm_download", response)

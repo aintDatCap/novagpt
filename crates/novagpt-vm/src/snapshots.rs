@@ -97,6 +97,86 @@ impl VmManager {
         ))
     }
 
+    /// Flatten an immutable reusable approved base from one offline QCOW2
+    /// environment snapshot. Subagents can then fork the base by image name,
+    /// sharing read-only storage without one snapshot per individual test.
+    pub async fn snapshot_promote(
+        &self,
+        id: &str,
+        snapshot: &str,
+        image_name: &str,
+    ) -> VmResult<crate::VmImage> {
+        if !valid_name(snapshot, SNAPSHOT_NAME_MAX) {
+            return Err(VmError::InvalidName);
+        }
+        crate::validate_image_name(image_name)?;
+        let _guard = self.inner.commands.lock().await;
+        let instance = self.load_instance(id)?;
+        let disk = self.snapshot_disk(id).await?;
+        if !self
+            .snapshots_for_disk(&disk)
+            .await?
+            .iter()
+            .any(|item| item == snapshot)
+        {
+            return Err(VmError::NotFound);
+        }
+        let images = self.root().join("images");
+        if fs::canonicalize(&images)? != images {
+            return Err(VmError::NotOwned);
+        }
+        let dir = images.join(image_name);
+        fs::create_dir(&dir)?;
+        let dest = dir.join("base.qcow2");
+        let result = async {
+            let args = vec![
+                "convert".into(),
+                "-f".into(),
+                "qcow2".into(),
+                "-l".into(),
+                snapshot.to_owned(),
+                "-O".into(),
+                "qcow2".into(),
+                disk.display().to_string(),
+                dest.display().to_string(),
+            ];
+            let answer = run_command("qemu-img", &args, Duration::from_secs(900)).await?;
+            if !answer.status.success() {
+                return Err(VmError::CommandFailed);
+            }
+            crate::validate_qcow2_base(&dest)?;
+            let metadata = dest.symlink_metadata()?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(VmError::NotOwned);
+            }
+            let hash_path = dest.clone();
+            let hash = tokio::task::spawn_blocking(move || crate::sha256_file(&hash_path))
+                .await
+                .map_err(|_| VmError::InvalidData)??;
+            let image = crate::VmImage {
+                name: image_name.to_owned(),
+                backend: VmBackend::Qemu,
+                sha256: hash,
+                bytes: metadata.len(),
+                default_cpus: instance.cpus,
+                default_memory_mb: instance.memory_mb,
+                human_approved: true,
+                boot_profile: VmBootProfile::Legacy,
+            };
+            let mut perms = metadata.permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&dest, perms)?;
+            crate::write_json_new(&dir.join("manifest.json"), &image)?;
+            Ok(image)
+        }
+        .await;
+        if result.is_err() && !dir.join("manifest.json").exists() {
+            let _ = fs::remove_file(dest);
+            let _ = fs::remove_dir(dir);
+        }
+        result
+    }
+
     async fn snapshot_disk(&self, id: &str) -> VmResult<std::path::PathBuf> {
         let instance = self.load_instance(id)?;
         if instance.backend != VmBackend::Qemu {
@@ -221,6 +301,8 @@ mod tests {
                 image: "blank".into(),
                 cpus: None,
                 memory_mb: None,
+                linux_options: None,
+                installer_iso: None,
             })
             .await
             .expect("start disposable QEMU");
@@ -232,6 +314,9 @@ mod tests {
             let listed = manager.snapshot_list(&id).await?;
             assert_eq!(listed.snapshots.len(), 2);
             manager.snapshot_restore(&id, "clean").await?;
+            let promoted = manager.snapshot_promote(&id, "clean", "clean-env").await?;
+            assert_eq!(promoted.name, "clean-env");
+            assert_eq!(manager.images()?.image_count, 2);
             manager.snapshot_delete(&id, "with-vpn").await?;
             assert_eq!(manager.snapshot_list(&id).await?.snapshots.len(), 1);
             manager.start(&id).await?;

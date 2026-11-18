@@ -14,6 +14,8 @@ uuid.workspace = true
 sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
+toml = "0.8.23"
+fs2 = "0.4.3"
 
 [dev-dependencies]
 tempfile = "3"

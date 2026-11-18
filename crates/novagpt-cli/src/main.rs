@@ -178,6 +178,27 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         memory_mb: u32,
     },
+    /// Copy a human-approved local ISO into NovaGPT's isolated boot media registry.
+    VmImportIso {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        source: PathBuf,
+    },
+    /// Generate a fresh, human-approved sparse qcow2 blank installation base.
+    VmInitBase {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 80)]
+        disk_gib: u32,
+        #[arg(long, default_value_t = 4)]
+        cpus: u8,
+        #[arg(long, default_value_t = 8192)]
+        memory_mb: u32,
+        /// Use legacy BIOS instead of default Linux UEFI.
+        #[arg(long)]
+        legacy: bool,
+    },
     /// Flatten a powered-off ISO installer into a separate reusable approved base.
     VmPromoteIso {
         #[arg(long)]
@@ -193,6 +214,48 @@ enum Command {
         cpus: Option<u8>,
         #[arg(long)]
         memory_mb: Option<u32>,
+        /// QEMU NIC: nat, none, listen:SEGMENT or connect:SEGMENT (repeatable).
+        #[arg(long = "network")]
+        networks: Vec<String>,
+        /// Enable private guest VNC display socket.
+        #[arg(long)]
+        display: bool,
+        /// Disable virtio guest-agent channel for this fork.
+        #[arg(long)]
+        no_guest_agent: bool,
+        /// Optional human-approved ISO name to boot in the disposable fork.
+        #[arg(long)]
+        installer_iso: Option<String>,
+    },
+    /// Start a previously stopped disposable fork.
+    VmForkStart {
+        #[arg(long)]
+        id: String,
+    },
+    /// Stop only a disposable fork owned by the active server process.
+    VmForkStop {
+        #[arg(long)]
+        id: String,
+        /// Explicitly terminate a guest that does not power off through ACPI.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Detach installer ISO after installing an OS; the fork must be stopped.
+    VmForkEjectIso {
+        #[arg(long)]
+        id: String,
+    },
+    /// Create/list/restore/delete/promote offline test-environment snapshots.
+    VmForkSnapshot {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// New immutable approved base image when action=promote.
+        #[arg(long)]
+        image: Option<String>,
     },
     /// Read the status of an owned disposable fork.
     VmForkStatus {
@@ -887,6 +950,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 novagpt_mcp::run_http_with(workspaces, address, token, extras).await?;
             }
         }
+        Some(Command::VmImportIso { name, source }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let approved = vm.import_iso(&name, &source)?;
+            println!("{}", serde_json::to_string_pretty(&approved)?);
+        }
+        Some(Command::VmInitBase {
+            name,
+            disk_gib,
+            cpus,
+            memory_mb,
+            legacy,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let approved = vm
+                .create_blank_image(
+                    &name,
+                    disk_gib,
+                    cpus,
+                    memory_mb,
+                    if legacy {
+                        novagpt_vm::VmBootProfile::Legacy
+                    } else {
+                        novagpt_vm::VmBootProfile::LinuxUefi
+                    },
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&approved)?);
+        }
         Some(Command::VmPromoteIso { installer, image }) => {
             let vm = extras
                 .vm
@@ -903,6 +998,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             image,
             cpus,
             memory_mb,
+            networks,
+            display,
+            no_guest_agent,
+            installer_iso,
         }) => {
             let vm = extras
                 .vm
@@ -912,9 +1011,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     image,
                     cpus,
                     memory_mb,
+                    linux_options: if networks.is_empty() && !display && !no_guest_agent {
+                        None
+                    } else {
+                        Some(novagpt_vm::linux_qemu::LinuxVmOptions::from_network_specs(
+                            if networks.is_empty() {
+                                None
+                            } else {
+                                Some(&networks)
+                            },
+                            display,
+                            !no_guest_agent,
+                        )?)
+                    },
+                    installer_iso,
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&fork)?);
+        }
+        Some(Command::VmForkStart { id }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            println!("{}", serde_json::to_string_pretty(&vm.start(&id).await?)?);
+        }
+        Some(Command::VmForkStop { id, force }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            #[cfg(unix)]
+            let result = if force {
+                vm.stop(&id).await?
+            } else {
+                vm.graceful_stop(&id).await?
+            };
+            #[cfg(not(unix))]
+            let result = {
+                let _ = force;
+                vm.stop(&id).await?
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Some(Command::VmForkEjectIso { id }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&vm.eject_iso(&id).await?)?
+            );
+        }
+        Some(Command::VmForkSnapshot {
+            id,
+            action,
+            name,
+            image,
+        }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            let name = name.as_deref().unwrap_or("");
+            let result = match action.as_str() {
+                "create" => vm.snapshot_create(&id, name).await?,
+                "list" => vm.snapshot_list(&id).await?,
+                "restore" => vm.snapshot_restore(&id, name).await?,
+                "delete" => vm.snapshot_delete(&id, name).await?,
+                "promote" => {
+                    let image = image
+                        .as_deref()
+                        .ok_or("image is required for snapshot promotion")?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &vm.snapshot_promote(&id, name, image).await?
+                        )?
+                    );
+                    return Ok(());
+                }
+                _ => {
+                    return Err(
+                        "snapshot action must be create, list, restore, delete or promote".into(),
+                    );
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Some(Command::VmForkStatus { id }) => {
             let vm = extras

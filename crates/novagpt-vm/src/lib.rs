@@ -1,5 +1,11 @@
 //! Opt-in disposable VM management. Never touches other application VM state.
 pub mod image_promotion;
+pub mod iso;
+pub mod linux_qemu;
+#[cfg(unix)]
+pub mod qga;
+#[cfg(unix)]
+pub mod qmp;
 pub mod snapshots;
 #[cfg(windows)]
 pub mod windows_direct;
@@ -7,6 +13,7 @@ pub mod windows_guest;
 #[cfg(windows)]
 pub mod windows_hyperv;
 pub mod windows_unattend;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -26,6 +33,10 @@ use tokio::{
 use uuid::Uuid;
 
 const IMAGE_NAME_MAX: usize = 80;
+const MAX_REGISTERED_FORKS: usize = 32;
+const MAX_ACTIVE_FORKS: usize = 4;
+const MAX_ACTIVE_CPUS: u32 = 16;
+const MAX_ACTIVE_MEMORY_MB: u64 = 32 * 1024;
 const MAX_COMMAND_OUTPUT: usize = 48 * 1024;
 const MAX_EXEC_MS: u64 = 300_000;
 const MAX_TRANSFER_BYTES: usize = 1024 * 1024;
@@ -112,6 +123,9 @@ pub struct VmInstance {
     pub state: VmState,
     pub cpus: u8,
     pub memory_mb: u32,
+    /// Approved ISO registry name for an install fork, never a host path.
+    #[serde(default)]
+    pub installer_iso: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,10 +173,14 @@ pub struct VmCreate {
     pub image: String,
     pub cpus: Option<u8>,
     pub memory_mb: Option<u32>,
+    pub linux_options: Option<linux_qemu::LinuxVmOptions>,
+    pub installer_iso: Option<String>,
 }
 
 struct VmInner {
     root: PathBuf,
+    // OS-managed exclusive lock: another NovaGPT process cannot mutate this home.
+    _home_lease: fs::File,
     backend: VmBackend,
     commands: Mutex<()>,
     children: Mutex<HashMap<String, Child>>,
@@ -203,11 +221,50 @@ impl VmManager {
             file.write_all(b"NovaGPT isolated VM storage v1\n")?;
             file.sync_all()?;
         }
-        fs::create_dir_all(root.join("images"))?;
-        fs::create_dir_all(root.join("instances"))?;
+        for subdir in ["images", "instances", "networks", "isos", "staging"] {
+            let path = root.join(subdir);
+            if path
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(VmError::NotOwned);
+            }
+            fs::create_dir_all(&path)?;
+            if fs::canonicalize(&path)? != path {
+                return Err(VmError::NotOwned);
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for subdir in ["", "instances", "networks"] {
+                fs::set_permissions(root.join(subdir), fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let lease_path = root.join("novagpt-vm-lease");
+        if lease_path
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(VmError::NotOwned);
+        }
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lease_path)?;
+        lease.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                VmError::Busy
+            } else {
+                VmError::Io(error)
+            }
+        })?;
         Ok(Self {
             inner: Arc::new(VmInner {
                 root,
+                _home_lease: lease,
                 backend: VmBackend::host(),
                 commands: Mutex::new(()),
                 children: Mutex::new(HashMap::new()),
@@ -266,13 +323,32 @@ impl VmManager {
         cpus: u8,
         memory_mb: u32,
     ) -> VmResult<VmImage> {
+        self.import_image_with_profile(name, source, cpus, memory_mb, VmBootProfile::Legacy)
+    }
+
+    pub fn import_image_with_profile(
+        &self,
+        name: &str,
+        source: &Path,
+        cpus: u8,
+        memory_mb: u32,
+        boot_profile: VmBootProfile,
+    ) -> VmResult<VmImage> {
         validate_image_name(name)?;
+        if self.backend() == VmBackend::Qemu && boot_profile == VmBootProfile::WindowsUefi {
+            return Err(VmError::Unsupported(
+                "Windows UEFI forks require owned swtpm state",
+            ));
+        }
         resources(cpus, memory_mb)?;
         let source = fs::canonicalize(source)?;
         if !source.is_file()
             || source.extension().and_then(|s| s.to_str()) != Some(self.inner.backend.disk_ext())
         {
             return Err(VmError::InvalidData);
+        }
+        if self.inner.backend == VmBackend::Qemu {
+            validate_qcow2_base(&source)?;
         }
         let dir = self.inner.root.join("images").join(name);
         fs::create_dir(&dir)?; // never replace an approved image silently
@@ -298,6 +374,12 @@ impl VmManager {
         if bytes == 0 {
             return Err(VmError::InvalidData);
         }
+        if self.inner.backend == VmBackend::Qemu {
+            validate_qcow2_base(&target)?;
+            let mut permissions = fs::metadata(&target)?.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&target, permissions)?;
+        }
         let image = VmImage {
             name: name.to_owned(),
             backend: self.inner.backend,
@@ -306,7 +388,7 @@ impl VmManager {
             default_cpus: cpus,
             default_memory_mb: memory_mb,
             human_approved: true,
-            boot_profile: VmBootProfile::Legacy,
+            boot_profile,
         };
         write_json_new(&dir.join("manifest.json"), &image)?;
         Ok(image)
@@ -324,9 +406,17 @@ impl VmManager {
         let cpus = req.cpus.unwrap_or(image.default_cpus);
         let memory = req.memory_mb.unwrap_or(image.default_memory_mb);
         resources(cpus, memory)?;
-        if image.backend == VmBackend::Qemu && image.boot_profile != VmBootProfile::Legacy {
+        self.check_capacity(cpus, memory, true)?;
+        if req.installer_iso.is_some() && image.backend != VmBackend::Qemu {
+            return Err(VmError::Unsupported("QEMU approved ISO boot only"));
+        }
+        if let Some(name) = &req.installer_iso {
+            // Verify immutable approved installation media before reserving a fork.
+            self.verified_iso(name).await?;
+        }
+        if image.backend == VmBackend::Qemu && image.boot_profile == VmBootProfile::WindowsUefi {
             return Err(VmError::Unsupported(
-                "UEFI/TPM fork support for promoted Linux-hosted installer disks is not yet available",
+                "Windows UEFI forks require owned swtpm lifecycle",
             ));
         }
         let id = format!("vm-{}", &Uuid::new_v4().simple().to_string()[..16]);
@@ -349,9 +439,20 @@ impl VmManager {
         if digest != expected {
             return Err(VmError::InvalidData);
         }
+        if image.backend == VmBackend::Qemu {
+            let to_validate = source.clone();
+            tokio::task::spawn_blocking(move || validate_qcow2_base(&to_validate))
+                .await
+                .map_err(|_| VmError::InvalidData)??;
+        }
         // An interrupted or rejected hash check must not leave an empty
         // instance directory that later looks like an incomplete VM.
         fs::create_dir(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        }
         let overlay = dir.join(format!("disk.{}", image.backend.disk_ext()));
         let instance = VmInstance {
             id: id.clone(),
@@ -360,8 +461,27 @@ impl VmManager {
             state: VmState::Starting,
             cpus,
             memory_mb: memory,
+            installer_iso: req.installer_iso,
         };
-        write_json_new(&dir.join("instance.json"), &instance)?;
+        let setup = (|| -> VmResult<()> {
+            write_json_new(&dir.join("instance.json"), &instance)?;
+            if image.backend == VmBackend::Qemu {
+                let options = req.linux_options.unwrap_or_default();
+                let config = toml::to_string(&options).map_err(|_| VmError::InvalidData)?;
+                write_bytes_new(&dir.join("vm.toml"), config.as_bytes())?;
+                linux_qemu::prepare_firmware(&dir, image.boot_profile)?;
+            } else if req.linux_options.is_some() {
+                return Err(VmError::Unsupported(
+                    "QEMU Linux network settings are not available on Hyper-V",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            // There is no VM process yet; delete only known instance-owned files.
+            self.remove_owned_instance(&id, image.backend)?;
+            return Err(error);
+        }
         let result = if image.backend == VmBackend::Hyperv {
             start_hyperv(&id, &source, &overlay, cpus, memory, image.boot_profile).await
         } else {
@@ -407,16 +527,67 @@ impl VmManager {
             let mut children = self.inner.children.lock().await;
             instance.state = match children.get_mut(id) {
                 Some(child) => match child.try_wait()? {
+                    None if instance.state == VmState::Failed => VmState::Failed,
                     None => VmState::Running,
                     Some(_) => VmState::Stopped,
                 },
-                None => VmState::Stopped,
+                None if matches!(instance.state, VmState::Running | VmState::Starting) => {
+                    VmState::Failed
+                }
+                None => instance.state,
             };
         }
         Ok(VmStatus {
             action: "status",
             instance,
         })
+    }
+
+    /// Ask the guest to power off through private QMP ACPI. Never force-kills
+    /// on timeout; callers must explicitly request the destructive stop path.
+    #[cfg(unix)]
+    pub async fn graceful_stop(&self, id: &str) -> VmResult<VmStatus> {
+        let _serial = self.inner.commands.lock().await;
+        let instance = self.load_instance(id)?;
+        if instance.backend != VmBackend::Qemu || instance.state != VmState::Running {
+            return Err(VmError::Unsupported(
+                "Graceful stop requires a running QEMU guest",
+            ));
+        }
+        let socket = self.owned_qemu_socket(id, "qmp.sock").await?;
+        qmp::request_powerdown(&socket).await?;
+        let began = std::time::Instant::now();
+        loop {
+            let exited = {
+                let mut children = self.inner.children.lock().await;
+                let Some(child) = children.get_mut(id) else {
+                    return Err(VmError::NotOwned);
+                };
+                match child.try_wait()? {
+                    Some(_) => {
+                        children.remove(id);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if exited {
+                self.cleanup_network_listener(id)?;
+                let stopped = VmInstance {
+                    state: VmState::Stopped,
+                    ..instance
+                };
+                save_instance(&self.instance_dir(id), &stopped)?;
+                return Ok(VmStatus {
+                    action: "stop",
+                    instance: stopped,
+                });
+            }
+            if began.elapsed() >= Duration::from_secs(10) {
+                return Err(VmError::Timeout);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Stop a QEMU guest owned by the current NovaGPT process. A stale
@@ -430,7 +601,10 @@ impl VmManager {
         let mut children = self.inner.children.lock().await;
         if let Some(mut child) = children.remove(id) {
             if child.try_wait()?.is_none() {
-                child.start_kill()?;
+                if let Err(error) = child.start_kill() {
+                    children.insert(id.to_owned(), child);
+                    return Err(VmError::Io(error));
+                }
                 match timeout(Duration::from_secs(15), child.wait()).await {
                     Ok(Ok(_)) => {}
                     _ => {
@@ -443,6 +617,7 @@ impl VmManager {
             return Err(VmError::NotOwned);
         }
         drop(children);
+        self.cleanup_network_listener(id)?;
         let stopped = VmInstance {
             state: VmState::Stopped,
             ..instance
@@ -464,6 +639,7 @@ impl VmManager {
         if instance.state != VmState::Stopped || self.inner.children.lock().await.contains_key(id) {
             return Err(VmError::Busy);
         }
+        self.check_capacity(instance.cpus, instance.memory_mb, false)?;
         let dir = self.instance_dir(id);
         if fs::canonicalize(&dir)? != dir {
             return Err(VmError::NotOwned);
@@ -483,6 +659,28 @@ impl VmManager {
         Ok(VmStatus {
             action: "start",
             instance: running,
+        })
+    }
+
+    /// Detach approved ISO media only while the owned fork is stopped.
+    /// The next start boots from the installed writable disk.
+    pub async fn eject_iso(&self, id: &str) -> VmResult<VmStatus> {
+        let _serial = self.inner.commands.lock().await;
+        let mut instance = self.load_instance(id)?;
+        if instance.backend != VmBackend::Qemu {
+            return Err(VmError::Unsupported("QEMU ISO eject only"));
+        }
+        if instance.state != VmState::Stopped || self.inner.children.lock().await.contains_key(id) {
+            return Err(VmError::Busy);
+        }
+        if instance.installer_iso.is_none() {
+            return Err(VmError::NotFound);
+        }
+        instance.installer_iso = None;
+        save_instance(&self.instance_dir(id), &instance)?;
+        Ok(VmStatus {
+            action: "eject_iso",
+            instance,
         })
     }
 
@@ -519,16 +717,37 @@ impl VmManager {
         } else {
             let mut children = self.inner.children.lock().await;
             if let Some(mut child) = children.remove(id) {
-                let _ = child.start_kill();
-                let _ = timeout(Duration::from_secs(10), child.wait()).await;
-            } else if instance.state == VmState::Running || instance.state == VmState::Starting {
+                if child.try_wait()?.is_none() {
+                    if let Err(error) = child.start_kill() {
+                        children.insert(id.to_owned(), child);
+                        return Err(VmError::Io(error));
+                    }
+                    match timeout(Duration::from_secs(10), child.wait()).await {
+                        Ok(Ok(_)) => {}
+                        _ => {
+                            children.insert(id.to_owned(), child);
+                            return Err(VmError::Timeout);
+                        }
+                    }
+                }
+            } else if matches!(instance.state, VmState::Running | VmState::Starting) {
                 return Err(VmError::NotOwned);
+            } else if instance.state == VmState::Failed {
+                // A failed launch may have left a live QEMU process before its
+                // handle was recorded. Never delete the disk if a monitor socket exists.
+                let monitor = self.instance_dir(id).join("qmp.sock");
+                if monitor.symlink_metadata().is_ok() {
+                    return Err(VmError::NotOwned);
+                }
             }
         }
         let stopped = VmInstance {
             state: VmState::Stopped,
             ..instance
         };
+        if stopped.backend == VmBackend::Qemu {
+            self.cleanup_network_listener(id)?;
+        }
         // Delete only the exact managed instance files, never an arbitrary
         // directory tree or a disk/image supplied by the caller.
         self.remove_owned_instance(id, stopped.backend)?;
@@ -536,6 +755,154 @@ impl VmManager {
             action: "destroy",
             instance: stopped,
         })
+    }
+
+    #[cfg(unix)]
+    async fn owned_qemu_socket(&self, id: &str, name: &str) -> VmResult<PathBuf> {
+        let instance = self.load_instance(id)?;
+        if instance.backend != VmBackend::Qemu || instance.state != VmState::Running {
+            return Err(VmError::Unsupported(
+                "QEMU guest is not in a managed running state",
+            ));
+        }
+        let mut children = self.inner.children.lock().await;
+        let Some(child) = children.get_mut(id) else {
+            return Err(VmError::NotOwned);
+        };
+        if child.try_wait()?.is_some() {
+            return Err(VmError::NotOwned);
+        }
+        drop(children);
+        let dir = self.instance_dir(id);
+        if fs::canonicalize(&dir)? != dir {
+            return Err(VmError::NotOwned);
+        }
+        if !matches!(name, "qga.sock" | "qmp.sock") {
+            return Err(VmError::InvalidData);
+        }
+        let socket = dir.join(name);
+        use std::os::unix::fs::FileTypeExt;
+        if !socket
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_socket())
+        {
+            return Err(VmError::Unsupported("QEMU Guest Agent socket unavailable"));
+        }
+        Ok(socket)
+    }
+
+    #[cfg(unix)]
+    async fn owned_qga_socket(&self, id: &str) -> VmResult<PathBuf> {
+        self.owned_qemu_socket(id, "qga.sock").await
+    }
+
+    #[cfg(unix)]
+    pub async fn desktop_screenshot(&self, id: &str) -> VmResult<qmp::VmScreenshot> {
+        let socket = self.owned_qemu_socket(id, "qmp.sock").await?;
+        let frame = self
+            .instance_dir(id)
+            .join(format!("screen-{}.png", Uuid::new_v4().simple()));
+        let result = qmp::screenshot(id, &socket, &frame).await;
+        if frame
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(frame);
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    pub async fn desktop_keys(&self, id: &str, keys: &[String]) -> VmResult<qmp::VmDesktopAction> {
+        let socket = self.owned_qemu_socket(id, "qmp.sock").await?;
+        qmp::keys(id, &socket, keys).await
+    }
+
+    #[cfg(unix)]
+    pub async fn desktop_pointer(
+        &self,
+        id: &str,
+        x: u16,
+        y: u16,
+        button: Option<&str>,
+    ) -> VmResult<qmp::VmDesktopAction> {
+        let socket = self.owned_qemu_socket(id, "qmp.sock").await?;
+        qmp::pointer(id, &socket, x, y, button).await
+    }
+
+    /// Health is proven with guest-ping, not inferred from a guest-agent socket.
+    pub async fn guest_status_live(&self, id: &str) -> VmResult<VmGuestStatus> {
+        #[cfg(unix)]
+        if self.backend() == VmBackend::Qemu {
+            let result = match self.owned_qga_socket(id).await {
+                Ok(socket) => qga::ping(&socket).await.is_ok(),
+                Err(VmError::NotFound | VmError::InvalidName) => return Err(VmError::NotFound),
+                Err(_) => false,
+            };
+            return Ok(VmGuestStatus {
+                action: "guest_status",
+                id: id.to_owned(),
+                available: result,
+                reason: if result {
+                    "QEMU Guest Agent responded to guest-ping"
+                } else {
+                    "Guest Agent unavailable; install and start qemu-guest-agent inside the VM"
+                }
+                .to_owned(),
+            });
+        }
+        self.guest_status(id)
+    }
+
+    #[cfg(unix)]
+    pub async fn exec_qemu_fork(
+        &self,
+        id: &str,
+        program: &str,
+        args: &[String],
+        timeout_ms: u64,
+    ) -> VmResult<VmExecResult> {
+        let valid_windows = program.len() > 3
+            && program.as_bytes()[0].is_ascii_alphabetic()
+            && program.as_bytes()[1] == b':'
+            && program.as_bytes()[2] == b'\\';
+        if !program.starts_with('/') && !valid_windows {
+            return Err(VmError::InvalidData);
+        }
+        let mut argv = vec![program.to_owned()];
+        argv.extend_from_slice(args);
+        Self::validate_exec(Some(&argv), None, None, Some(timeout_ms))?;
+        let socket = self.owned_qga_socket(id).await?;
+        let result = qga::exec(id, &socket, program, args, timeout_ms).await;
+        if matches!(result, Err(VmError::Timeout)) {
+            // QGA guest-exec cannot be cancelled. Fail closed until explicitly
+            // stopped and inspected; no second command is issued unknowingly.
+            let mut record = self.load_instance(id)?;
+            record.state = VmState::Failed;
+            save_instance(&self.instance_dir(id), &record)?;
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    pub async fn upload_qemu_fork(
+        &self,
+        id: &str,
+        guest_path: &str,
+        data_base64: &str,
+    ) -> VmResult<serde_json::Value> {
+        let socket = self.owned_qga_socket(id).await?;
+        qga::upload(id, &socket, guest_path, data_base64).await
+    }
+
+    #[cfg(unix)]
+    pub async fn download_qemu_fork(
+        &self,
+        id: &str,
+        guest_path: &str,
+    ) -> VmResult<serde_json::Value> {
+        let socket = self.owned_qga_socket(id).await?;
+        qga::download(id, &socket, guest_path).await
     }
 
     pub fn guest_status(&self, id: &str) -> VmResult<VmGuestStatus> {
@@ -593,6 +960,47 @@ impl VmManager {
         Ok(())
     }
 
+    /// Conservative aggregate admission control, serialized by the manager's
+    /// commands lock and protected across processes by the VM-home lease.
+    /// Failed/Starting instances may still own live guests and consume quota.
+    fn check_capacity(&self, add_cpus: u8, add_memory_mb: u32, creating: bool) -> VmResult<()> {
+        let mut registered = 0usize;
+        let mut active = 0usize;
+        let mut cpus = 0u32;
+        let mut memory = 0u64;
+        let parent = self.root().join("instances");
+        if fs::canonicalize(&parent)? != parent {
+            return Err(VmError::NotOwned);
+        }
+        for entry in fs::read_dir(&parent)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() {
+                return Err(VmError::NotOwned);
+            }
+            let name = entry.file_name();
+            let id = name.to_str().ok_or(VmError::NotOwned)?;
+            let instance = self.load_instance(id)?;
+            registered = registered.checked_add(1).ok_or(VmError::OutputLimit)?;
+            if instance.state != VmState::Stopped {
+                active = active.checked_add(1).ok_or(VmError::OutputLimit)?;
+                cpus = cpus
+                    .checked_add(u32::from(instance.cpus))
+                    .ok_or(VmError::OutputLimit)?;
+                memory = memory
+                    .checked_add(u64::from(instance.memory_mb))
+                    .ok_or(VmError::OutputLimit)?;
+            }
+        }
+        if (creating && registered >= MAX_REGISTERED_FORKS)
+            || active >= MAX_ACTIVE_FORKS
+            || cpus.saturating_add(u32::from(add_cpus)) > MAX_ACTIVE_CPUS
+            || memory.saturating_add(u64::from(add_memory_mb)) > MAX_ACTIVE_MEMORY_MB
+        {
+            return Err(VmError::Busy);
+        }
+        Ok(())
+    }
+
     fn load_instance(&self, id: &str) -> VmResult<VmInstance> {
         validate_id(id)?;
         let file = self.instance_dir(id).join("instance.json");
@@ -624,14 +1032,36 @@ impl VmManager {
             return Err(VmError::NotOwned);
         }
         let disk = format!("disk.{}", backend.disk_ext());
-        let allowed = ["instance.json", "instance.next", disk.as_str()];
+        let files = [
+            "instance.json",
+            "instance.next",
+            "vm.toml",
+            "uefi-vars.fd",
+            disk.as_str(),
+        ];
+        let sockets = ["qga.sock", "qmp.sock", "display.sock"];
         let mut paths = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let name = entry.file_name();
+            let screen = name.to_str().is_some_and(|text| {
+                text.strip_prefix("screen-")
+                    .and_then(|suffix| suffix.strip_suffix(".png"))
+                    .is_some_and(|hex| {
+                        hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+            });
+            #[cfg(unix)]
+            let socket = {
+                use std::os::unix::fs::FileTypeExt;
+                sockets.iter().any(|candidate| name == *candidate) && entry.file_type()?.is_socket()
+            };
+            #[cfg(not(unix))]
+            let socket = false;
             if entry.file_type()?.is_symlink()
-                || !entry.file_type()?.is_file()
-                || !allowed.iter().any(|allowed| name == *allowed)
+                || !(entry.file_type()?.is_file()
+                    && (files.iter().any(|candidate| name == *candidate) || screen)
+                    || socket)
             {
                 return Err(VmError::NotOwned);
             }
@@ -677,27 +1107,101 @@ impl VmManager {
         self.launch_qemu(id, overlay, cpus, memory).await
     }
 
+    fn cleanup_network_listener(&self, id: &str) -> VmResult<()> {
+        for network in self.linux_options(id)?.networks {
+            if let linux_qemu::VmNetwork::IsolatedListen { segment } = network {
+                let socket = linux_qemu::network_socket(&self.instance_dir(id), &segment)?;
+                if let Ok(meta) = socket.symlink_metadata() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileTypeExt;
+                        if !meta.file_type().is_socket() {
+                            return Err(VmError::NotOwned);
+                        }
+                        fs::remove_file(socket)?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = meta;
+                        return Err(VmError::Unsupported("QEMU network sockets require Unix"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn linux_options(&self, id: &str) -> VmResult<linux_qemu::LinuxVmOptions> {
+        let file = self.instance_dir(id).join("vm.toml");
+        if !file.exists() {
+            return Ok(linux_qemu::LinuxVmOptions::default());
+        }
+        if file.symlink_metadata()?.file_type().is_symlink() {
+            return Err(VmError::NotOwned);
+        }
+        let bytes = fs::read(file)?;
+        if bytes.len() > 8_192 {
+            return Err(VmError::OutputLimit);
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| VmError::InvalidData)?;
+        toml::from_str(text).map_err(|_| VmError::InvalidData)
+    }
+
     async fn launch_qemu(&self, id: &str, overlay: &Path, cpus: u8, memory: u32) -> VmResult<()> {
-        let child = Command::new("qemu-system-x86_64")
-            .args([
-                "-nodefaults",
-                "-display",
-                "none",
-                "-machine",
-                "q35",
-                "-m",
-                &memory.to_string(),
-                "-smp",
-                &cpus.to_string(),
-                "-drive",
-            ])
-            .arg(format!("file={},format=qcow2,if=virtio", overlay.display()))
+        let dir = self.instance_dir(id);
+        let options = self.linux_options(id)?;
+        let instance = self.load_instance(id)?;
+        let profile = self
+            .images()?
+            .images
+            .into_iter()
+            .find(|image| image.name == instance.image)
+            .ok_or(VmError::NotFound)?
+            .boot_profile;
+        let iso = match instance.installer_iso.as_deref() {
+            Some(name) => Some(self.verified_iso(name).await?),
+            None => None,
+        };
+        // Remove only known stale, owned Unix sockets from a previously stopped fork.
+        for name in ["qmp.sock", "qga.sock", "display.sock"] {
+            let file = dir.join(name);
+            if let Ok(meta) = file.symlink_metadata() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if !meta.file_type().is_socket() {
+                        return Err(VmError::NotOwned);
+                    }
+                    fs::remove_file(&file)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = meta;
+                    return Err(VmError::Unsupported("QEMU managed sockets require Unix"));
+                }
+            }
+        }
+        let args = linux_qemu::build_command(
+            &dir,
+            overlay,
+            iso.as_deref(),
+            cpus,
+            memory,
+            profile,
+            &options,
+        )?;
+        let mut child = Command::new("qemu-system-x86_64")
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(false)
-            .spawn()
-            .map_err(VmError::Io)?;
+            .spawn()?;
+        // Do not report a guest as started if QEMU immediately rejects its arguments.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if child.try_wait()?.is_some() {
+            return Err(VmError::CommandFailed);
+        }
         self.inner
             .children
             .lock()
@@ -705,6 +1209,31 @@ impl VmManager {
             .insert(id.to_owned(), child);
         Ok(())
     }
+}
+
+fn validate_qcow2_base(path: &Path) -> VmResult<()> {
+    let output = std::process::Command::new("qemu-img")
+        .args(["info", "--output=json"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success()
+        || output.stdout.len() > 48 * 1024
+        || output.stderr.len() > 48 * 1024
+    {
+        return Err(VmError::InvalidData);
+    }
+    let info: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| VmError::InvalidData)?;
+    if info.get("format").and_then(serde_json::Value::as_str) != Some("qcow2")
+        || info.get("backing-filename").is_some()
+        || info.get("full-backing-filename").is_some()
+        || info.get("data-file").is_some()
+        || info.get("encrypted").and_then(serde_json::Value::as_bool) == Some(true)
+    {
+        return Err(VmError::InvalidData);
+    }
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> VmResult<String> {
@@ -751,11 +1280,14 @@ fn resources(cpus: u8, memory: u32) -> VmResult<()> {
 }
 fn write_json_new<T: Serialize>(path: &Path, value: &T) -> VmResult<()> {
     let contents = serde_json::to_vec_pretty(value).map_err(|_| VmError::InvalidData)?;
+    write_bytes_new(path, &contents)
+}
+fn write_bytes_new(path: &Path, data: &[u8]) -> VmResult<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
-    file.write_all(&contents)?;
+    file.write_all(data)?;
     file.sync_all()?;
     Ok(())
 }
@@ -868,6 +1400,20 @@ mod tests {
                 .is_err()
         );
     }
+    fn make_fixture_disk(path: &Path) {
+        if VmBackend::host() == VmBackend::Qemu {
+            let out = std::process::Command::new("qemu-img")
+                .args(["create", "-f", "qcow2"])
+                .arg(path)
+                .arg("32M")
+                .output()
+                .expect("qemu-img");
+            assert!(out.status.success());
+        } else {
+            fs::write(path, b"test-only-image-content").expect("test vhdx fixture");
+        }
+    }
+
     #[test]
     fn foreign_vm_home_is_rejected_and_imports_are_scoped() {
         let foreign = tempfile::tempdir().expect("foreign home");
@@ -883,12 +1429,12 @@ mod tests {
             VmBackend::Hyperv => "test.vhdx",
             VmBackend::Qemu => "test.qcow2",
         });
-        fs::write(&source, b"test-only-image-content").expect("fixture");
+        make_fixture_disk(&source);
         let manager = VmManager::new(store.path()).expect("VM home");
         let image = manager
             .import_image("test-image", &source, 2, 1024)
             .expect("explicit import");
-        assert_eq!(image.bytes, 23);
+        assert_eq!(image.bytes, fs::metadata(&source).unwrap().len());
         assert_eq!(manager.images().expect("images").image_count, 1);
         assert!(matches!(
             manager.import_image("../secret", &source, 2, 1024),
@@ -908,7 +1454,7 @@ mod tests {
         let source = input
             .path()
             .join(format!("fixture.{}", manager.backend().disk_ext()));
-        fs::write(&source, b"approved-image").expect("source fixture");
+        make_fixture_disk(&source);
         manager
             .import_image("approved", &source, 2, 1024)
             .expect("import");
@@ -917,12 +1463,25 @@ mod tests {
             .join("images")
             .join("approved")
             .join(format!("base.{}", manager.backend().disk_ext()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&base).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&base, permissions).unwrap();
+        }
         fs::write(base, b"changed-after-approval").expect("simulate tampering");
         let result = manager
             .create(VmCreate {
                 image: "approved".into(),
                 cpus: None,
                 memory_mb: None,
+                linux_options: None,
+                installer_iso: None,
             })
             .await;
         assert!(matches!(result, Err(VmError::InvalidData)));
@@ -933,6 +1492,83 @@ mod tests {
             0,
             "Hash rejection must not reserve a VM instance directory"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_qcow2_with_host_backing_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = temp.path().join("external.raw");
+        let overlay = temp.path().join("untrusted.qcow2");
+        let base = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "raw"])
+            .arg(&raw)
+            .arg("32M")
+            .output()
+            .unwrap();
+        assert!(base.status.success());
+        let linked = std::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2", "-F", "raw", "-b"])
+            .arg(&raw)
+            .arg(&overlay)
+            .output()
+            .unwrap();
+        assert!(linked.status.success());
+        let manager = VmManager::new(temp.path().join("managed")).unwrap();
+        assert!(matches!(
+            manager.import_image("unsafe", &overlay, 1, 512),
+            Err(VmError::InvalidData)
+        ));
+        assert!(!manager.root().join("images/unsafe").exists());
+    }
+
+    #[test]
+    fn aggregate_vm_admission_limits_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = VmManager::new(temp.path()).unwrap();
+        for number in 1..=MAX_ACTIVE_FORKS {
+            let id = format!("vm-{number:016x}");
+            let dir = manager.root().join("instances").join(&id);
+            fs::create_dir(&dir).unwrap();
+            write_json_new(
+                &dir.join("instance.json"),
+                &VmInstance {
+                    id,
+                    image: "approved".into(),
+                    backend: manager.backend(),
+                    state: VmState::Starting,
+                    cpus: 1,
+                    memory_mb: 512,
+                    installer_iso: None,
+                },
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            manager.check_capacity(1, 512, true),
+            Err(VmError::Busy)
+        ));
+        // Malformed or foreign instance directories also block admission.
+        fs::create_dir(
+            manager
+                .root()
+                .join("instances")
+                .join("../instances/foreign"),
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.check_capacity(1, 512, true),
+            Err(VmError::InvalidName)
+        ));
+    }
+
+    #[test]
+    fn only_one_vm_manager_can_own_a_home_across_live_handles() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = VmManager::new(temp.path()).unwrap();
+        assert!(matches!(VmManager::new(temp.path()), Err(VmError::Busy)));
+        drop(first);
+        assert!(VmManager::new(temp.path()).is_ok());
     }
 
     #[test]
