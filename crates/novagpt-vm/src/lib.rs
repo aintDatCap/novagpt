@@ -1,5 +1,6 @@
 //! Opt-in disposable VM management. Never touches other application VM state.
 pub mod image_promotion;
+pub mod snapshots;
 #[cfg(windows)]
 pub mod windows_direct;
 pub mod windows_guest;
@@ -418,6 +419,73 @@ impl VmManager {
         })
     }
 
+    /// Stop a QEMU guest owned by the current NovaGPT process. A stale
+    /// process ID from an earlier server is never treated as authorization.
+    pub async fn stop(&self, id: &str) -> VmResult<VmStatus> {
+        let _serial = self.inner.commands.lock().await;
+        let instance = self.load_instance(id)?;
+        if instance.backend != VmBackend::Qemu {
+            return Err(VmError::Unsupported("QEMU stop only"));
+        }
+        let mut children = self.inner.children.lock().await;
+        if let Some(mut child) = children.remove(id) {
+            if child.try_wait()?.is_none() {
+                child.start_kill()?;
+                match timeout(Duration::from_secs(15), child.wait()).await {
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        children.insert(id.to_owned(), child);
+                        return Err(VmError::Timeout);
+                    }
+                }
+            }
+        } else if instance.state != VmState::Stopped {
+            return Err(VmError::NotOwned);
+        }
+        drop(children);
+        let stopped = VmInstance {
+            state: VmState::Stopped,
+            ..instance
+        };
+        save_instance(&self.instance_dir(id), &stopped)?;
+        Ok(VmStatus {
+            action: "stop",
+            instance: stopped,
+        })
+    }
+
+    /// Resume a stopped QEMU fork from its existing owned writable overlay.
+    pub async fn start(&self, id: &str) -> VmResult<VmStatus> {
+        let _serial = self.inner.commands.lock().await;
+        let instance = self.load_instance(id)?;
+        if instance.backend != VmBackend::Qemu {
+            return Err(VmError::Unsupported("QEMU start only"));
+        }
+        if instance.state != VmState::Stopped || self.inner.children.lock().await.contains_key(id) {
+            return Err(VmError::Busy);
+        }
+        let dir = self.instance_dir(id);
+        if fs::canonicalize(&dir)? != dir {
+            return Err(VmError::NotOwned);
+        }
+        let disk = dir.join("disk.qcow2");
+        let metadata = disk.symlink_metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(VmError::NotOwned);
+        }
+        self.launch_qemu(id, &disk, instance.cpus, instance.memory_mb)
+            .await?;
+        let running = VmInstance {
+            state: VmState::Running,
+            ..instance
+        };
+        save_instance(&dir, &running)?;
+        Ok(VmStatus {
+            action: "start",
+            instance: running,
+        })
+    }
+
     pub async fn destroy(&self, id: &str) -> VmResult<VmStatus> {
         let _serial = self.inner.commands.lock().await;
         let instance = self.load_instance(id)?;
@@ -606,6 +674,10 @@ impl VmManager {
         if !output.status.success() {
             return Err(VmError::CommandFailed);
         }
+        self.launch_qemu(id, overlay, cpus, memory).await
+    }
+
+    async fn launch_qemu(&self, id: &str, overlay: &Path, cpus: u8, memory: u32) -> VmResult<()> {
         let child = Command::new("qemu-system-x86_64")
             .args([
                 "-nodefaults",
