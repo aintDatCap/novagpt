@@ -345,6 +345,98 @@ mod tests {
         assert!(!args.contains("hostfwd="));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_two_disposable_guests_share_private_segment_without_host_routes() {
+        use crate::{VmCreate, VmManager, VmState};
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("blank.qcow2");
+        let make = tokio::process::Command::new("qemu-img")
+            .args(["create", "-f", "qcow2"])
+            .arg(&source)
+            .arg("32M")
+            .output()
+            .await
+            .unwrap();
+        assert!(make.status.success());
+        let manager = VmManager::new(temp.path().join("lab")).unwrap();
+        manager.import_image("blank", &source, 1, 512).unwrap();
+        let before_v4 = fs::read("/proc/net/route").unwrap();
+        let before_v6 = fs::read("/proc/net/ipv6_route").unwrap();
+        let first = manager
+            .create(VmCreate {
+                image: "blank".into(),
+                cpus: None,
+                memory_mb: None,
+                linux_options: Some(LinuxVmOptions {
+                    networks: vec![
+                        VmNetwork::IsolatedListen {
+                            segment: "private_lab".into(),
+                        },
+                        VmNetwork::Nat,
+                    ],
+                    display: false,
+                    guest_agent: false,
+                }),
+                installer_iso: None,
+            })
+            .await
+            .expect("start isolated gateway fixture");
+        let first_id = first.instance.id.clone();
+        let mut second_id = None;
+        let tested = async {
+            let socket = manager.root().join("networks/private_lab.sock");
+            assert!(socket.symlink_metadata().unwrap().file_type().is_socket());
+            let second = manager
+                .create(VmCreate {
+                    image: "blank".into(),
+                    cpus: None,
+                    memory_mb: None,
+                    linux_options: Some(LinuxVmOptions {
+                        networks: vec![VmNetwork::IsolatedConnect {
+                            segment: "private_lab".into(),
+                        }],
+                        display: false,
+                        guest_agent: false,
+                    }),
+                    installer_iso: None,
+                })
+                .await?;
+            second_id = Some(second.instance.id);
+            assert_eq!(
+                manager.status(&first_id).await?.instance.state,
+                VmState::Running
+            );
+            assert_eq!(
+                manager
+                    .status(second_id.as_deref().unwrap())
+                    .await?
+                    .instance
+                    .state,
+                VmState::Running
+            );
+            assert_eq!(fs::read("/proc/net/route")?, before_v4);
+            assert_eq!(fs::read("/proc/net/ipv6_route")?, before_v6);
+            Ok::<(), VmError>(())
+        }
+        .await;
+        let child_destroyed = match second_id {
+            Some(id) => manager.destroy(&id).await,
+            None => Ok(crate::VmStatus {
+                action: "skipped",
+                instance: first.instance.clone(),
+            }),
+        };
+        let parent_destroyed = manager.destroy(&first_id).await;
+        assert!(
+            tested.is_ok(),
+            "private QEMU segment acceptance: {tested:?}"
+        );
+        assert!(child_destroyed.is_ok(), "second VM cleanup failed");
+        assert!(parent_destroyed.is_ok(), "first VM cleanup failed");
+        assert!(!manager.root().join("networks/private_lab.sock").exists());
+    }
+
     #[test]
     fn uefi_windows_without_swtpm_fails_closed() {
         let argv = build_command(
