@@ -199,6 +199,16 @@ pub async fn request_powerdown(socket: &Path) -> VmResult<()> {
     Ok(())
 }
 
+/// Terminate the exact owned QEMU process through its private QMP socket.
+/// A closed connection before ACK is possible; the caller verifies process exit.
+pub async fn request_quit(socket: &Path) -> VmResult<()> {
+    let mut qmp = QmpConnection::connect(socket).await?;
+    match qmp.execute(json!({"execute":"quit"})).await {
+        Ok(_) | Err(VmError::CommandFailed) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn keys(id: &str, socket: &Path, keys: &[String]) -> VmResult<VmDesktopAction> {
     let events = qcodes(keys)?;
     let mut qmp = QmpConnection::connect(socket).await?;

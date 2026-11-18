@@ -2,6 +2,8 @@
 pub mod image_promotion;
 pub mod iso;
 pub mod linux_qemu;
+#[cfg(target_os = "linux")]
+mod process_identity;
 #[cfg(unix)]
 pub mod qga;
 #[cfg(unix)]
@@ -126,6 +128,10 @@ pub struct VmInstance {
     /// Approved ISO registry name for an install fork, never a host path.
     #[serde(default)]
     pub installer_iso: Option<String>,
+    #[serde(default)]
+    pub qemu_pid: Option<u32>,
+    #[serde(default)]
+    pub qemu_start_ticks: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -462,6 +468,8 @@ impl VmManager {
             cpus,
             memory_mb: memory,
             installer_iso: req.installer_iso,
+            qemu_pid: None,
+            qemu_start_ticks: None,
         };
         let setup = (|| -> VmResult<()> {
             write_json_new(&dir.join("instance.json"), &instance)?;
@@ -498,8 +506,15 @@ impl VmManager {
             )?;
         }
         result?;
+        let (qemu_pid, qemu_start_ticks) = if image.backend == VmBackend::Qemu {
+            self.running_qemu_identity(&id).await?
+        } else {
+            (None, None)
+        };
         let running = VmInstance {
             state: VmState::Running,
+            qemu_pid,
+            qemu_start_ticks,
             ..instance
         };
         save_instance(&dir, &running)?;
@@ -524,15 +539,25 @@ impl VmManager {
                 _ => VmState::Failed,
             };
         } else {
-            let mut children = self.inner.children.lock().await;
-            instance.state = match children.get_mut(id) {
-                Some(child) => match child.try_wait()? {
-                    None if instance.state == VmState::Failed => VmState::Failed,
-                    None => VmState::Running,
-                    Some(_) => VmState::Stopped,
-                },
+            let child_state = {
+                let mut children = self.inner.children.lock().await;
+                match children.get_mut(id) {
+                    Some(child) => Some(match child.try_wait()? {
+                        None if instance.state == VmState::Failed => VmState::Failed,
+                        None => VmState::Running,
+                        Some(_) => VmState::Stopped,
+                    }),
+                    None => None,
+                }
+            };
+            instance.state = match child_state {
+                Some(state) => state,
                 None if matches!(instance.state, VmState::Running | VmState::Starting) => {
-                    VmState::Failed
+                    if self.verified_orphan(&instance).await? {
+                        VmState::Running
+                    } else {
+                        VmState::Failed
+                    }
                 }
                 None => instance.state,
             };
@@ -558,23 +583,36 @@ impl VmManager {
         qmp::request_powerdown(&socket).await?;
         let began = std::time::Instant::now();
         loop {
-            let exited = {
+            let child_state = {
                 let mut children = self.inner.children.lock().await;
-                let Some(child) = children.get_mut(id) else {
-                    return Err(VmError::NotOwned);
+                let exited = match children.get_mut(id) {
+                    Some(child) => Some(child.try_wait()?.is_some()),
+                    None => None,
                 };
-                match child.try_wait()? {
-                    Some(_) => {
-                        children.remove(id);
-                        true
+                if exited == Some(true) {
+                    children.remove(id);
+                }
+                exited
+            };
+            let exited = match child_state {
+                Some(exited) => exited,
+                None => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        !self.verified_orphan(&instance).await?
                     }
-                    None => false,
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return Err(VmError::NotOwned);
+                    }
                 }
             };
             if exited {
                 self.cleanup_network_listener(id)?;
                 let stopped = VmInstance {
                     state: VmState::Stopped,
+                    qemu_pid: None,
+                    qemu_start_ticks: None,
                     ..instance
                 };
                 save_instance(&self.instance_dir(id), &stopped)?;
@@ -598,28 +636,42 @@ impl VmManager {
         if instance.backend != VmBackend::Qemu {
             return Err(VmError::Unsupported("QEMU stop only"));
         }
-        let mut children = self.inner.children.lock().await;
-        if let Some(mut child) = children.remove(id) {
+        let owned_child = self.inner.children.lock().await.remove(id);
+        if let Some(mut child) = owned_child {
             if child.try_wait()?.is_none() {
                 if let Err(error) = child.start_kill() {
-                    children.insert(id.to_owned(), child);
+                    self.inner
+                        .children
+                        .lock()
+                        .await
+                        .insert(id.to_owned(), child);
                     return Err(VmError::Io(error));
                 }
                 match timeout(Duration::from_secs(15), child.wait()).await {
                     Ok(Ok(_)) => {}
                     _ => {
-                        children.insert(id.to_owned(), child);
+                        self.inner
+                            .children
+                            .lock()
+                            .await
+                            .insert(id.to_owned(), child);
                         return Err(VmError::Timeout);
                     }
                 }
             }
+        } else if matches!(instance.state, VmState::Running | VmState::Failed) {
+            #[cfg(target_os = "linux")]
+            self.signal_verified_orphan(&instance, false).await?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(VmError::NotOwned);
         } else if instance.state != VmState::Stopped {
             return Err(VmError::NotOwned);
         }
-        drop(children);
         self.cleanup_network_listener(id)?;
         let stopped = VmInstance {
             state: VmState::Stopped,
+            qemu_pid: None,
+            qemu_start_ticks: None,
             ..instance
         };
         save_instance(&self.instance_dir(id), &stopped)?;
@@ -651,8 +703,11 @@ impl VmManager {
         }
         self.launch_qemu(id, &disk, instance.cpus, instance.memory_mb)
             .await?;
+        let (qemu_pid, qemu_start_ticks) = self.running_qemu_identity(id).await?;
         let running = VmInstance {
             state: VmState::Running,
+            qemu_pid,
+            qemu_start_ticks,
             ..instance
         };
         save_instance(&dir, &running)?;
@@ -715,34 +770,55 @@ impl VmManager {
             );
             powershell(&script, Duration::from_secs(90)).await?;
         } else {
-            let mut children = self.inner.children.lock().await;
-            if let Some(mut child) = children.remove(id) {
+            let owned_child = self.inner.children.lock().await.remove(id);
+            if let Some(mut child) = owned_child {
                 if child.try_wait()?.is_none() {
                     if let Err(error) = child.start_kill() {
-                        children.insert(id.to_owned(), child);
+                        self.inner
+                            .children
+                            .lock()
+                            .await
+                            .insert(id.to_owned(), child);
                         return Err(VmError::Io(error));
                     }
                     match timeout(Duration::from_secs(10), child.wait()).await {
                         Ok(Ok(_)) => {}
                         _ => {
-                            children.insert(id.to_owned(), child);
+                            self.inner
+                                .children
+                                .lock()
+                                .await
+                                .insert(id.to_owned(), child);
                             return Err(VmError::Timeout);
                         }
                     }
                 }
+            } else if matches!(instance.state, VmState::Running | VmState::Failed)
+                && self.verified_orphan(&instance).await?
+            {
+                #[cfg(target_os = "linux")]
+                self.signal_verified_orphan(&instance, false).await?;
+                #[cfg(not(target_os = "linux"))]
+                return Err(VmError::NotOwned);
             } else if matches!(instance.state, VmState::Running | VmState::Starting) {
                 return Err(VmError::NotOwned);
             } else if instance.state == VmState::Failed {
-                // A failed launch may have left a live QEMU process before its
-                // handle was recorded. Never delete the disk if a monitor socket exists.
-                let monitor = self.instance_dir(id).join("qmp.sock");
-                if monitor.symlink_metadata().is_ok() {
+                // The failed state may have live QEMU without a persistently
+                // verified handle. Never unlink disks while a monitor remains.
+                if self
+                    .instance_dir(id)
+                    .join("qmp.sock")
+                    .symlink_metadata()
+                    .is_ok()
+                {
                     return Err(VmError::NotOwned);
                 }
             }
         }
         let stopped = VmInstance {
             state: VmState::Stopped,
+            qemu_pid: None,
+            qemu_start_ticks: None,
             ..instance
         };
         if stopped.backend == VmBackend::Qemu {
@@ -765,14 +841,16 @@ impl VmManager {
                 "QEMU guest is not in a managed running state",
             ));
         }
-        let mut children = self.inner.children.lock().await;
-        let Some(child) = children.get_mut(id) else {
-            return Err(VmError::NotOwned);
+        let locally_owned = {
+            let mut children = self.inner.children.lock().await;
+            match children.get_mut(id) {
+                Some(child) => child.try_wait()?.is_none(),
+                None => false,
+            }
         };
-        if child.try_wait()?.is_some() {
+        if !locally_owned && !self.verified_orphan(&instance).await? {
             return Err(VmError::NotOwned);
         }
-        drop(children);
         let dir = self.instance_dir(id);
         if fs::canonicalize(&dir)? != dir {
             return Err(VmError::NotOwned);
@@ -1129,6 +1207,80 @@ impl VmManager {
             }
         }
         Ok(())
+    }
+
+    async fn running_qemu_identity(&self, id: &str) -> VmResult<(Option<u32>, Option<u64>)> {
+        let pid = {
+            let children = self.inner.children.lock().await;
+            children
+                .get(id)
+                .and_then(Child::id)
+                .ok_or(VmError::NotOwned)?
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let ticks = tokio::task::spawn_blocking(move || process_identity::start_ticks(pid))
+                .await
+                .map_err(|_| VmError::NotOwned)??;
+            Ok((Some(pid), Some(ticks)))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            Ok((None, None))
+        }
+    }
+
+    async fn verified_orphan(&self, instance: &VmInstance) -> VmResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let (Some(pid), Some(ticks)) = (instance.qemu_pid, instance.qemu_start_ticks) else {
+                return Ok(false);
+            };
+            let dir = self.instance_dir(&instance.id);
+            tokio::task::spawn_blocking(move || process_identity::verify(&dir, pid, ticks))
+                .await
+                .map_err(|_| VmError::NotOwned)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = instance;
+            Ok(false)
+        }
+    }
+
+    /// Terminate only an OS-verified survivor of this exact QEMU fork.
+    /// QMP is the control channel; a stored PID alone never authorizes signals.
+    #[cfg(target_os = "linux")]
+    async fn signal_verified_orphan(&self, instance: &VmInstance, graceful: bool) -> VmResult<()> {
+        if !self.verified_orphan(instance).await? {
+            return Err(VmError::NotOwned);
+        }
+        let socket = self.instance_dir(&instance.id).join("qmp.sock");
+        use std::os::unix::fs::FileTypeExt;
+        if !socket
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_socket())
+        {
+            return Err(VmError::NotOwned);
+        }
+        // For a quit request, QEMU may close the QMP socket before returning
+        // an acknowledgement. The only success condition is process exit.
+        let command = if graceful {
+            qmp::request_powerdown(&socket).await
+        } else {
+            qmp::request_quit(&socket).await
+        };
+        let start = std::time::Instant::now();
+        loop {
+            if !self.verified_orphan(instance).await? {
+                return Ok(());
+            }
+            if start.elapsed() >= Duration::from_secs(10) {
+                return Err(command.err().unwrap_or(VmError::Timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     fn linux_options(&self, id: &str) -> VmResult<linux_qemu::LinuxVmOptions> {
@@ -1540,6 +1692,8 @@ mod tests {
                     cpus: 1,
                     memory_mb: 512,
                     installer_iso: None,
+                    qemu_pid: None,
+                    qemu_start_ticks: None,
                 },
             )
             .unwrap();
