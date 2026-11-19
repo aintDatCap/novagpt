@@ -17,6 +17,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      # Linux tests exercise real, disposable QEMU guests and QCOW2 snapshots.
+      - name: Install QEMU for Linux VM integration tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86
       - name: Install stable Rust, rustfmt and Clippy
         shell: bash
         run: |

@@ -49,6 +49,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Required by the real, disposable QEMU and QCOW2 tests in cargo test.
+      - name: Install QEMU for Linux VM integration tests
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86
       - name: Install stable Rust, rustfmt and Clippy
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy

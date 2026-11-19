@@ -25,6 +25,10 @@ cargo check --workspace
 cargo test --workspace
 ```
 
+On Linux, the full test suite includes real, isolated QEMU VM tests. Install
+`qemu-img` (`qemu-utils`) and `qemu-system-x86_64` (`qemu-system-x86`) before
+running it; the Linux PR and release-verification runners install both packages.
+
 For changes to the POSIX source-development supervisor:
 
 ```bash
