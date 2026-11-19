@@ -1,7 +1,7 @@
 # Agent Context Efficiency Roadmap
 
 **Status:** Proposal; no feature in this roadmap is considered implemented by this document.
-**Scope:** NovaGPT core, MCP adapters, optional browser and agent modules, and an optional external workflow orchestrator.
+**Scope:** NovaGPT core, MCP adapters, and optional browser and agent modules.
 **Goal:** Reduce the total cost of *correctly completed* agent development tasks. Preserve correctness, security, auditability, and access to necessary evidence.
 
 This is a planning document. It does not authorize unattended execution, remote access, new dependencies, or changes to other repositories. Follow [AGENTS.md](../AGENTS.md), [ARCHITECTURE.md](ARCHITECTURE.md), [ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md), [QUALITY_GATES.md](QUALITY_GATES.md), and [CAPABILITIES.md](CAPABILITIES.md). Implement each phase through small, independently reviewed changes.
@@ -158,13 +158,13 @@ Every implementation PR must include: fixture identifiers, before/after usage ta
 6. Make task handoff idempotent and auditable: received artifact ID, source hash, task status, and acknowledgment. Never turn a model summary into evidence that tests passed.
 7. Treat model-generated summaries and retrieved web pages as untrusted data; block prompt-injection attempts to change tool privileges, workspace scope, or approval policy.
 
-**Likely owners.** Existing `novagpt-agents` and core context/handoff modules; MCP exposes narrow typed operations. The orchestrator owns cross-task scheduling, not transport identity.
+**Likely owners.** Existing `novagpt-agents` and core context/handoff modules; MCP exposes narrow typed operations. Cross-task scheduling is outside NovaGPT; MCP transport identity remains separate from task identity.
 
 **Verification.** Multi-agent fixtures with long histories, repeated instructions, failed and resumed tasks, stale checkpoints, missing evidence, conflicting writes, and intentionally misleading summaries. Compare token usage, successful task completion, repeated file reads, time to resume, and scope violations. Test redaction and cleanup after cancellation.
 
 **Done when.** A new agent can resume a fixture from checkpoint and complete it correctly without the full transcript; the checkpoint does not claim unverified actions; context savings do not increase task failures or unauthorized reads.
 
-## 9. Delivery order and dependencies
+## 8. Delivery order and dependencies
 
 | Step | Deliverable | Depends on | Rollout |
 | --- | --- | --- | --- |
@@ -174,9 +174,8 @@ Every implementation PR must include: fixture identifiers, before/after usage ta
 | C | Article/section/UI extraction in browser read | 0, preferably A | Explicit mode; raw fallback |
 | D | Symbol-first repository navigation and cache | 0, preferably A | Opt-in |
 | E | Verified task checkpoint and scoped context reuse | A, then B/D as useful | Opt-in |
-| F | External scheduler and hybrid-worker contract | A + stable verification receipts | Independent pilot |
 
-B and C can proceed in parallel after the evaluation harness is ready. Do not wait for Windmill to start work on NovaGPT's tool outputs. Revisit the order after collecting evidence.
+B and C can proceed in parallel after the evaluation harness is ready. Revisit the order after collecting evidence.
 
 ### Suggested first implementation slice
 
@@ -186,7 +185,7 @@ B and C can proceed in parallel after the evaluation harness is ready. Do not wa
 4. Expand to `cargo clippy` and a minimal `browser_read` article extraction mode only if the first benchmark does not show harmful regressions.
 5. Update quality gates, capability status and the documented defaults only after demonstrated behavior.
 
-## 10. Explicit non-goals and cautions
+## 9. Explicit non-goals and cautions
 
 - No claims of fixed token-saving percentages, universal command compression, automatic legal compliance, or autonomous security certification.
 - No forced switch to STE100 for all text. Controlled English can improve technical clarity, but shorter text and fewer tokens are separate hypotheses. Compare original, STE100, concise, and STE100-plus-concise documents using the real model tokenizer **and** comprehension/task-success tests.
@@ -196,7 +195,7 @@ B and C can proceed in parallel after the evaluation harness is ready. Do not wa
 - No forced model compaction, prompt-cache assumption, or changes to another agent's worktree.
 - No silent change to existing MCP output defaults. Breaking protocol changes need an ADR, contract tests, and a migration path.
 
-## 11. Completion report template
+## 10. Completion report template
 
 For each delivered slice, record:
 

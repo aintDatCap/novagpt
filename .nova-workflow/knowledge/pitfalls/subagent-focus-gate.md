@@ -1,14 +1,13 @@
 +++
-id = "subagent-focus-gate"
+schema_version = 1
 title = "Visible browser focus is a precondition for subagent input"
-category = "pitfall"
-status = "candidate"
-module = "novagpt-browser"
-scope = ["crates/novagpt-browser/src/lib.rs"]
-sources = ["crates/novagpt-browser/src/lib.rs#L117-L119"]
-created_at = "2026-11-18"
-+++
 
+[[evidence]]
+file = "crates/novagpt-browser/src/lib.rs"
+commit = "e734dc9c2125fdd671a4bb47b28c9b0016340773"
+source = "legacy:docs/knowledge/pitfalls/subagent-focus-gate.md"
+status = "candidate"
++++
 # Visible browser focus is a precondition for subagent input
 
 The browser adapter has a distinct `InteractionBlocked` error for cases in

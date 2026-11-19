@@ -109,5 +109,5 @@ The wrapper is a process supervisor, not an integrated Rust lifecycle API.
 It does not yet appear in NovaGPT CLI flags, TUI settings or Rust managed
 Chrome reconnect status. A crashed Xvfb ends the supervised service instead
 of silently attaching to another display. It neither schedules work nor
-exposes a new chat API. Live account interactions and focus-gate behavior
+changes the MCP protocol. Live account interactions and focus-gate behavior
 on each VPS compositor must be verified before unattended use.

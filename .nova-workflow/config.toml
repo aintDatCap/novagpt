@@ -1,0 +1,4 @@
+schema_version = 1
+project_id = "novagpt"
+display_name = "NovaGPT"
+suggested_categories = ["invariants", "pitfalls", "decisions"]
