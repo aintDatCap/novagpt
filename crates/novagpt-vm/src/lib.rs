@@ -1780,7 +1780,21 @@ mod tests {
         let first = VmManager::new(temp.path()).unwrap();
         assert!(matches!(VmManager::new(temp.path()), Err(VmError::Busy)));
         drop(first);
-        assert!(VmManager::new(temp.path()).is_ok());
+        // Concurrent tests may fork a QEMU child while the lease fd is open.
+        // A forked child shares the lock until exec closes its inherited fd.
+        // Allow that brief transition, but fail if the lease remains held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match VmManager::new(temp.path()) {
+                Ok(_) => break,
+                Err(VmError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    panic!("VM home must be reusable after releasing its lease: {error:?}")
+                }
+            }
+        }
     }
 
     /// A local writer must not be able to redirect a stopped overlay to a

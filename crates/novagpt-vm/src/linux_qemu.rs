@@ -204,8 +204,9 @@ pub fn build_command(
         .and_then(|value| value.to_str())
         .ok_or(VmError::InvalidName)?;
     let mut result = vec![
-        "-nodefaults".into(), "-machine".into(), "q35".into(),
-        "-accel".into(), if Path::new("/dev/kvm").exists() { "kvm" } else { "tcg" }.into(),
+        "-nodefaults".into(), "-machine".into(), "q35,accel=kvm:tcg".into(),
+        // /dev/kvm may exist but be inaccessible (e.g. an unprivileged CI runner).
+        // Let QEMU try KVM and fall back to TCG if initialization fails.
         "-m".into(), memory.to_string().into(),
         "-smp".into(), cpus.to_string().into(),
         "-blockdev".into(),
@@ -337,6 +338,8 @@ mod tests {
             .map(|x| x.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
+        assert!(args.contains("-machine q35,accel=kvm:tcg"));
+        assert!(!args.contains("-accel kvm"));
         assert!(args.contains("net=10.0.20.0/24"));
         assert!(args.contains("net=10.0.21.0/24"));
         assert!(args.contains("virtserialport,chardev=qga0"));
