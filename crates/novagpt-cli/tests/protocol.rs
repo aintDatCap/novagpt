@@ -333,9 +333,24 @@ fn stdio_initialize_list_and_call_use_the_real_protocol() {
     assert_eq!(by_id(14)["result"]["isError"], true);
     assert_eq!(by_id(3)["result"]["structuredContent"]["text"], "test text");
     assert_eq!(by_id(55)["result"]["isError"], false);
-    let grep_hits = by_id(55)["result"]["structuredContent"]
-        .as_array()
-        .expect("grep returns structured hits");
+    // rmcp 3.11+ moves non-object structuredContent to the first text block
+    // for peers negotiating MCP 2025-11-25 (which requires an object there).
+    // Newer peers may receive the same JSON array in structuredContent.
+    let grep_result = &by_id(55)["result"];
+    let grep_hits: Vec<Value> = if let Some(hits) = grep_result["structuredContent"].as_array() {
+        hits.clone()
+    } else {
+        assert!(
+            grep_result.get("structuredContent").is_none(),
+            "legacy grep response must not expose non-object structuredContent"
+        );
+        serde_json::from_str(
+            grep_result["content"][0]["text"]
+                .as_str()
+                .expect("legacy grep results must appear in a text block"),
+        )
+        .expect("legacy grep text must contain the JSON hits array")
+    };
     assert_eq!(grep_hits.len(), 1);
     assert_eq!(grep_hits[0]["path"], "hello.txt");
     assert_eq!(grep_hits[0]["line"], 1);
