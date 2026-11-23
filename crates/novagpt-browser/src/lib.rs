@@ -576,6 +576,10 @@ struct Inner {
     runtime: Mutex<Option<UndetectedChrome>>,
     dev_origin: Option<reqwest::Url>,
     create_lock: Mutex<()>,
+    /// Only one worker may own the foreground while composing and submitting.
+    /// New tabs also take this lock because Chrome activates them.
+    /// Background reply polling never holds it.
+    foreground_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
     reporter: Option<DiagnosticReporter>,
     pacing: InteractionPacing,
@@ -624,6 +628,7 @@ impl ChatGptBrowser {
                 runtime: Mutex::new(None),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
+                foreground_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
                 pacing: InteractionPacing::human(),
@@ -652,6 +657,7 @@ impl ChatGptBrowser {
                 runtime: Mutex::new(Some(UndetectedChrome::from_session_for_test(session))),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
+                foreground_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
                 pacing: InteractionPacing::instant(),
@@ -868,6 +874,9 @@ impl ChatGptBrowser {
                 sleep(gap - elapsed).await;
             }
         }
+        // Opening a tab can activate it even while another worker is typing.
+        // Never steal the foreground between its focus check and submission.
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         *self.inner.last_open.lock().await = Some(Instant::now());
         let chrome = self.chrome().await?;
         {
@@ -953,6 +962,7 @@ impl ChatGptBrowser {
                 self.page(BROWSE_TAB).await?
             }
         };
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         page.ensure_interactive().await
     }
 
@@ -1483,6 +1493,9 @@ impl ChatGptBrowser {
                 page.pacing.settle_jitter,
             ))
             .await;
+            // Per-page send locks cannot protect Chrome's shared foreground.
+            // Release this immediately after submitting, not after the reply.
+            let _foreground_guard = self.inner.foreground_lock.lock().await;
             // Input into a hidden or unfocused tab is not something a person
             // can do. Raise this tab and refuse to type unless the document
             // confirms it is visible and focused.
@@ -1782,6 +1795,9 @@ impl ChatGptBrowser {
     }
 
     pub async fn close(&self, id: &str) -> Result<(), BrowserError> {
+        // ChromeDriver selects the window to close, potentially activating it.
+        // Do not steal focus from another worker between input and submission.
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         if let Some(page) = self.inner.pages.lock().await.remove(id) {
             page.cancelled.store(true, Ordering::Release);
             page.transport.close().await.map_err(BrowserError::from)?;
@@ -2639,6 +2655,77 @@ mod tests {
         WebDriverSession::create(client, json!({"browserName":"chrome"}))
             .await
             .expect("session")
+    }
+
+    #[tokio::test]
+    async fn foreground_composition_blocks_competing_tab_creation() {
+        let (port, state, server) = spawn_mock().await;
+        state.lock().await.verified = true;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-one").await.expect("first tab");
+
+        // Hold the same foreground gate that protects focus, input and send.
+        // Neither a second tab nor a prompt may activate Chrome until it is
+        // released. Background reads are intentionally not part of this gate.
+        let foreground = browser.inner.foreground_lock.lock().await;
+        let first = browser.clone();
+        let sending = tokio::spawn(async move { first.send("agent-one", "First prompt").await });
+        let second = browser.clone();
+        let opening = tokio::spawn(async move { second.open("agent-two").await });
+        let third = browser.clone();
+        let opening_three = tokio::spawn(async move { third.open("agent-three").await });
+        let fourth = browser.clone();
+        let opening_four = tokio::spawn(async move { fourth.open("agent-four").await });
+        tokio::task::yield_now().await;
+        sleep(Duration::from_millis(80)).await;
+        {
+            let mock = state.lock().await;
+            assert_eq!(mock.handles.len(), 2, "opening another tab must wait");
+            assert!(
+                !mock.cdp.iter().any(|cmd| cmd == "Page.bringToFront"),
+                "the first worker must wait before raising its tab"
+            );
+        }
+        drop(foreground);
+
+        let reply = timeout(Duration::from_secs(8), sending)
+            .await
+            .expect("send deadline")
+            .expect("send task")
+            .expect("send");
+        assert_eq!(reply.content, "Fixture answer");
+        for opening in [opening, opening_three, opening_four] {
+            timeout(Duration::from_secs(8), opening)
+                .await
+                .expect("open deadline")
+                .expect("open task")
+                .expect("worker tab");
+        }
+        let mock = state.lock().await;
+        assert_eq!(mock.handles.len(), 5, "all four worker tabs remain open");
+        assert!(
+            mock.cdp.iter().any(|cmd| cmd == "Page.bringToFront"),
+            "worker input must eventually raise its own tab"
+        );
+        drop(mock);
+
+        // Closing a worker tab also selects it in ChromeDriver; it must not
+        // interrupt another worker that currently owns the foreground.
+        let foreground = browser.inner.foreground_lock.lock().await;
+        let closing_browser = browser.clone();
+        let closing = tokio::spawn(async move { closing_browser.close("agent-two").await });
+        tokio::task::yield_now().await;
+        sleep(Duration::from_millis(80)).await;
+        assert_eq!(state.lock().await.handles.len(), 5, "close must wait");
+        drop(foreground);
+        timeout(Duration::from_secs(8), closing)
+            .await
+            .expect("close deadline")
+            .expect("close task")
+            .expect("close tab");
+        assert_eq!(state.lock().await.handles.len(), 4);
+        browser.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
