@@ -2324,6 +2324,7 @@ mod tests {
         chat_url: String,
         project_ui_enabled: bool,
         project_exists: bool,
+        project_row_role_button: bool,
         project_ui_missing: bool,
         project_verification: bool,
         project_creations: usize,
@@ -2503,7 +2504,13 @@ mod tests {
                     "missing"
                 } else {
                     match action {
-                        "existing" if state.project_exists => "new-chat",
+                        "existing" if state.project_exists => {
+                            if state.project_row_role_button {
+                                "entry"
+                            } else {
+                                "new-chat"
+                            }
+                        }
                         "new-project" if !state.project_exists => "control",
                         "name-input" | "create-project" if !state.project_exists => "control",
                         "verify"
@@ -2516,7 +2523,7 @@ mod tests {
                     }
                 };
                 state.project_pending = match action {
-                    "existing" if kind == "new-chat" => "new-chat".into(),
+                    "existing" if kind == "new-chat" || kind == "entry" => kind.into(),
                     "new-project" if kind == "control" => "new-project".into(),
                     "name-input" if kind == "control" => "name-input".into(),
                     "create-project" if kind == "control" => "create-project".into(),
@@ -2921,6 +2928,27 @@ mod tests {
             2,
             "existing project needs only the worker tab"
         );
+        assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
+        drop(mock);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn automatic_subagent_project_opens_role_button_sidebar_row() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.project_ui_enabled = true;
+            mock.project_exists = true;
+            mock.project_row_role_button = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.inner.auto_project.store(true, Ordering::Relaxed);
+        browser.open("agent-role-row").await.expect("project row");
+        let mock = state.lock().await;
+        assert_eq!(mock.project_creations, 0, "must not duplicate the project");
+        assert_eq!(mock.handles.len(), 2);
         assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
         drop(mock);
         browser.shutdown().await;
