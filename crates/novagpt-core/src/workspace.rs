@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use thiserror::Error;
 
@@ -47,9 +47,14 @@ struct SharedState {
     default_root: PathBuf,
     allowed_roots: Vec<PathBuf>,
     known: Mutex<HashMap<String, PathBuf>>,
-    write_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
-    git_locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    write_locks: Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>,
+    git_locks: Mutex<HashMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>,
     worktrees: Mutex<HashMap<(String, String), crate::worktree_ops::OwnedWorktree>>,
+}
+
+pub(crate) struct GitMutationGuard {
+    _common: tokio::sync::OwnedRwLockWriteGuard<()>,
+    _tree: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 #[derive(Clone)]
@@ -212,42 +217,110 @@ impl WorkspaceRegistry {
         Ok(target)
     }
 
+    // Canonical existing ancestor plus the missing suffix gives aliases the
+    // same lock identity, including targets that do not yet exist.
+    fn canonical_target(target: &Path) -> NovaResult<PathBuf> {
+        let mut ancestor = target;
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().ok_or(NovaError::OutsideAllowedRoot)?;
+        }
+        Ok(fs::canonicalize(ancestor)?.join(
+            target
+                .strip_prefix(ancestor)
+                .map_err(|_| NovaError::OutsideAllowedRoot)?,
+        ))
+    }
+
+    pub(crate) fn repository_root(&self, target: &Path) -> NovaResult<Option<PathBuf>> {
+        for ancestor in target.ancestors() {
+            if ancestor.join(".git").exists() {
+                return Ok(Some(ancestor.to_path_buf()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn worktree_gate(&self, root: &Path) -> NovaResult<Arc<tokio::sync::RwLock<()>>> {
+        let mut table = self
+            .inner
+            .git_locks
+            .lock()
+            .map_err(|_| NovaError::StatePoisoned)?;
+        table.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = table.get(root).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        table.insert(root.to_path_buf(), Arc::downgrade(&lock));
+        Ok(lock)
+    }
+
     pub(crate) fn with_write_lock<T>(
         &self,
         target: &Path,
         operation: impl FnOnce() -> NovaResult<T>,
     ) -> NovaResult<T> {
+        let identity = Self::canonical_target(target)?;
+        let worktree = self
+            .repository_root(&identity)?
+            .map(|root| self.worktree_gate(&root))
+            .transpose()?;
+        // Lock order: worktree (shared), then canonical target (exclusive).
+        let _worktree_guard = worktree.as_ref().map(|gate| gate.blocking_read());
         let lock = {
             let mut table = self
                 .inner
                 .write_locks
                 .lock()
                 .map_err(|_| NovaError::StatePoisoned)?;
-            table
-                .entry(target.to_path_buf())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+            table.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = table.get(&identity).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                table.insert(identity.clone(), Arc::downgrade(&lock));
+                lock
+            }
         };
         let _guard = lock.lock().map_err(|_| NovaError::StatePoisoned)?;
+        if Self::canonical_target(target)? != identity {
+            return Err(NovaError::StaleWrite);
+        }
         operation()
     }
 
-    pub(crate) async fn git_mutation_lock(
-        &self,
-        root: &Path,
-    ) -> NovaResult<tokio::sync::OwnedMutexGuard<()>> {
-        let lock = {
-            let mut table = self
-                .inner
-                .git_locks
-                .lock()
-                .map_err(|_| NovaError::StatePoisoned)?;
-            table
-                .entry(root.to_path_buf())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        Ok(lock.lock_owned().await)
+    pub(crate) async fn git_mutation_lock(&self, root: &Path) -> NovaResult<GitMutationGuard> {
+        let root = tokio::fs::canonicalize(root).await?;
+        let registry = self.clone();
+        let scan_root = root.clone();
+        let repo = tokio::task::spawn_blocking(move || registry.repository_root(&scan_root))
+            .await
+            .map_err(|_| NovaError::StatePoisoned)??;
+        let repo = repo.ok_or_else(|| NovaError::InvalidInput("Git worktree required".into()))?;
+        if !self.is_allowed(&repo) {
+            return Err(NovaError::OutsideAllowedRoot);
+        }
+        // Linked worktrees have distinct worktree gates but share Git refs.
+        let common = crate::git_ops::run_git(
+            &repo,
+            "common_dir",
+            vec![
+                "rev-parse".into(),
+                "--path-format=absolute".into(),
+                "--git-common-dir".into(),
+            ],
+        )
+        .await?;
+        let common = tokio::fs::canonicalize(common.stdout.trim_end_matches(['\r', '\n'])).await?;
+        let common_gate = self.worktree_gate(&common)?;
+        let tree_gate = self.worktree_gate(&repo)?;
+        // Git locks shared repository metadata first, then the selected worktree.
+        let common = common_gate.write_owned().await;
+        let tree = tree_gate.write_owned().await;
+        Ok(GitMutationGuard {
+            _common: common,
+            _tree: tree,
+        })
     }
 
     pub(crate) fn inner_known_roots(&self) -> NovaResult<Vec<Workspace>> {
@@ -390,6 +463,60 @@ pub(crate) fn blocked(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn nested_workspace_and_file_writes_share_repository_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let nested = dir.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let registry = WorkspaceRegistry::new(dir.path(), &[]).unwrap();
+        let canonical = fs::canonicalize(dir.path()).unwrap();
+        let guard = registry.git_mutation_lock(&nested).await.unwrap();
+        let gate = registry.worktree_gate(&canonical).unwrap();
+        assert!(gate.try_read().is_err());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let target = nested.join("file");
+        let copy = registry.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            copy.with_write_lock(&target, || {
+                done_tx.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        assert!(done_rx.try_recv().is_err());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_aliases_share_lock_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            WorkspaceRegistry::canonical_target(&real.join("new")).unwrap(),
+            WorkspaceRegistry::canonical_target(&alias.join("new")).unwrap()
+        );
+    }
+
     #[test]
     fn stable_workspace_ids_and_default_isolation() {
         let tmp = tempfile::tempdir().unwrap();

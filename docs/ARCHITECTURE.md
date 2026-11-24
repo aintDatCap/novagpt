@@ -24,7 +24,7 @@ novagpt-cli
 
 One server can serve multiple simultaneous MCP clients on the same filesystem. MCP session IDs represent transport sessions, not ChatGPT conversations. Each operation uses the default configured root unless another explicitly approved workspace ID is supplied.
 
-Canonical workspace roots and path guards reject disallowed paths and selected sensitive files. Optimistic SHA-256 changes are checked under per-file locks. Git index operations coordinate per canonical root. OS-level hostile path races still require further testing.
+Canonical workspace roots and path guards reject disallowed paths and selected sensitive files. Optimistic SHA-256 changes are checked under per-file locks. Structured Git mutations lock the canonical Git common directory and worktree; cooperative file mutations hold a shared worktree gate and an exclusive canonical-target lock. Nested workspace aliases share these gates. Arbitrary shell commands and external processes do not participate. OS-level hostile path races still require further testing.
 
 The MCP HTTP server binds to loopback and requires the shared user token. It accepts a bearer header or the private URL query parameter `novagpt_token`; the query secret is removed before MCP protocol handling. The token is private user state outside the repository. A previously issued query key is accepted temporarily for existing private connections, but is not emitted in new URLs.
 

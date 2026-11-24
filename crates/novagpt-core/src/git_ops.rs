@@ -266,12 +266,21 @@ impl WorkspaceRegistry {
             _ => {}
         }
 
-        // Independent reads can proceed; index/branch mutations serialize per root only.
+        // Independent reads can proceed; Git mutations exclude cooperative file writers.
         let _index_guard = if index_mutation {
             Some(self.git_mutation_lock(Path::new(&root)).await?)
         } else {
             None
         };
+        if matches!(action.as_str(), "stage" | "unstage" | "restore") {
+            args.truncate(
+                args.iter()
+                    .position(|arg| arg == "--")
+                    .ok_or_else(|| NovaError::InvalidInput("Missing path separator".into()))?
+                    + 1,
+            );
+            args.extend(self.git_file_args(&request)?);
+        }
         if action == "commit" {
             self.verify_staged_paths(&request).await?;
         }
@@ -308,6 +317,7 @@ fn git_command(root: &Path, args: &[String]) -> Command {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
