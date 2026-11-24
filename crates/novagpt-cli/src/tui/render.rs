@@ -1,7 +1,6 @@
 //! Stateless Ratatui widgets and responsive layout (Ratatui 0.29).
 use super::model::{
-    App, AuthState, ChatRole, Confirm, Field, Level, Modal, ServerState, command_label,
-    config_label,
+    App, AuthState, Confirm, Field, Level, Modal, ServerState, command_label, config_label,
 };
 use crate::i18n::{Language, LanguageChoice, Messages};
 use ratatui::{
@@ -867,127 +866,6 @@ fn config(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), split[1]);
     }
 }
-/// Keep the editable tail visible while preserving the full draft for sending.
-/// Wrap by terminal cell width, not UTF-8 byte count.
-fn chat_composer_lines(input: &str, width: usize, height: usize) -> Vec<Line<'static>> {
-    use unicode_width::UnicodeWidthChar;
-
-    if width == 0 || height == 0 {
-        return Vec::new();
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut cells = 0;
-    for ch in input.chars().chain(std::iter::once('▏')) {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cells + char_width > width && !current.is_empty() {
-            lines.push(Line::from(std::mem::take(&mut current)));
-            cells = 0;
-        }
-        current.push(ch);
-        cells += char_width;
-    }
-    lines.push(Line::from(current));
-    lines
-        .into_iter()
-        .rev()
-        .take(height)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
-
-fn chat(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let lang = app.language();
-    // Grow the message composer on taller terminals without hiding the transcript.
-    let input_height = if area.height < 8 {
-        area.height.min(5)
-    } else {
-        (area.height / 3).clamp(4, 8)
-    };
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(input_height)])
-        .split(area);
-    let visible = sections[0].height.saturating_sub(2) as usize;
-    let total = app.chat.messages.len();
-    let end = total.saturating_sub(app.chat.scroll);
-    let start = end.saturating_sub(visible);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for message in app
-        .chat
-        .messages
-        .iter()
-        .skip(start)
-        .take(end.saturating_sub(start))
-    {
-        let (prefix, color) = match message.role {
-            ChatRole::User => (Messages::chat_role_you(lang), ACCENT),
-            ChatRole::Assistant => (Messages::chat_role_chatgpt(lang), OK),
-            ChatRole::Notice => (Messages::chat_role_note(lang), MUTED),
-        };
-        let mut first = true;
-        for line in message.text.lines() {
-            if first {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{prefix}> "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(line.to_owned()),
-                ]));
-                first = false;
-            } else {
-                lines.push(Line::from(format!("   {line}")));
-            }
-        }
-        lines.push(Line::from(""));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            Messages::chat_empty(lang),
-            Style::default().fg(MUTED),
-        )));
-    }
-    let title = if app.chat.pending {
-        Messages::chat_sending(lang)
-    } else {
-        Messages::chat_page_title(lang)
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(panel(title)),
-        sections[0],
-    );
-    let status = app
-        .chat
-        .error
-        .clone()
-        .unwrap_or_else(|| Messages::chat_input_hint(lang).to_owned());
-    let status_color = if app.chat.error.is_some() { BAD } else { MUTED };
-    let input_block = panel(Messages::chat_input_title(lang));
-    let inner = input_block.inner(sections[1]);
-    frame.render_widget(input_block, sections[1]);
-    let input_sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let lines = chat_composer_lines(
-        &app.chat.input,
-        usize::from(input_sections[0].width),
-        usize::from(input_sections[0].height),
-    );
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().fg(Color::White)),
-        input_sections[0],
-    );
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(status_color)),
-        input_sections[1],
-    );
-}
 fn centered(area: Rect, percent_w: u16, h: u16) -> Rect {
     let width = area
         .width
@@ -1260,7 +1138,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         Messages::tab_overview(lang),
         Messages::tab_activity(lang),
         Messages::tab_settings(lang),
-        Messages::tab_chat(lang),
         Messages::tab_usage(lang),
     ])
     .select(app.tab)
@@ -1271,7 +1148,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
         0 => commands(frame, app, slots[2]),
         1 => dashboard(frame, app, slots[2]),
         2 => config(frame, app, slots[2]),
-        3 => chat(frame, app, slots[2]),
         _ => usage(frame, app, slots[2]),
     }
     let keys = if app.modal.is_some() {
@@ -1281,7 +1157,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &App) {
             0 => Messages::keys_overview(lang),
             1 => Messages::keys_activity(lang),
             2 => Messages::fields_enter_edit_s_save_tab_views(lang),
-            3 => Messages::chat_input_hint(lang),
             _ => Messages::usage_refresh_hint(lang),
         }
     };

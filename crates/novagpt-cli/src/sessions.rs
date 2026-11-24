@@ -23,7 +23,7 @@ const MAX_ID: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
-    /// A conversation started from the TUI chat page.
+    /// Legacy record from the removed TUI chat page.
     Chat,
     /// A subagent worker conversation.
     Subagent,

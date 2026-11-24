@@ -175,24 +175,22 @@ mod tests {
         assert_eq!(a.tab, 1);
         a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 2);
-        a.key(key(KeyCode::Tab));
-        assert_eq!(a.tab, 3);
         assert!(matches!(a.key(key(KeyCode::Tab)), Some(Effect::LoadUsage)));
-        assert_eq!(a.tab, 4);
+        assert_eq!(a.tab, 3);
         a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 0);
         assert!(matches!(
             a.key(key(KeyCode::BackTab)),
             Some(Effect::LoadUsage)
         ));
-        assert_eq!(a.tab, 4);
-        a.key(key(KeyCode::Left));
         assert_eq!(a.tab, 3);
         a.key(key(KeyCode::Left));
         assert_eq!(a.tab, 2);
-        a.key(key(KeyCode::Right));
+        assert!(matches!(
+            a.key(key(KeyCode::Right)),
+            Some(Effect::LoadUsage)
+        ));
         assert_eq!(a.tab, 3);
-        a.key(key(KeyCode::Tab));
         a.key(key(KeyCode::Tab));
         assert_eq!(a.tab, 0);
         let selected = a.key(key(KeyCode::Char('4')));
@@ -1142,90 +1140,6 @@ mod tests {
             .collect::<String>()
     }
 
-    #[test]
-    fn chat_page_types_sends_and_ignores_a_second_send_while_pending() {
-        let mut a = app_with(browser_settings());
-        a.tab = 3;
-        for ch in "ciao".chars() {
-            a.key(key(KeyCode::Char(ch)));
-        }
-        let effect = a.key(key(KeyCode::Enter));
-        let Some(Effect::ChatSend { prompt, .. }) = effect else {
-            panic!("expected a chat send effect");
-        };
-        assert_eq!(prompt, "ciao");
-        assert!(a.chat.input.is_empty());
-        assert!(a.chat.pending);
-        assert_eq!(a.chat.messages.len(), 1);
-        assert_eq!(a.chat.messages[0].text, "ciao");
-        // A second Enter while a reply is pending must not queue another prompt.
-        assert!(a.key(key(KeyCode::Enter)).is_none());
-        assert_eq!(a.chat.messages.len(), 1);
-    }
-
-    #[test]
-    fn chat_composer_keeps_the_draft_tail_visible_after_wrapping_and_resize() {
-        let mut app = app_with(browser_settings());
-        app.tab = 3;
-        for ch in format!("{}界界TAILEND", "x".repeat(300)).chars() {
-            app.key(key(KeyCode::Char(ch)));
-        }
-        assert_eq!(app.chat.input.chars().count(), 309);
-        for (width, height) in [(64, 22), (36, 14), (30, 11)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| render::draw(frame, &app)).unwrap();
-            let output = screen_of(&terminal);
-            assert!(
-                output.contains("TAILEND▏"),
-                "the end of a long draft must remain visible at {width}x{height}"
-            );
-        }
-        for _ in 0..7 {
-            app.key(key(KeyCode::Backspace));
-        }
-        let mut terminal = Terminal::new(TestBackend::new(36, 14)).unwrap();
-        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
-        assert!(screen_of(&terminal).contains("界") || screen_of(&terminal).contains("x"));
-        assert!(!screen_of(&terminal).contains("TAILEND"));
-        // Scrolling only affects the viewport; it must not change the submitted text.
-        let expected = app.chat.input.clone();
-        let Some(Effect::ChatSend { prompt, .. }) = app.key(key(KeyCode::Enter)) else {
-            panic!("expected a chat send effect");
-        };
-        assert_eq!(prompt, expected);
-    }
-
-    #[test]
-    fn chat_requires_the_browser_setting() {
-        let mut a = app();
-        a.tab = 3;
-        a.key(key(KeyCode::Char('x')));
-        assert!(a.key(key(KeyCode::Enter)).is_none());
-        assert!(!a.chat.pending);
-        assert!(a.status.to_lowercase().contains("browser"));
-    }
-
-    #[test]
-    fn chat_reply_is_shown_and_links_the_conversation() {
-        let mut a = app_with(browser_settings());
-        a.tab = 3;
-        a.chat.pending = true;
-        a.on_event(OperationEvent::ChatFinished(Ok(model::ChatOutcome {
-            content: "risposta".into(),
-            conversation_url: Some("https://chatgpt.com/c/aaa".into()),
-        })));
-        assert!(!a.chat.pending);
-        assert_eq!(
-            a.chat.conversation_url.as_deref(),
-            Some("https://chatgpt.com/c/aaa")
-        );
-        assert_eq!(a.chat.messages.back().expect("reply").text, "risposta");
-        assert_eq!(
-            a.chat.messages.back().expect("reply").role,
-            model::ChatRole::Assistant
-        );
-    }
-
     fn session(kind: crate::sessions::SessionKind, url: &str) -> crate::sessions::SessionRecord {
         crate::sessions::SessionRecord {
             id: "tui-chat".into(),
@@ -1235,32 +1149,6 @@ mod tests {
             updated_ms: 2,
             workspace_id: None,
         }
-    }
-
-    #[test]
-    fn reopening_a_tui_session_restores_its_conversation_url() {
-        let mut a = app_with(browser_settings());
-        a.sessions = vec![session(
-            crate::sessions::SessionKind::Chat,
-            "https://chatgpt.com/c/aaa",
-        )];
-        a.tab = 3;
-        let effect = a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        assert!(matches!(effect, Some(Effect::LoadSessions)));
-        assert!(matches!(a.modal, Some(Modal::Sessions)));
-        let effect = a.key(key(KeyCode::Enter));
-        let Some(Effect::ReopenSession { url, chat, .. }) = effect else {
-            panic!("expected a reopen effect");
-        };
-        assert!(chat);
-        assert_eq!(url, "https://chatgpt.com/c/aaa");
-        assert_eq!(
-            a.chat.conversation_url.as_deref(),
-            Some("https://chatgpt.com/c/aaa")
-        );
-        assert_eq!(a.chat.messages.len(), 1);
-        assert_eq!(a.chat.messages[0].role, model::ChatRole::Notice);
-        assert_eq!(a.tab, 3);
     }
 
     #[test]
@@ -1274,10 +1162,9 @@ mod tests {
         a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(matches!(a.modal, Some(Modal::Sessions)));
         let effect = a.key(key(KeyCode::Enter));
-        let Some(Effect::ReopenSession { chat, url, .. }) = effect else {
+        let Some(Effect::ReopenSession { url, .. }) = effect else {
             panic!("expected a reopen effect");
         };
-        assert!(!chat);
         assert_eq!(url, "https://chatgpt.com/c/bbb");
         assert_eq!(
             a.tab, 0,
@@ -1316,33 +1203,32 @@ mod tests {
     }
 
     #[test]
-    fn chat_page_and_sessions_modal_render_without_prompt_content() {
+    fn legacy_chat_sessions_reopen_only_in_browser() {
         let mut a = app_with(browser_settings());
-        a.tab = 3;
-        let mut terminal = Terminal::new(TestBackend::new(110, 30)).expect("terminal");
-        terminal.draw(|frame| render::draw(frame, &a)).unwrap();
-        let shown = screen_of(&terminal);
-        assert!(shown.contains("CHATGPT CHAT"));
-        assert!(shown.contains("No messages yet"));
-        assert!(shown.contains("Message"));
         a.sessions = vec![session(
             crate::sessions::SessionKind::Chat,
             "https://chatgpt.com/c/aaa",
         )];
-        a.modal = Some(Modal::Sessions);
+        a.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).expect("terminal");
         terminal.draw(|frame| render::draw(frame, &a)).unwrap();
         let shown = screen_of(&terminal);
-        assert!(shown.contains("CHATGPT SESSIONS"));
-        assert!(shown.contains("https://chatgpt.com/c/aaa"));
-        assert!(shown.contains("TUI chat"));
+        assert!(shown.contains("Legacy chat"));
+        assert!(!shown.contains("CHATGPT CHAT"));
+        assert!(matches!(
+            a.key(key(KeyCode::Enter)),
+            Some(Effect::ReopenSession { .. })
+        ));
+        assert_eq!(a.tab, 0);
     }
+
     #[test]
     fn usage_tab_shows_labeled_graphs_and_refreshes_without_blocking_input() {
         let mut a = app();
         assert!(!a.persisted.usage_profiler_enabled);
-        a.tab = 3;
+        a.tab = 2;
         assert!(matches!(a.key(key(KeyCode::Tab)), Some(Effect::LoadUsage)));
-        assert_eq!(a.tab, 4);
+        assert_eq!(a.tab, 3);
         assert!(a.usage_loading);
 
         let mut report = novagpt_core::usage::UsageReport::default();

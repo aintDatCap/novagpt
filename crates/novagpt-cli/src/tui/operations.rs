@@ -7,17 +7,10 @@ use crate::{connection, tunnel};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::JoinHandle};
-
-/// One page id for the TUI chat. It is not an agent and never shares an
-/// agent conversation, even when the browser is the server's instance.
-const CHAT_TAB: &str = "tui-chat";
 
 pub(super) struct Controller {
     runtime: Handle,
@@ -25,7 +18,6 @@ pub(super) struct Controller {
     server: Option<JoinHandle<()>>,
     browser_login: Option<JoinHandle<()>>,
     agent_browser: Arc<Mutex<Option<novagpt_browser::ChatGptBrowser>>>,
-    chat_tab_open: Arc<AtomicBool>,
     installer: Option<JoinHandle<()>>,
 }
 impl Controller {
@@ -36,7 +28,6 @@ impl Controller {
             server: None,
             browser_login: None,
             agent_browser: Arc::new(Mutex::new(None)),
-            chat_tab_open: Arc::new(AtomicBool::new(false)),
             installer: None,
         }
     }
@@ -98,93 +89,21 @@ impl Controller {
                     let _ = tx.send(OperationEvent::SessionsLoaded(sessions));
                 });
             }
-            Effect::ChatNew => {
-                let browser = self.agent_browser.lock().ok().and_then(|slot| slot.clone());
-                let opened = Arc::clone(&self.chat_tab_open);
-                self.runtime.spawn(async move {
-                    if let Some(browser) = browser {
-                        let _ = browser.close(CHAT_TAB).await;
-                    }
-                    opened.store(false, Ordering::Release);
-                });
-            }
-            Effect::ChatSend { prompt, settings } => {
+            Effect::ReopenSession { url, settings } => {
                 let tx = self.tx.clone();
                 let slot = Arc::clone(&self.agent_browser);
-                let opened = Arc::clone(&self.chat_tab_open);
-                self.runtime.spawn(async move {
-                    let browser = match chat_browser(&slot, &settings).await {
-                        Ok(browser) => browser,
-                        Err(message) => {
-                            let _ = tx.send(OperationEvent::ChatFinished(Err(message)));
-                            return;
-                        }
-                    };
-                    if !opened.load(Ordering::Acquire) {
-                        if let Err(error) = browser.open_home(CHAT_TAB).await {
-                            let _ = tx.send(OperationEvent::ChatFinished(Err(error.to_string())));
-                            return;
-                        }
-                        opened.store(true, Ordering::Release);
-                    }
-                    match browser.send(CHAT_TAB, &prompt).await {
-                        Ok(reply) => {
-                            let conversation_url = reply.conversation_url.clone();
-                            let sessions = persist_chat_session(conversation_url.as_deref()).await;
-                            let _ = tx.send(OperationEvent::ChatFinished(Ok(
-                                super::model::ChatOutcome {
-                                    content: reply.content,
-                                    conversation_url,
-                                },
-                            )));
-                            if let Some(sessions) = sessions {
-                                let _ = tx.send(OperationEvent::SessionsLoaded(sessions));
-                            }
-                        }
-                        Err(error) => {
-                            if matches!(
-                                error,
-                                novagpt_browser::BrowserError::Unavailable
-                                    | novagpt_browser::BrowserError::NotRunning
-                                    | novagpt_browser::BrowserError::Protocol
-                            ) {
-                                // The owned tab is gone; the next attempt reopens it.
-                                opened.store(false, Ordering::Release);
-                            }
-                            let _ = tx.send(OperationEvent::ChatFinished(Err(error.to_string())));
-                        }
-                    }
-                });
-            }
-            Effect::ReopenSession {
-                url,
-                chat,
-                settings,
-            } => {
-                let tx = self.tx.clone();
-                let slot = Arc::clone(&self.agent_browser);
-                let opened = Arc::clone(&self.chat_tab_open);
                 self.runtime.spawn(async move {
                     let result = async {
-                        let browser = chat_browser(&slot, &settings).await?;
-                        if chat {
-                            let _ = browser.close(CHAT_TAB).await;
-                            browser
-                                .open_at(CHAT_TAB, &url)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            opened.store(true, Ordering::Release);
-                        } else {
-                            browser.browse_open().await.map_err(|e| e.to_string())?;
-                            browser
-                                .browse_navigate(&url)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                        }
+                        let browser = session_browser(&slot, &settings).await?;
+                        browser.browse_open().await.map_err(|e| e.to_string())?;
+                        browser
+                            .browse_navigate(&url)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(())
                     }
                     .await;
-                    let _ = tx.send(OperationEvent::SessionReopened { chat, result });
+                    let _ = tx.send(OperationEvent::SessionReopened { result });
                 });
             }
             Effect::ExportAudit => {
@@ -427,7 +346,7 @@ impl Controller {
         let tx = self.tx.clone();
         let agent_browser = Arc::clone(&self.agent_browser);
         let session_runtime = self.runtime.clone();
-        // A browser already opened by the TUI chat owns the dedicated profile.
+        // A browser already opened for session history owns the dedicated profile.
         // The server must reuse that same handle instead of launching a second
         // Chrome on the same profile, which would fail with ProfileBusy.
         let existing_browser = self.agent_browser.lock().ok().and_then(|slot| slot.clone());
@@ -460,7 +379,7 @@ impl Controller {
                 };
                 let browser = if config.browser_enabled {
                     let browser = match existing_browser {
-                        // Reuse the chat-owned browser and the same profile.
+                        // Reuse the session-history browser and the same profile.
                         Some(browser) => browser,
                         None => {
                             let chrome =
@@ -679,7 +598,6 @@ impl Controller {
         if let Ok(mut handle) = self.agent_browser.lock() {
             *handle = None;
         }
-        self.chat_tab_open.store(false, Ordering::Release);
         if let Some(task) = self.server.take() {
             task.abort();
             self.report(Level::Info, "HTTP stop requested (task cancelled).");
@@ -689,8 +607,8 @@ impl Controller {
 }
 
 /// Reuse the server-owned browser when one exists (the same dedicated Chrome
-/// and profile), otherwise create one lazily for the TUI chat page.
-async fn chat_browser(
+/// and profile), otherwise create one lazily for session history.
+async fn session_browser(
     slot: &Arc<Mutex<Option<novagpt_browser::ChatGptBrowser>>>,
     settings: &LocalSettings,
 ) -> Result<novagpt_browser::ChatGptBrowser, String> {
@@ -717,21 +635,6 @@ async fn chat_browser(
     Ok(browser)
 }
 
-/// Record the chat conversation and return the refreshed index. Returns `None`
-/// when the conversation has no URL yet or the private index is unavailable.
-async fn persist_chat_session(url: Option<&str>) -> Option<Vec<crate::sessions::SessionRecord>> {
-    let url = url?.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let store = crate::sessions::SessionStore::open_default().ok()?;
-        store
-            .record(crate::sessions::SessionKind::Chat, "tui-chat", &url, None)
-            .ok()?;
-        Some(store.load())
-    })
-    .await
-    .ok()
-    .flatten()
-}
 impl Drop for Controller {
     fn drop(&mut self) {
         if let Ok(mut handle) = self.agent_browser.lock() {

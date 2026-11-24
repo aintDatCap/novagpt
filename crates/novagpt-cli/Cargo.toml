@@ -19,7 +19,6 @@ tokio.workspace = true
 clap.workspace = true
 tracing-subscriber.workspace = true
 ratatui.workspace = true
-unicode-width = "0.2"
 sys-locale = "0.3.2"
 crossterm.workspace = true
 serde.workspace = true

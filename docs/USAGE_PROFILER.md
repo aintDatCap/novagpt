@@ -19,7 +19,7 @@ No external analytics service or new dependency is required. The command reads t
 - Subagent turns have opaque task, agent and repository IDs. Ordinary MCP tool responses have a repository ID and a tool stage, but **do not claim an agent, task or ChatGPT conversation**: transport connections do not provide reliable conversation identity.
 - A duplicate `receipt_id` is accepted once within retained history. The typed core ledger aggregates per stage, task, repository, agent, and workflow. There is no new public MCP tool or client-facing schema change.
 
-**Limitations:** This first integration collects MCP response-length estimates and ChatGPT Web subagent turn-length estimates. NovaGPT does not yet have an API-backed model execution path that supplies billed provider usage, so the provider series and real cost can remain empty. The standalone TUI chat does not currently report a task profile. An empty provider chart means **no provider records**, not zero model cost.
+**Limitations:** This first integration collects MCP response-length estimates and ChatGPT Web subagent turn-length estimates. NovaGPT does not yet have an API-backed model execution path that supplies billed provider usage, so the provider series and real cost can remain empty. An empty provider chart means **no provider records**, not zero model cost.
 
 ## Privacy, retention and failure modes
 

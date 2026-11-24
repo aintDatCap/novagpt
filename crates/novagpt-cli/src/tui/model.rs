@@ -1,6 +1,6 @@
 //! UI state and pure keyboard transitions. Effects are executed by operations.rs.
 use crate::i18n::{self, Language};
-use crate::sessions::{SessionKind, SessionRecord};
+use crate::sessions::SessionRecord;
 use crate::settings::{ImportProfile, LocalSettings};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::{
@@ -65,37 +65,6 @@ pub(super) enum Level {
     Success,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ChatRole {
-    User,
-    Assistant,
-    Notice,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct ChatMessage {
-    pub role: ChatRole,
-    pub text: String,
-}
-
-/// In-memory transcript for the chat page. Prompts and replies are never
-/// persisted: ChatGPT remains the owner of the conversation history, and the
-/// TUI only remembers which conversation URL to continue.
-#[derive(Default)]
-pub(super) struct ChatState {
-    pub messages: VecDeque<ChatMessage>,
-    pub input: String,
-    pub pending: bool,
-    pub scroll: usize,
-    pub conversation_url: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug)]
-pub(super) struct ChatOutcome {
-    pub content: String,
-    pub conversation_url: Option<String>,
-}
 #[derive(Clone, Debug)]
 pub(super) struct LogEntry {
     pub time: String,
@@ -168,14 +137,8 @@ pub(super) enum Effect {
     LoadUsage,
     ExportAudit,
     LoadSessions,
-    ChatSend {
-        prompt: String,
-        settings: LocalSettings,
-    },
-    ChatNew,
     ReopenSession {
         url: String,
-        chat: bool,
         settings: LocalSettings,
     },
     Quit,
@@ -207,10 +170,8 @@ pub(super) enum OperationEvent {
     AuditLoaded(Result<Vec<novagpt_mcp::AuditEvent>, String>),
     UsageLoaded(Result<novagpt_core::usage::UsageReport, String>),
     AuditExported(Result<PathBuf, String>),
-    ChatFinished(Result<ChatOutcome, String>),
     SessionsLoaded(Vec<SessionRecord>),
     SessionReopened {
-        chat: bool,
         result: Result<(), String>,
     },
     Saved {
@@ -253,7 +214,6 @@ pub(super) struct App {
     pub log_offset: usize,
     pub status: String,
     pub clipboard_feedback: Option<String>,
-    pub chat: ChatState,
     pub sessions: Vec<SessionRecord>,
     pub session_selection: usize,
 }
@@ -312,7 +272,6 @@ impl App {
             log_offset: 0,
             status: "Ready".into(),
             clipboard_feedback: None,
-            chat: ChatState::default(),
             sessions: Vec::new(),
             session_selection: 0,
         };
@@ -630,48 +589,15 @@ impl App {
                     Err(msg) => self.log(Level::Error, msg),
                 }
             }
-            OperationEvent::ChatFinished(outcome) => {
-                self.chat.pending = false;
-                match outcome {
-                    Ok(outcome) => {
-                        if let Some(url) = outcome.conversation_url {
-                            self.chat.conversation_url = Some(url);
-                        }
-                        self.chat.messages.push_back(ChatMessage {
-                            role: ChatRole::Assistant,
-                            text: outcome.content,
-                        });
-                        self.chat.scroll = 0;
-                    }
-                    Err(message) => {
-                        self.chat.error =
-                            Some(i18n::Messages::chat_failed(self.language()).to_owned());
-                        self.log(Level::Error, message);
-                    }
-                }
-            }
             OperationEvent::SessionsLoaded(records) => {
                 self.sessions = records;
                 self.session_selection = self
                     .session_selection
                     .min(self.sessions.len().saturating_sub(1));
             }
-            OperationEvent::SessionReopened { chat, result } => match result {
-                Ok(()) => {
-                    if chat {
-                        self.log_localized(Level::Success, i18n::Messages::chat_reopened);
-                    } else {
-                        self.log_localized(Level::Success, i18n::Messages::session_opened);
-                    }
-                }
-                Err(message) => {
-                    if chat {
-                        self.chat.conversation_url = None;
-                        self.chat.error =
-                            Some(i18n::Messages::session_open_failed(self.language()).to_owned());
-                    }
-                    self.log(Level::Error, message);
-                }
+            OperationEvent::SessionReopened { result } => match result {
+                Ok(()) => self.log_localized(Level::Success, i18n::Messages::session_opened),
+                Err(message) => self.log(Level::Error, message),
             },
             OperationEvent::Saved { settings, outcome } => {
                 self.busy = false;
@@ -890,75 +816,14 @@ impl App {
         }
     }
     fn navigate_tab(&mut self, next: usize) -> Option<Effect> {
-        self.tab = next % 5;
-        if self.tab == 4 {
+        self.tab = next % 4;
+        if self.tab == 3 {
             self.usage_loading = true;
             Some(Effect::LoadUsage)
         } else {
             None
         }
     }
-    fn chat_key(&mut self, key: KeyEvent) -> Option<Effect> {
-        match key.code {
-            KeyCode::Esc => self.tab = 0,
-            KeyCode::Tab | KeyCode::Right => return self.navigate_tab(4),
-            KeyCode::BackTab | KeyCode::Left => return self.navigate_tab(2),
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.chat = ChatState::default();
-                self.log_localized(Level::Info, i18n::Messages::chat_new_conversation);
-                return Some(Effect::ChatNew);
-            }
-            KeyCode::Enter => return self.send_chat(),
-            KeyCode::Backspace => {
-                self.chat.input.pop();
-                self.chat.error = None;
-            }
-            KeyCode::Up => {
-                self.chat.scroll =
-                    (self.chat.scroll + 1).min(self.chat.messages.len().saturating_sub(1))
-            }
-            KeyCode::Down => self.chat.scroll = self.chat.scroll.saturating_sub(1),
-            KeyCode::Char(ch)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.chat.input.len() < 8_000 =>
-            {
-                self.chat.input.push(ch);
-                self.chat.error = None;
-            }
-            _ => {}
-        }
-        None
-    }
-
-    fn send_chat(&mut self) -> Option<Effect> {
-        if self.chat.pending {
-            self.log_localized(Level::Info, i18n::Messages::chat_pending_note);
-            return None;
-        }
-        if !self.persisted.browser_enabled {
-            self.log_localized(Level::Warn, i18n::Messages::chat_browser_required);
-            return None;
-        }
-        let prompt = self.chat.input.trim().to_owned();
-        if prompt.is_empty() {
-            return None;
-        }
-        self.chat.input.clear();
-        self.chat.error = None;
-        self.chat.scroll = 0;
-        self.chat.messages.push_back(ChatMessage {
-            role: ChatRole::User,
-            text: prompt.clone(),
-        });
-        self.chat.pending = true;
-        Some(Effect::ChatSend {
-            prompt,
-            settings: self.persisted.clone(),
-        })
-    }
-
     fn open_sessions(&mut self) -> Option<Effect> {
         self.session_selection = self
             .session_selection
@@ -969,24 +834,9 @@ impl App {
     }
 
     fn reopen(&mut self, record: SessionRecord) -> Option<Effect> {
-        let chat = record.kind == SessionKind::Chat;
-        if chat {
-            self.tab = 3;
-            self.chat = ChatState {
-                conversation_url: Some(record.url.clone()),
-                ..ChatState::default()
-            };
-            self.chat.messages.push_back(ChatMessage {
-                role: ChatRole::Notice,
-                text: i18n::Messages::chat_reopened_history_note(self.language()).to_owned(),
-            });
-            self.log_localized(Level::Info, i18n::Messages::chat_reopening);
-        } else {
-            self.log_localized(Level::Info, i18n::Messages::session_opening_in_browser);
-        }
+        self.log_localized(Level::Info, i18n::Messages::session_opening_in_browser);
         Some(Effect::ReopenSession {
             url: record.url,
-            chat,
             settings: self.persisted.clone(),
         })
     }
@@ -1370,9 +1220,6 @@ impl App {
             // The session list is global, so it is reachable from every page.
             return self.open_sessions();
         }
-        if self.tab == 3 {
-            return self.chat_key(key);
-        }
         match key.code {
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('a') if self.tab == 0 => {
@@ -1382,8 +1229,8 @@ impl App {
                 }
             }
             KeyCode::Tab | KeyCode::Right => return self.navigate_tab(self.tab + 1),
-            KeyCode::BackTab | KeyCode::Left => return self.navigate_tab(self.tab + 4),
-            KeyCode::Char('r') if self.tab == 4 && !self.usage_loading => {
+            KeyCode::BackTab | KeyCode::Left => return self.navigate_tab(self.tab + 3),
+            KeyCode::Char('r') if self.tab == 3 && !self.usage_loading => {
                 self.usage_loading = true;
                 return Some(Effect::LoadUsage);
             }

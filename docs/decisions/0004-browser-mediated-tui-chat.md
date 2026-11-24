@@ -3,6 +3,8 @@
 **Date:** 2026-11-09
 **Status:** Accepted (manual-only project setup superseded by [ADR 0005](0005-automatic-subagent-project.md)). Deterministic tests implemented; live ChatGPT login, Cloudflare and reply completion remain unverified.
 
+> Historical decision: the terminal chat composer was removed in November 2026. The private session index remains; all records reopen in the dedicated browser.
+
 ## Context
 
 NovaGPT's product contract treats ChatGPT as the MCP client and NovaGPT as the
