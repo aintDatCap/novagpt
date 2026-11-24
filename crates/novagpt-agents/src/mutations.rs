@@ -1,8 +1,8 @@
 //! Authenticated workspace mutations and capability probes.
 use super::{
     AgentCreateReceipt, AgentError, AgentManager, AgentPatchReceipt, AgentResult, AgentRole,
-    AgentState, AgentToolProbe, MAX_AGENT_PATCH_BYTES, MAX_COMPLETION_ATTEMPTS,
-    MAX_CREATE_ATTEMPTS, MAX_PATCH_ATTEMPTS,
+    AgentState, AgentToolProbe, Entry, MAX_AGENT_PATCH_BYTES, MAX_CREATE_ATTEMPTS,
+    MAX_PATCH_ATTEMPTS,
 };
 
 /// Compare workspace-relative paths regardless of the platform separator.
@@ -11,6 +11,27 @@ use super::{
 /// this same run had just created.
 fn same_relative_path(left: &str, right: &str) -> bool {
     left.replace('\\', "/") == right.replace('\\', "/")
+}
+
+impl Entry {
+    fn authorize_mutation(
+        &mut self,
+        code: &str,
+        available: bool,
+        allow_waiting: bool,
+    ) -> AgentResult<()> {
+        if !self.ready
+            || self.info.role != AgentRole::Implementer
+            || !(self.info.state == AgentState::Running
+                || (allow_waiting && self.info.state == AgentState::Waiting))
+            || self.completion_claimed
+            || !available
+            || !self.accept_code(code)
+        {
+            return Err(AgentError::PatchDenied);
+        }
+        Ok(())
+    }
 }
 
 impl AgentManager {
@@ -25,14 +46,7 @@ impl AgentManager {
     ) -> AgentResult<AgentToolProbe> {
         let mut entries = self.inner.entries.lock().await;
         let entry = entries.get_mut(id).ok_or(AgentError::PatchDenied)?;
-        if !entry.ready
-            || entry.info.role != AgentRole::Implementer
-            || entry.info.state != AgentState::Running
-            || entry.completion_claimed
-            || !entry.accept_code(code)
-        {
-            return Err(AgentError::PatchDenied);
-        }
+        entry.authorize_mutation(code, true, false)?;
         let capability = match capability {
             "subagent_apply_patch" => "subagent_apply_patch",
             "subagent_create_file" => "subagent_create_file",
@@ -58,6 +72,13 @@ impl AgentManager {
         if patch.is_empty() || patch.len() > MAX_AGENT_PATCH_BYTES {
             return Err(AgentError::PatchRejected);
         }
+        // Queue asynchronously; transfer the owned guard into blocking I/O.
+        let gate = self
+            .patch_gate(id)
+            .await
+            .map_err(|_| AgentError::PatchDenied)?
+            .lock_owned()
+            .await;
         let id = id.to_owned();
         let code = code.to_owned();
         let patch = patch.to_owned();
@@ -65,30 +86,11 @@ impl AgentManager {
         tokio::task::spawn_blocking(move || {
             let relative =
                 novagpt_core::patch_target(&patch).map_err(|_| AgentError::PatchRejected)?;
-            let gate = manager
-                .inner
-                .entries
-                .blocking_lock()
-                .get(&id)
-                .ok_or(AgentError::PatchDenied)?
-                .patch_gate
-                .clone();
-            let _gate = gate.blocking_lock();
+            let _gate = gate;
             let workspace_id = {
                 let mut entries = manager.inner.entries.blocking_lock();
                 let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
-                if !entry.ready
-                    || entry.info.role != AgentRole::Implementer
-                    || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
-                    || entry.completion_claimed
-                    || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
-                    || entry.patch_attempts >= MAX_PATCH_ATTEMPTS
-                {
-                    return Err(AgentError::PatchDenied);
-                }
-                if !entry.accept_code(&code) {
-                    return Err(AgentError::PatchDenied);
-                }
+                entry.authorize_mutation(&code, entry.patch_attempts < MAX_PATCH_ATTEMPTS, true)?;
                 entry.record_activity("patch_attempt", "Authenticated patch request")?;
                 let workspace_id = entry.info.workspace_id.clone();
                 let target = manager
@@ -151,37 +153,27 @@ impl AgentManager {
             return Err(AgentError::CreateRejected);
         }
         let manager = self.clone();
+        // Queue asynchronously; transfer the owned guard into blocking I/O.
+        let gate = self
+            .patch_gate(id)
+            .await
+            .map_err(|_| AgentError::PatchDenied)?
+            .lock_owned()
+            .await;
         let id = id.to_owned();
         let code = code.to_owned();
         let path = path.to_owned();
         let content = content.to_owned();
         tokio::task::spawn_blocking(move || {
-            let gate = manager
-                .inner
-                .entries
-                .blocking_lock()
-                .get(&id)
-                .ok_or(AgentError::PatchDenied)?
-                .patch_gate
-                .clone();
-            // Holding the per-agent gate until the blocking write finishes
-            // prevents cancellation, completion and new runs from racing it.
-            let _guard = gate.blocking_lock();
+            let _gate = gate;
             let workspace_id = {
                 let mut entries = manager.inner.entries.blocking_lock();
                 let entry = entries.get_mut(&id).ok_or(AgentError::PatchDenied)?;
-                if !entry.ready
-                    || entry.info.role != AgentRole::Implementer
-                    || !matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
-                    || entry.completion_claimed
-                    || entry.completion_failures >= MAX_COMPLETION_ATTEMPTS
-                    || entry.create_attempts >= MAX_CREATE_ATTEMPTS
-                {
-                    return Err(AgentError::PatchDenied);
-                }
-                if !entry.accept_code(&code) {
-                    return Err(AgentError::PatchDenied);
-                }
+                entry.authorize_mutation(
+                    &code,
+                    entry.create_attempts < MAX_CREATE_ATTEMPTS,
+                    true,
+                )?;
                 entry.record_activity("create_attempt", "Authenticated file creation request")?;
                 entry.create_attempts += 1;
                 entry.info.workspace_id.clone()

@@ -854,7 +854,7 @@ impl AgentManager {
 
     pub async fn cancel(&self, id: &str) -> AgentResult<AgentInfo> {
         let gate = self.patch_gate(id).await?;
-        let _patch_guard = gate.lock().await;
+        let patch_guard = gate.lock_owned().await;
         let info = {
             let mut agents = self.inner.entries.lock().await;
             let entry = agents.get_mut(id).ok_or(AgentError::NotFound)?;
@@ -866,17 +866,25 @@ impl AgentManager {
             entry.updates.send_replace(entry.info.clone());
             entry.info.clone()
         };
-        self.inner.backend.cancel(id).await;
-        self.inner.backend.close(id).await;
-        self.cleanup_vm(id).await;
-        Ok(self
-            .inner
-            .entries
-            .lock()
-            .await
-            .get(id)
-            .map(|entry| entry.info.clone())
-            .unwrap_or(info))
+        // Cleanup must survive a disconnected cancellation RPC.
+        let manager = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let _guard = patch_guard;
+            manager.inner.backend.cancel(&id).await;
+            manager.inner.backend.close(&id).await;
+            manager.cleanup_vm(&id).await;
+            manager
+                .inner
+                .entries
+                .lock()
+                .await
+                .get(&id)
+                .map(|entry| entry.info.clone())
+                .unwrap_or(info)
+        })
+        .await
+        .map_err(|_| AgentError::Backend)
     }
 
     pub async fn status(&self, id: Option<&str>) -> AgentResult<AgentStatus> {
