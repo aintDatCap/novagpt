@@ -10,6 +10,8 @@ pub enum AgentError {
     NotFound,
     #[error("Private agent history unavailable; no assignment dispatched")]
     HistoryUnavailable,
+    #[error("Agent manager is shutting down")]
+    ShuttingDown,
     #[error("Maximum concurrent subagent count reached")]
     Capacity,
     #[error(

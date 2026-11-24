@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -162,6 +162,8 @@ struct Inner {
     workspaces: WorkspaceRegistry,
     vm: OnceLock<VmManager>,
     spawn_gate: Mutex<()>,
+    stopping: AtomicBool,
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tab_gate: Mutex<()>,
     entries: Mutex<HashMap<String, Entry>>,
     history: OnceLock<Arc<history::History>>,
@@ -188,6 +190,8 @@ impl AgentManager {
                 workspaces,
                 vm: OnceLock::new(),
                 spawn_gate: Mutex::new(()),
+                stopping: AtomicBool::new(false),
+                tasks: std::sync::Mutex::new(Vec::new()),
                 tab_gate: Mutex::new(()),
                 entries: Mutex::new(HashMap::new()),
                 history: OnceLock::new(),
@@ -362,6 +366,9 @@ impl AgentManager {
         // Admission is serialized only across spawns. VM conversion/startup is
         // allowed to await without locking any unrelated agent actions.
         let _spawn_guard = self.inner.spawn_gate.lock().await;
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(AgentError::ShuttingDown);
+        }
         {
             let agents = self.inner.entries.lock().await;
             if agents.len() >= MAX_RECORDS {
@@ -516,7 +523,7 @@ impl AgentManager {
         workspace_id: String,
     ) {
         let manager = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let outcome = async {
                 if must_create {
                     let _tab_guard = manager.inner.tab_gate.lock().await;
@@ -669,6 +676,49 @@ impl AgentManager {
                 manager.cleanup_vm(&id).await;
             }
         });
+        let mut tasks = self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    /// Stop admission, cancel live workers and join backend tasks. The owner
+    /// must shut down the shared browser after this returns.
+    pub fn begin_shutdown(&self) {
+        self.inner.stopping.store(true, Ordering::Release);
+    }
+
+    pub async fn shutdown(&self) {
+        self.begin_shutdown();
+        let _admission = self.inner.spawn_gate.lock().await;
+        let ids: Vec<_> = self
+            .inner
+            .entries
+            .lock()
+            .await
+            .values()
+            .filter(|entry| matches!(entry.info.state, AgentState::Running | AgentState::Waiting))
+            .map(|entry| entry.info.id.clone())
+            .collect();
+        drop(_admission);
+        let mut cancellations = tokio::task::JoinSet::new();
+        for id in ids {
+            let manager = self.clone();
+            cancellations.spawn(async move {
+                let _ = manager.cancel(&id).await;
+            });
+        }
+        while cancellations.join_next().await.is_some() {}
+        let tasks =
+            std::mem::take(&mut *self.inner.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        for mut task in tasks {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 
     async fn is_active(&self, id: &str, epoch: u64) -> bool {
@@ -761,6 +811,9 @@ impl AgentManager {
         let gate = self.patch_gate(id).await?;
         let _patch_guard = gate.lock().await;
         let _admission = self.inner.spawn_gate.lock().await;
+        if self.inner.stopping.load(Ordering::Acquire) {
+            return Err(AgentError::ShuttingDown);
+        }
         let mut agents = self.inner.entries.lock().await;
         let active = agents
             .values()

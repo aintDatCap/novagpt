@@ -364,6 +364,10 @@ async fn separate_http_sessions_share_files_and_conflicts() {
         .await
         .expect("b stale");
     assert_eq!(stale["result"]["isError"], true);
+    assert_eq!(
+        stale["result"]["structuredContent"]["error_code"],
+        "stale_write"
+    );
     let (final_read, _) = rpc(&client, port, &token, Some(&sid_b), read(7))
         .await
         .expect("b observes");
@@ -378,6 +382,7 @@ async fn separate_http_sessions_share_files_and_conflicts() {
     let serialized = activity.to_string();
     assert!(serialized.contains("read"));
     assert!(serialized.contains("write"));
+    assert!(serialized.contains("write_error_stale_write"));
     assert!(!serialized.contains("original"));
     assert!(!serialized.contains("winner"));
     assert_eq!(activity["mode"], "metadata-only-persistent");

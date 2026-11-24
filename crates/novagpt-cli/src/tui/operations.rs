@@ -16,6 +16,7 @@ pub(super) struct Controller {
     runtime: Handle,
     tx: UnboundedSender<OperationEvent>,
     server: Option<JoinHandle<()>>,
+    server_stop: Option<tokio::sync::watch::Sender<bool>>,
     browser_login: Option<JoinHandle<()>>,
     agent_browser: Arc<Mutex<Option<novagpt_browser::ChatGptBrowser>>>,
     installer: Option<JoinHandle<()>>,
@@ -26,6 +27,7 @@ impl Controller {
             runtime,
             tx,
             server: None,
+            server_stop: None,
             browser_login: None,
             agent_browser: Arc::new(Mutex::new(None)),
             installer: None,
@@ -342,6 +344,8 @@ impl Controller {
             self.report(Level::Warn, "An HTTP server is already running.");
             return;
         }
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        self.server_stop = Some(stop_tx.clone());
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
         let tx = self.tx.clone();
         let agent_browser = Arc::clone(&self.agent_browser);
@@ -473,6 +477,10 @@ impl Controller {
             .await;
             match setup {
                 Ok(Ok((workspaces, mut extras, token))) => {
+                    if *stop_rx.borrow() {
+                        let _ = tx.send(OperationEvent::Server(ServerState::Stopped));
+                        return;
+                    }
                     if let Ok(mut handle) = agent_browser.lock() {
                         *handle = extras.browser.clone();
                     }
@@ -504,8 +512,8 @@ impl Controller {
                                             // Same validated public host used by the tunnel; never disable host validation.
                                             extras.http_public_hostname = Some(hostname);
                                             let server = async {
-                                                novagpt_mcp::run_http_on_listener_with(
-                                                    workspaces, listener, token, extras
+                                                novagpt_mcp::run_http_on_listener_with_shutdown(
+                                                    workspaces, listener, token, extras, wait_for_stop(stop_rx.clone())
                                                 ).await.is_ok()
                                             };
                                             tokio::pin!(server);
@@ -519,6 +527,8 @@ impl Controller {
                                                     output = tunnel.child.wait() => {
                                                         let _ = output;
                                                         audit.record("http_tunnel_stopped", true);
+                                                        let _ = stop_tx.send(true);
+                                                        let _ = (&mut server).await;
                                                         break Err("The ngrok tunnel closed".into());
                                                     }
                                                     () = tokio::time::sleep(Duration::from_millis(450)) => {
@@ -555,7 +565,14 @@ impl Controller {
                             }
                         }
                     } else {
-                        novagpt_mcp::run_http_with(workspaces, address, token, extras).await
+                        match tokio::net::TcpListener::bind(address).await {
+                            Ok(listener) => novagpt_mcp::run_http_on_listener_with_shutdown(workspaces, listener, token, extras, wait_for_stop(stop_rx.clone())).await,
+                            Err(error) => {
+                                extras.audit.record("http_bind_failed", true);
+                                extras.audit.flush().await;
+                                Err(error.into())
+                            }
+                        }
                     };
                     probe.abort();
                     if let Ok(mut handle) = agent_browser.lock() {
@@ -595,14 +612,42 @@ impl Controller {
         self.server = Some(task);
     }
     fn stop(&mut self) {
-        if let Ok(mut handle) = self.agent_browser.lock() {
-            *handle = None;
+        if let Some(stop) = self.server_stop.as_ref() {
+            let _ = stop.send(true);
+            self.report(Level::Info, "HTTP graceful shutdown requested.");
+        } else {
+            let _ = self.tx.send(OperationEvent::Server(ServerState::Stopped));
         }
-        if let Some(task) = self.server.take() {
-            task.abort();
-            self.report(Level::Info, "HTTP stop requested (task cancelled).");
+    }
+
+    /// Called from the blocking TUI thread, never from the Tokio executor.
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        self.stop();
+        if let Some(mut task) = self.server.take() {
+            self.runtime.block_on(async {
+                if tokio::time::timeout(Duration::from_secs(40), &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = task.await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TUI server shutdown timed out",
+                    ));
+                }
+                Ok(())
+            })?;
         }
-        let _ = self.tx.send(OperationEvent::Server(ServerState::Stopped));
+        Ok(())
+    }
+}
+
+async fn wait_for_stop(mut stop: tokio::sync::watch::Receiver<bool>) {
+    while !*stop.borrow_and_update() {
+        if stop.changed().await.is_err() {
+            break;
+        }
     }
 }
 

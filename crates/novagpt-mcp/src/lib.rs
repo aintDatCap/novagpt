@@ -80,6 +80,15 @@ impl NovaMcp {
     fn observed(&self, tool: &'static str, result: CallToolResult) -> CallToolResult {
         let failed = result.is_error.unwrap_or(false);
         self.extras.audit.record(tool, failed);
+        if failed
+            && let Some(code) = result
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.get("error_code"))
+                .and_then(|v| v.as_str())
+        {
+            self.extras.audit.record_error_code(tool, code);
+        }
         if self.extras.usage.enabled() {
             // Only the length is retained; response content never reaches telemetry.
             let chars =
@@ -648,8 +657,47 @@ struct AgentCancelArgs {
     cleanup_worktree: Option<bool>,
 }
 
+fn agent_reply<T: Serialize>(result: novagpt_agents::AgentResult<T>) -> CallToolResult {
+    use novagpt_agents::AgentError::*;
+    match result {
+        Ok(value) => tool_reply(Ok(value)),
+        Err(error) => {
+            let code = match &error {
+                Disabled => "agent_disabled",
+                NotFound => "agent_not_found",
+                HistoryUnavailable => "agent_history_unavailable",
+                ShuttingDown => "agent_shutting_down",
+                Capacity => "agent_capacity",
+                RecordCapacity => "agent_record_capacity",
+                Busy => "agent_busy",
+                Cancelled => "agent_cancelled",
+                NotWaiting => "agent_not_waiting",
+                Invalid | ConnectorMissing => "agent_invalid",
+                CompletionDenied => "agent_completion_denied",
+                ActivityDenied => "agent_activity_denied",
+                PatchDenied => "agent_patch_denied",
+                PatchRejected => "agent_patch_rejected",
+                CreateRejected => "agent_create_rejected",
+                Manual(_) => "agent_manual_action",
+                Backend => "agent_backend_unavailable",
+                VmUnavailable | VmLeaseEnded => "agent_vm_unavailable",
+            };
+            error_reply(format!("Invalid input: {error}"), code)
+        }
+    }
+}
+
+fn error_reply(message: String, code: &'static str) -> CallToolResult {
+    let mut response = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
+    response.structured_content = Some(serde_json::json!({"error": message, "error_code": code}));
+    response
+}
+
 fn external_reply<T: Serialize, E: std::fmt::Display>(result: Result<T, E>) -> CallToolResult {
-    tool_reply(result.map_err(|error| NovaError::InvalidInput(error.to_string())))
+    match result {
+        Ok(value) => tool_reply(Ok(value)),
+        Err(error) => error_reply(format!("Invalid input: {error}"), "external_failure"),
+    }
 }
 
 fn tool_reply<T: Serialize>(result: NovaResult<T>) -> CallToolResult {
@@ -662,10 +710,20 @@ fn tool_reply<T: Serialize>(result: NovaResult<T>) -> CallToolResult {
             response
         }
         Err(err) => {
-            let message = err.to_string();
-            let mut response = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
-            response.structured_content = Some(serde_json::json!({ "error": message }));
-            response
+            let code = match &err {
+                NovaError::OutsideAllowedRoot
+                | NovaError::BlockedPath
+                | NovaError::SymlinkWrite => "workspace_access_denied",
+                NovaError::UnknownWorkspace(_) => "workspace_unknown",
+                NovaError::StaleWrite => "stale_write",
+                NovaError::ReplacementCount(_) => "replacement_count",
+                NovaError::InvalidText | NovaError::BinaryFile => "invalid_text",
+                NovaError::TooLarge(_) => "limit_exceeded",
+                NovaError::InvalidInput(_) => "invalid_input",
+                NovaError::StatePoisoned => "state_unavailable",
+                NovaError::Io(_) => "filesystem_io",
+            };
+            error_reply(err.to_string(), code)
         }
     }
 }
@@ -1903,7 +1961,7 @@ impl NovaMcp {
     async fn subagent_spawn(&self, Parameters(args): Parameters<AgentSpawnArgs>) -> CallToolResult {
         let response = async {
             let Some(manager) = &self.extras.agents else {
-                return external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled));
+                return agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled));
             };
             let role = match args.role.as_str() {
                 "explorer" => AgentRole::Explorer,
@@ -1918,7 +1976,7 @@ impl NovaMcp {
             };
             // An optional display-name hint is not authorization. Write callbacks
             // validate the worker credential and assigned paths independently.
-            external_reply(
+            agent_reply(
                 manager
                     .spawn_with_connector_vm(
                         SpawnAgent {
@@ -1944,8 +2002,8 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentMessageArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(manager.message(&args.id, &args.message).await),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            Some(manager) => agent_reply(manager.message(&args.id, &args.message).await),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_message", response)
     }
@@ -1959,9 +2017,9 @@ impl NovaMcp {
     ) -> CallToolResult {
         let response = match &self.extras.agents {
             Some(manager) => {
-                external_reply(manager.resume(&args.id, args.manual_check_completed).await)
+                agent_reply(manager.resume(&args.id, args.manual_check_completed).await)
             }
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_resume", response)
     }
@@ -1974,8 +2032,8 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentStatusArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(manager.status(args.id.as_deref()).await),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            Some(manager) => agent_reply(manager.status(args.id.as_deref()).await),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_status", response)
     }
@@ -1985,12 +2043,12 @@ impl NovaMcp {
     )]
     async fn subagent_wait(&self, Parameters(args): Parameters<AgentWaitArgs>) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(
+            Some(manager) => agent_reply(
                 manager
                     .wait(&args.id, args.max_wait_seconds.unwrap_or(20))
                     .await,
             ),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_wait", response)
     }
@@ -2003,10 +2061,8 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentProgressArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => {
-                external_reply(manager.progress(&args.id, &args.code, &args.kind).await)
-            }
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            Some(manager) => agent_reply(manager.progress(&args.id, &args.code, &args.kind).await),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_progress", response)
     }
@@ -2019,12 +2075,12 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentActivityArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(
+            Some(manager) => agent_reply(
                 manager
                     .activity_since(&args.id, args.after_sequence.unwrap_or(0))
                     .await,
             ),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_activity", response)
     }
@@ -2037,7 +2093,7 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentActivityWaitArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(
+            Some(manager) => agent_reply(
                 manager
                     .wait_activity(
                         &args.id,
@@ -2047,7 +2103,7 @@ impl NovaMcp {
                     )
                     .await,
             ),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_activity_wait", response)
     }
@@ -2061,9 +2117,9 @@ impl NovaMcp {
     ) -> CallToolResult {
         let response = match &self.extras.agents {
             Some(manager) => {
-                external_reply(manager.finished(&args.id, &args.code, &args.result).await)
+                agent_reply(manager.finished(&args.id, &args.code, &args.result).await)
             }
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_finished", response)
     }
@@ -2076,15 +2132,15 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentPatchArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) if args.probe => external_reply(
+            Some(manager) if args.probe => agent_reply(
                 manager
                     .probe_tool(&args.id, &args.code, "subagent_apply_patch")
                     .await,
             ),
             Some(manager) => {
-                external_reply(manager.apply_patch(&args.id, &args.code, &args.patch).await)
+                agent_reply(manager.apply_patch(&args.id, &args.code, &args.patch).await)
             }
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_apply_patch", response)
     }
@@ -2097,17 +2153,17 @@ impl NovaMcp {
         Parameters(args): Parameters<AgentCreateFileArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) if args.probe => external_reply(
+            Some(manager) if args.probe => agent_reply(
                 manager
                     .probe_tool(&args.id, &args.code, "subagent_create_file")
                     .await,
             ),
-            Some(manager) => external_reply(
+            Some(manager) => agent_reply(
                 manager
                     .create_file(&args.id, &args.code, &args.path, &args.content)
                     .await,
             ),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_create_file", response)
     }
@@ -2117,8 +2173,8 @@ impl NovaMcp {
     )]
     async fn subagent_result(&self, Parameters(args): Parameters<IdArgs>) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(manager.result(&args.id).await),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            Some(manager) => agent_reply(manager.result(&args.id).await),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_result", response)
     }
@@ -2137,8 +2193,8 @@ impl NovaMcp {
                 )));
             }
             match &self.extras.agents {
-                Some(manager) => external_reply(manager.cancel(&args.id).await),
-                None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+                Some(manager) => agent_reply(manager.cancel(&args.id).await),
+                None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
             }
         }
         .await;
@@ -2153,8 +2209,8 @@ impl NovaMcp {
         Parameters(args): Parameters<IdArgs>,
     ) -> CallToolResult {
         let response = match &self.extras.agents {
-            Some(manager) => external_reply(manager.diagnostics(&args.id).await),
-            None => external_reply::<(), _>(Err(novagpt_agents::AgentError::Disabled)),
+            Some(manager) => agent_reply(manager.diagnostics(&args.id).await),
+            None => agent_reply::<()>(Err(novagpt_agents::AgentError::Disabled)),
         };
         self.observed("subagent_browser_diagnostics", response)
     }
@@ -2476,6 +2532,7 @@ where
     }
     let config = http_server_config(extras.http_public_hostname.as_deref())?;
     let audit = extras.audit.clone();
+    let cleanup = extras.clone();
     if extras.http_public_hostname.is_some() {
         audit.record("http_public_host_allowed", false);
     }
@@ -2496,11 +2553,71 @@ where
     audit.record("http_server_listening", false);
     let address = listener.local_addr()?;
     tracing::info!(%address, "NovaGPT MCP HTTP listening");
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server = async {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = stop_rx.await;
+            })
+            .await
+    };
+    tokio::pin!(server);
+    tokio::pin!(shutdown);
+    let result = tokio::select! {
+        result = &mut server => result,
+        () = &mut shutdown => {
+            audit.record("http_shutdown_requested", false);
+            if let Some(manager) = &cleanup.agents { manager.begin_shutdown(); }
+            let _ = stop_tx.send(());
+            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    audit.record("http_shutdown_drain_timeout", true);
+                    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP drain timed out"))
+                }
+            }
+        }
+    };
+    if let Some(manager) = cleanup.agents
+        && tokio::time::timeout(std::time::Duration::from_secs(12), manager.shutdown())
+            .await
+            .is_err()
+    {
+        audit.record("agent_shutdown_timeout", true);
+    }
+    if let Some(browser) = cleanup.browser
+        && tokio::time::timeout(std::time::Duration::from_secs(5), browser.shutdown())
+            .await
+            .is_err()
+    {
+        audit.record("browser_shutdown_timeout", true);
+    }
     audit.record("http_server_stopped", result.is_err());
     audit.flush().await;
     result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn agent_capacity_and_callback_denial_are_distinct() {
+        for (error, code) in [
+            (novagpt_agents::AgentError::Capacity, "agent_capacity"),
+            (
+                novagpt_agents::AgentError::ActivityDenied,
+                "agent_activity_denied",
+            ),
+            (
+                novagpt_agents::AgentError::HistoryUnavailable,
+                "agent_history_unavailable",
+            ),
+        ] {
+            let result = agent_reply::<()>(Err(error));
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(result.structured_content.unwrap()["error_code"], code);
+        }
+    }
 }

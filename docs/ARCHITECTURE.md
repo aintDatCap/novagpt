@@ -57,7 +57,7 @@ Subagent lifecycle audit events are server-observed, use fixed English stage lab
 
 The MCP audit keeps a 128-event in-memory fast view, while private disk history rotates plain-text active segments into Zstandard-compressed archives. The compressed history and active/legacy segments share a 100 MiB workspace budget with a 90-day archive age limit; audit data remains fixed-schema metadata only, never tool arguments, prompts, URLs or tokens. Legacy rotated raw log segments are not supported or imported. Archived events may be dropped after age or quota expiry, and a saturated bounded writer queue records a dropped-event counter.
 
-Graceful HTTP shutdown handles Ctrl+C and SIGTERM on Unix and flushes audit events. CLI-owned ngrok is stopped and reaped on normal termination. Forced process termination, power failures and all in-flight requests are not guaranteed to be recoverable.
+Graceful HTTP shutdown handles Ctrl+C and SIGTERM on Unix and the TUI stop signal. The server closes worker admission, allows a bounded HTTP drain, cancels active workers, joins tracked tasks, shuts down its owned Chrome, and flushes audit events. CLI-owned ngrok is stopped and reaped on normal termination. The TUI displays Stopping and rejects new start commands until shutdown completes. Drain and cleanup timeouts are separately audited; forced process termination, power failures and all in-flight requests are not guaranteed to be recoverable.
 
 The native driver boundary follows [ADR 0003](decisions/0003-native-browser-driver.md); the preceding opt-in architecture remains described in [ADR 0002](decisions/0002-optional-vm-and-browser-agents.md). Live ChatGPT account compatibility is outside the disposable browser fixture's coverage.
 
@@ -86,7 +86,7 @@ For local Rust iteration, `script/dev.py` builds once at startup and **never reb
 ## Known limitations
 
 - The full live public ChatGPT-to-ngrok integration has not been independently verified on every supported platform.
-- TUI shutdown currently aborts some async server tasks; complete graceful resource cleanup needs an end-to-end audit.
+- TUI HTTP shutdown is bounded; live authenticated Chrome and VM cleanup under timeout conditions still need end-to-end testing. Forced abort remains a last-resort fallback.
 - Shell commands run with host permissions; subprocess-tree cleanup and full sandboxing are not guaranteed.
 - VM guest control and some optional integrations require live testing. The managed ChromeDriver transport passed disposable Chrome 156 tests covering launch, patch, four-tab isolation, reconnect, Chrome crash/restart, profile persistence across application restart, screenshots, and the ChatGPT adapter's local browsing path. Live ChatGPT authentication, challenge handling, and response completion remain unverified; this is not a fully managed cloud environment.
 - Adapter input requires a visible, focusable tab. A window manager that refuses focus produces `InteractionBlocked` (no prompt submitted) instead of hidden background input.
@@ -111,3 +111,7 @@ All runtime behavior and security changes require relevant positive and negative
 ### Restart-safe worker metadata
 
 CLI-managed agent managers keep a private, versioned, atomically replaced history of up to 128 worker IDs, workspace IDs, roles, states and epochs outside the workspace. A per-history OS lock prevents competing writers. Assignments are recorded before dispatch. Recovered running/waiting records are reported as failed/interrupted, and recovered terminal records remain queryable without stored results. No prompts, replies, completion credentials, or mutation authorization are persisted; recovered records cannot be resumed or replayed. Check the actual workspace before issuing a fresh assignment. Terminal history writes are best-effort and failures are audited.
+
+### Structured MCP failures
+
+Tool errors preserve their human-readable message and include an additive stable `error_code` in structured content. Core filesystem/workspace errors and agent errors have distinct typed classifications; other external errors use `external_failure`. The audit retains the original tool event and a separate bounded tool/error classifier, not tool arguments or arbitrary error messages. HTTP status alone does not imply tool success.

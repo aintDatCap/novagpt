@@ -81,6 +81,7 @@ pub(super) enum AuthState {
 pub(super) enum ServerState {
     Stopped,
     Starting,
+    Stopping,
     Running,
     Failed,
 }
@@ -431,6 +432,9 @@ impl App {
             }
 
             OperationEvent::Server(s) => {
+                if self.server == ServerState::Stopping && s == ServerState::Running {
+                    return;
+                }
                 self.server = s;
                 if matches!(s, ServerState::Stopped | ServerState::Failed) {
                     self.running_config = None;
@@ -442,7 +446,10 @@ impl App {
                     self.command = 8;
                 }
             }
-            OperationEvent::TunnelReady => self.tunnel_ready = true,
+            OperationEvent::TunnelReady if self.server != ServerState::Stopping => {
+                self.tunnel_ready = true
+            }
+            OperationEvent::TunnelReady => {}
             OperationEvent::NgrokMissing => {
                 self.server = ServerState::Stopped;
                 self.running_config = None;
@@ -632,7 +639,9 @@ impl App {
         }
     }
     pub fn visible_commands(&self) -> Vec<usize> {
-        let mut commands = if matches!(self.server, ServerState::Running | ServerState::Starting) {
+        let mut commands = if self.server == ServerState::Stopping {
+            vec![2]
+        } else if matches!(self.server, ServerState::Running | ServerState::Starting) {
             if self.persisted.browser_enabled {
                 vec![8, 10, 1, 2]
             } else {
@@ -663,6 +672,10 @@ impl App {
 
     fn activate_command(&mut self, index: usize) -> Option<Effect> {
         self.command = index;
+        if self.server == ServerState::Stopping && matches!(index, 0 | 1 | 7 | 8 | 9 | 10) {
+            self.log_localized(Level::Warn, i18n::Messages::operation_in_progress);
+            return None;
+        }
         match index {
             0 => {
                 if self.browser_login_running {
@@ -1060,12 +1073,9 @@ impl App {
                 Some(Effect::InstallNgrok)
             }
             Confirm::Stop => {
-                self.server = ServerState::Stopped;
+                self.server = ServerState::Stopping;
                 self.tunnel_ready = false;
-                if !self.show_advanced {
-                    self.command = 0;
-                }
-                self.running_config = None;
+                self.command = 2;
                 Some(Effect::Stop)
             }
             Confirm::Save => {

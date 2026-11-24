@@ -35,6 +35,7 @@ fn state(s: ServerState, lang: Language) -> &'static str {
     match s {
         ServerState::Stopped => Messages::server_stopped(lang),
         ServerState::Starting => Messages::server_starting(lang),
+        ServerState::Stopping => Messages::server_stopping(lang),
         ServerState::Running => Messages::server_ready(lang),
         ServerState::Failed => Messages::server_failed(lang),
     }
@@ -42,7 +43,7 @@ fn state(s: ServerState, lang: Language) -> &'static str {
 fn state_color(s: ServerState) -> Color {
     match s {
         ServerState::Running => OK,
-        ServerState::Starting => WARN,
+        ServerState::Starting | ServerState::Stopping => WARN,
         ServerState::Failed => BAD,
         ServerState::Stopped => MUTED,
     }
@@ -268,6 +269,7 @@ fn service_lines(app: &App) -> Vec<Line<'static>> {
         ServerState::Running if app.tunnel_ready => Messages::next_show_url(lang),
         ServerState::Running => Messages::next_check_tunnel(lang),
         ServerState::Starting => Messages::waiting_for_mcp_server_verification(lang),
+        ServerState::Stopping => Messages::server_stopping(lang),
         _ => Messages::next_start_mcp(lang),
     };
     vec![

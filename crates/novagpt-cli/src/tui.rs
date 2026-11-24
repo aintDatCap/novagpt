@@ -122,7 +122,7 @@ pub fn run(
             }
         }
     }
-    Ok(())
+    controller.finish()
 }
 
 #[cfg(test)]
@@ -138,6 +138,26 @@ mod tests {
     fn app() -> App {
         App::new(PathBuf::from("."), LocalSettings::default(), false, vec![])
     }
+    #[test]
+    fn stopping_ignores_late_readiness_and_blocks_restart() {
+        let mut app = app();
+        app.on_event(OperationEvent::Server(ServerState::Running));
+        app.command = 1;
+        app.key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm(model::Confirm::Stop))
+        ));
+        app.key(key(KeyCode::Char('y')));
+        assert_eq!(app.server, ServerState::Stopping);
+        app.on_event(OperationEvent::Server(ServerState::Running));
+        app.on_event(OperationEvent::TunnelReady);
+        assert_eq!(app.server, ServerState::Stopping);
+        assert!(!app.tunnel_ready);
+        app.on_event(OperationEvent::Server(ServerState::Stopped));
+        assert_eq!(app.server, ServerState::Stopped);
+    }
+
     #[test]
     fn initial_launch_prepares_token_without_user_action() {
         let mut regular = app();

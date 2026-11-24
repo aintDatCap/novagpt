@@ -275,6 +275,11 @@ impl AuditTrail {
         self.record_with_agent(tool, failed, None);
     }
 
+    /// Classifier emitted by the server's typed error conversion.
+    pub(crate) fn record_error_code(&self, tool: &str, code: &str) {
+        self.record_with_agent(&format!("{tool}_error_{code}"), true, None);
+    }
+
     /// Server-owned lifecycle event, tagged with a validated opaque agent ID.
     pub fn record_agent(&self, tool: &'static str, failed: bool, agent_id: &str) {
         if valid_agent_id(agent_id) {
@@ -282,7 +287,7 @@ impl AuditTrail {
         }
     }
 
-    fn record_with_agent(&self, tool: &'static str, failed: bool, agent_id: Option<&str>) {
+    fn record_with_agent(&self, tool: &str, failed: bool, agent_id: Option<&str>) {
         // Only internal static tool identifiers are accepted, never user-controlled strings.
         if tool.is_empty()
             || tool.len() > 64

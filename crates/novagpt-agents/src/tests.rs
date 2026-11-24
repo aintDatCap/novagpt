@@ -2520,3 +2520,31 @@ async fn history_recovers_interrupted_worker_without_replaying() {
     assert!(!recovered.wait(&info.id, 1).await.unwrap().timed_out);
     assert!(recovered.message(&info.id, "do not replay").await.is_err());
 }
+
+#[tokio::test]
+async fn shutdown_closes_admission_and_joins_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(PausedBackend {
+        created: tokio::sync::Notify::new(),
+        continue_create: tokio::sync::Notify::new(),
+        sent: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let manager = AgentManager::new(
+        WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+        backend.clone(),
+    );
+    let info = manager.spawn(tab_task(42)).await.unwrap();
+    backend.created.notified().await;
+    manager.begin_shutdown();
+    assert!(matches!(
+        manager.spawn(tab_task(43)).await,
+        Err(AgentError::ShuttingDown)
+    ));
+    backend.continue_create.notify_one();
+    manager.shutdown().await;
+    assert!(matches!(
+        manager.result(&info.id).await.unwrap().state,
+        AgentState::Cancelled | AgentState::Completed
+    ));
+    assert!(manager.inner.tasks.lock().unwrap().is_empty());
+}

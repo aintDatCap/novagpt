@@ -346,6 +346,7 @@ messages! {
         unavailable_2: { en: "unavailable", it: "non disponibile" },
         start_mcp_http: { en: "Start MCP HTTP", it: "Avvia MCP HTTP" },
         server_starting: { en: "Starting", it: "Avvio in corso" },
+        server_stopping: { en: "Stopping", it: "Arresto in corso" },
         current_values: { en: "current values", it: "valori attuali" },
         not_verified: { en: "Not verified", it: "Non verificato" },
         vm_disabled: { en: "VM disabled", it: "VM disattivata" },
