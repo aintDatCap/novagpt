@@ -26,7 +26,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, oneshot},
     time::{Duration, Instant, sleep},
 };
 
@@ -543,6 +543,25 @@ impl Page {
         Ok(true)
     }
 
+    async fn manual_focus(&self, stage: &'static str) -> BrowserError {
+        *self.manual.lock().await = Some("focus".to_owned());
+        self.diagnostic(stage, "").await;
+        BrowserError::Manual("focus")
+    }
+
+    /// Check without requesting activation; a lost focus must not submit.
+    async fn require_send_focus(&self) -> Result<(), BrowserError> {
+        let focus = self
+            .eval("({visible:document.visibilityState === 'visible', focused:document.hasFocus()})")
+            .await?;
+        if focus["visible"] != true || focus["focused"] != true {
+            return Err(self
+                .manual_focus("manual_focus_required_before_submit")
+                .await);
+        }
+        Ok(())
+    }
+
     /// Raise this tab and require the page to report itself visible and
     /// focused before input. A hidden or unfocused document cannot receive
     /// human input, so dispatching keystrokes there is both ineffective and
@@ -565,6 +584,15 @@ impl Page {
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                self.diagnostic(
+                    "focus_timeout",
+                    &format!(
+                        "visible={} focused={}",
+                        state["visible"] == true,
+                        state["focused"] == true
+                    ),
+                )
+                .await;
                 return Err(BrowserError::InteractionBlocked);
             }
             sleep(Duration::from_millis(100)).await;
@@ -874,7 +902,6 @@ impl ChatGptBrowser {
         // Opening a tab can activate it even while another worker is typing.
         // Never steal the foreground between its focus check and submission.
         let _foreground_guard = self.inner.foreground_lock.lock().await;
-        *self.inner.last_open.lock().await = Some(Instant::now());
         let chrome = self.chrome().await?;
         {
             let mut pages = self.inner.pages.lock().await;
@@ -921,6 +948,7 @@ impl ChatGptBrowser {
         });
         page.diagnostic("tab_opened", "").await;
         self.inner.pages.lock().await.insert(id.to_owned(), page);
+        *self.inner.last_open.lock().await = Some(Instant::now());
         Ok(())
     }
 
@@ -1306,6 +1334,26 @@ impl ChatGptBrowser {
     }
 
     pub async fn send(&self, id: &str, prompt: &str) -> Result<BrowserReply, BrowserError> {
+        self.send_observed(id, prompt, None).await
+    }
+
+    /// Release startup admission once the submitted turn is observed or the
+    /// bounded acknowledgement window expires, without waiting for the reply.
+    pub async fn send_with_submission(
+        &self,
+        id: &str,
+        prompt: &str,
+        submitted: oneshot::Sender<()>,
+    ) -> Result<BrowserReply, BrowserError> {
+        self.send_observed(id, prompt, Some(submitted)).await
+    }
+
+    async fn send_observed(
+        &self,
+        id: &str,
+        prompt: &str,
+        mut submitted: Option<oneshot::Sender<()>>,
+    ) -> Result<BrowserReply, BrowserError> {
         if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT {
             return Err(BrowserError::TooLarge);
         }
@@ -1328,7 +1376,7 @@ impl ChatGptBrowser {
                 .await;
             return Err(BrowserError::Manual("verification"));
         }
-        let mut outcome = self.send_inner(id, prompt).await;
+        let mut outcome = self.send_inner(id, prompt, &mut submitted).await;
         if matches!(
             outcome,
             Err(BrowserError::Unavailable
@@ -1356,7 +1404,7 @@ impl ChatGptBrowser {
             // retry the unsent prompt exactly once; this is the only automatic
             // replay path, and it is gated on submission_attempted == false.
             if self.reconnect_runtime().await.is_ok() {
-                outcome = self.send_inner(id, prompt).await;
+                outcome = self.send_inner(id, prompt, &mut submitted).await;
                 let attempted = self
                     .inner
                     .pages
@@ -1386,7 +1434,12 @@ impl ChatGptBrowser {
             .map_err(BrowserError::from)
     }
 
-    async fn send_inner(&self, id: &str, prompt: &str) -> Result<BrowserReply, BrowserError> {
+    async fn send_inner(
+        &self,
+        id: &str,
+        prompt: &str,
+        submitted: &mut Option<oneshot::Sender<()>>,
+    ) -> Result<BrowserReply, BrowserError> {
         let page = match self.page(id).await {
             Ok(page) => page,
             Err(error) => {
@@ -1483,6 +1536,11 @@ impl ChatGptBrowser {
         }
         page.diagnostic("composer_ready", "").await;
         let pending = *page.pending_before.lock().await;
+        let before_users = state["user_count"].as_u64().unwrap_or(0);
+        let mut awaiting_ack = pending.is_none();
+        if !awaiting_ack && let Some(signal) = submitted.take() {
+            let _ = signal.send(());
+        }
         let before = if let Some(before) = pending {
             before
         } else {
@@ -1502,7 +1560,12 @@ impl ChatGptBrowser {
             if page.cancelled.load(Ordering::Acquire) {
                 return Err(BrowserError::Cancelled);
             }
-            page.ensure_interactive().await?;
+            match page.ensure_interactive().await {
+                Err(BrowserError::InteractionBlocked) => {
+                    return Err(page.manual_focus("manual_focus_required").await);
+                }
+                other => other?,
+            }
             page.diagnostic("tab_interactive", "").await;
             // Select the actual visible, editable textbox (not its wrapper).
             // Replacing a selection via browser input generates real input events,
@@ -1525,11 +1588,11 @@ impl ChatGptBrowser {
                 ))
                 .await?;
             if focused != Value::Bool(true) {
-                page.diagnostic("composer_focus_failed", "").await;
-                return Err(BrowserError::InteractionBlocked);
+                return Err(page.manual_focus("composer_focus_failed").await);
             }
             page.diagnostic("composer_focused", "").await;
             let typed = page.type_prompt(prompt).await?;
+            page.require_send_focus().await?;
             page.diagnostic(
                 if typed {
                     "text_input_typed"
@@ -1574,8 +1637,7 @@ impl ChatGptBrowser {
                 ))
                 .await?;
             if editable != Value::Bool(true) {
-                page.diagnostic("editor_not_focused", "").await;
-                return Err(BrowserError::InteractionBlocked);
+                return Err(page.manual_focus("editor_not_focused").await);
             }
             sleep(interaction::jittered(
                 page.pacing.submit_delay,
@@ -1641,6 +1703,7 @@ impl ChatGptBrowser {
                 page.diagnostic("send_button_obscured", "").await;
                 return Err(BrowserError::InteractionBlocked);
             }
+            page.require_send_focus().await?;
             if let (Some(x), Some(y)) = (button["x"].as_f64(), button["y"].as_f64()) {
                 page.send_button_seen.store(true, Ordering::Release);
                 page.diagnostic("send_button_found", "").await;
@@ -1699,6 +1762,25 @@ impl ChatGptBrowser {
             }
             *page.manual.lock().await = None;
             let count = state["assistant_count"].as_u64().unwrap_or(0) as usize;
+            if awaiting_ack {
+                let acknowledged =
+                    count > before || state["user_count"].as_u64().unwrap_or(0) > before_users;
+                if acknowledged || elapsed >= page.pacing.submission_ack_timeout {
+                    awaiting_ack = false;
+                    page.diagnostic(
+                        if acknowledged {
+                            "submission_observed"
+                        } else {
+                            "submission_ack_timeout"
+                        },
+                        "",
+                    )
+                    .await;
+                    if let Some(signal) = submitted.take() {
+                        let _ = signal.send(());
+                    }
+                }
+            }
             if count > before {
                 let reply = state["last_text"].as_str().unwrap_or("").trim();
                 if reply.len() > MAX_REPLY {
@@ -1774,6 +1856,7 @@ impl ChatGptBrowser {
             const copy = !!last?.querySelector('[data-testid="copy-turn-action-button"]');
             return {{url:location.href, title, page_kind:'chatgpt',
                 composer:!!editor, challenge, login,
+                user_count:document.querySelectorAll('[data-message-author-role="user"]').length,
                 assistant_count:assistants.length, last_text:content?.innerText || '',
                 generating:stop, complete:copy || !stop}};"#,
             json!(ASSISTANTS)
@@ -2313,6 +2396,7 @@ mod tests {
         initial_blank: usize,
         verified: bool,
         reply_ready: bool,
+        hold_reply: bool,
         generating: bool,
         inserted: usize,
         inserted_text: String,
@@ -2556,6 +2640,7 @@ mod tests {
                     };
                     json!({"url":home,"page_kind":"chatgpt",
                         "composer":true,"challenge":false,"login":false,
+                        "user_count":usize::from(state.released),
                         "assistant_count":0,"last_text":"","complete":true,
                         "preflight_idle":!state.generating})
                 }
@@ -2607,7 +2692,7 @@ mod tests {
                         state.pressed = true;
                     } else if params["type"] == "mouseReleased" {
                         state.released = state.pressed;
-                        state.reply_ready = state.released;
+                        state.reply_ready = state.released && !state.hold_reply;
                     }
                     state.clicks += 1;
                     (200, json!({"value":{}}))
@@ -3284,13 +3369,71 @@ mod tests {
         .await
         .expect("no hang")
         .expect_err("unfocused tab");
-        assert!(matches!(result, BrowserError::InteractionBlocked));
-        let state = state.lock().await;
-        assert_eq!(state.keys, 0, "no keystroke may be dispatched");
-        assert_eq!(state.inserted, 0, "no text insertion may be dispatched");
-        assert!(!state.pressed, "no submit click may be dispatched");
-        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.insertText"));
-        assert!(!state.cdp.iter().any(|cmd| cmd == "Input.dispatchKeyEvent"));
+        assert!(matches!(result, BrowserError::Manual("focus")));
+        let diagnostics = browser.diagnostics(Some("agent-hidden")).await;
+        assert!(diagnostics.page_ready);
+        assert_eq!(diagnostics.manual_check.as_deref(), Some("focus"));
+        let guard = state.lock().await;
+        assert_eq!(guard.keys, 0, "no keystroke may be dispatched");
+        assert_eq!(guard.inserted, 0, "no text insertion may be dispatched");
+        assert!(!guard.pressed, "no submit click may be dispatched");
+        assert!(!guard.cdp.iter().any(|cmd| cmd == "Input.insertText"));
+        assert!(!guard.cdp.iter().any(|cmd| cmd == "Input.dispatchKeyEvent"));
+        let handles = guard.handles.clone();
+        drop(guard);
+        state.lock().await.not_focused = false;
+        let reply = timeout(
+            Duration::from_secs(8),
+            browser.send("agent-hidden", "Must not be typed"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.content, "Fixture answer");
+        assert_eq!(state.lock().await.handles, handles);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn submission_acknowledgement_does_not_wait_for_reply() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut guard = state.lock().await;
+            guard.verified = true;
+            guard.hold_reply = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-ack").await.unwrap();
+        let (signal, ack) = oneshot::channel();
+        let worker = browser.clone();
+        let reply = tokio::spawn(async move {
+            worker
+                .send_with_submission("agent-ack", "Fixture prompt", signal)
+                .await
+        });
+        timeout(Duration::from_secs(3), ack).await.unwrap().unwrap();
+        assert!(state.lock().await.released);
+        assert!(!reply.is_finished());
+        assert!(
+            browser
+                .diagnostics(Some("agent-ack"))
+                .await
+                .recent_events
+                .iter()
+                .any(|event| event == "submission_observed")
+        );
+        state.lock().await.reply_ready = true;
+        assert_eq!(
+            timeout(Duration::from_secs(5), reply)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .content,
+            "Fixture answer"
+        );
+        browser.shutdown().await;
         server.abort();
     }
 

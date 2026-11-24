@@ -2548,3 +2548,95 @@ async fn shutdown_closes_admission_and_joins_worker() {
     ));
     assert!(manager.inner.tasks.lock().unwrap().is_empty());
 }
+
+/// Model the real adapter's two independent boundaries: startup acknowledgement
+/// and response completion. A new tab must not open across the first boundary.
+struct SubmissionGatedBackend {
+    created: tokio::sync::mpsc::UnboundedSender<String>,
+    acknowledge: tokio::sync::Semaphore,
+    finish: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl AgentBackend for SubmissionGatedBackend {
+    fn name(&self) -> &'static str {
+        "submission-gated"
+    }
+    fn model(&self) -> &'static str {
+        "fixture"
+    }
+    async fn create(&self, id: &str) -> Result<(), BackendFailure> {
+        self.created
+            .send(id.to_owned())
+            .map_err(|_| BackendFailure::Unavailable)
+    }
+    async fn send(&self, id: &str, _: &str) -> Result<(String, Option<String>), BackendFailure> {
+        self.finish
+            .acquire()
+            .await
+            .map_err(|_| BackendFailure::Unavailable)?
+            .forget();
+        Ok((id.to_owned(), None))
+    }
+    async fn send_with_submission(
+        &self,
+        id: &str,
+        prompt: &str,
+        submitted: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(String, Option<String>), BackendFailure> {
+        self.acknowledge
+            .acquire()
+            .await
+            .map_err(|_| BackendFailure::Unavailable)?
+            .forget();
+        let _ = submitted.send(());
+        self.send(id, prompt).await
+    }
+    async fn cancel(&self, _: &str) {}
+    async fn diagnostics(&self, _: &str) -> serde_json::Value {
+        serde_json::json!({})
+    }
+}
+
+#[tokio::test]
+async fn five_workers_start_one_at_a_time_but_replies_remain_concurrent() {
+    let root = tempfile::tempdir().unwrap();
+    let (created, mut next) = tokio::sync::mpsc::unbounded_channel();
+    let backend = Arc::new(SubmissionGatedBackend {
+        created,
+        acknowledge: tokio::sync::Semaphore::new(0),
+        finish: tokio::sync::Semaphore::new(0),
+    });
+    let manager = AgentManager::new(
+        WorkspaceRegistry::new(root.path(), &[]).unwrap(),
+        backend.clone(),
+    );
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        ids.push(manager.spawn(tab_task(i)).await.unwrap().id);
+    }
+    for _ in 0..5 {
+        let id = timeout(Duration::from_secs(2), next.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ids.contains(&id));
+        assert!(
+            timeout(Duration::from_millis(50), next.recv())
+                .await
+                .is_err(),
+            "no second tab before acknowledgement"
+        );
+        backend.acknowledge.add_permits(1);
+    }
+    for id in &ids {
+        assert_eq!(manager.result(id).await.unwrap().state, AgentState::Running);
+    }
+    backend.finish.add_permits(5);
+    for id in &ids {
+        assert_eq!(
+            manager.wait(id, 3).await.unwrap().agent.state,
+            AgentState::Completed
+        );
+    }
+}

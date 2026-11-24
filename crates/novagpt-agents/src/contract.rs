@@ -22,7 +22,7 @@ pub enum AgentError {
     Busy,
     #[error("Subagent was cancelled")]
     Cancelled,
-    #[error("Subagent is not waiting for confirmed manual verification")]
+    #[error("Subagent is not waiting for confirmed manual browser action")]
     NotWaiting,
     #[error("Subagent request is invalid")]
     Invalid,

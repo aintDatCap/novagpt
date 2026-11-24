@@ -164,6 +164,7 @@ struct Inner {
     spawn_gate: Mutex<()>,
     stopping: AtomicBool,
     tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    // Serialize startup through the submission boundary, never through reply polling.
     tab_gate: Mutex<()>,
     entries: Mutex<HashMap<String, Entry>>,
     history: OnceLock<Arc<history::History>>,
@@ -525,11 +526,11 @@ impl AgentManager {
         let manager = self.clone();
         let task = tokio::spawn(async move {
             let outcome = async {
+                let tab_guard = manager.inner.tab_gate.lock().await;
+                if !manager.is_active(&id, epoch).await {
+                    return Err(BackendFailure::Unavailable);
+                }
                 if must_create {
-                    let _tab_guard = manager.inner.tab_gate.lock().await;
-                    if !manager.is_active(&id, epoch).await {
-                        return Err(BackendFailure::Unavailable);
-                    }
                     manager.evict_completed_tabs().await;
                     let created = manager.inner.backend.create(&id).await;
                     manager.emit(
@@ -549,7 +550,22 @@ impl AgentManager {
                     manager.inner.backend.close(&id).await;
                     return Err(BackendFailure::Unavailable);
                 }
-                let reply = manager.inner.backend.send(&id, &prompt).await;
+                let (submitted, startup_done) = tokio::sync::oneshot::channel();
+                let sending = manager
+                    .inner
+                    .backend
+                    .send_with_submission(&id, &prompt, submitted);
+                tokio::pin!(sending);
+                let reply = tokio::select! {
+                    reply = &mut sending => {
+                        drop(tab_guard);
+                        reply
+                    }
+                    _ = startup_done => {
+                        drop(tab_guard);
+                        sending.await
+                    }
+                };
                 if let Some(reporter) = manager.inner.usage_reporter.get() {
                     reporter(
                         &id,

@@ -26,6 +26,17 @@ pub trait AgentBackend: Send + Sync {
         id: &str,
         prompt: &str,
     ) -> Result<(String, Option<String>), BackendFailure>;
+    /// Notify the manager when the initial foreground work is over. Backends
+    /// without a shared interactive browser need not hold the startup gate.
+    async fn send_with_submission(
+        &self,
+        id: &str,
+        prompt: &str,
+        submitted: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(String, Option<String>), BackendFailure> {
+        let _ = submitted.send(());
+        self.send(id, prompt).await
+    }
     async fn cancel(&self, id: &str);
     /// Stop awaiting an already acknowledged response without closing its tab.
     async fn complete(&self, _id: &str) {}
@@ -59,6 +70,19 @@ impl AgentBackend for ChatGptBackend {
         prompt: &str,
     ) -> Result<(String, Option<String>), BackendFailure> {
         let reply = self.browser.send(id, prompt).await.map_err(map_browser)?;
+        Ok((reply.content, reply.conversation_url))
+    }
+    async fn send_with_submission(
+        &self,
+        id: &str,
+        prompt: &str,
+        submitted: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(String, Option<String>), BackendFailure> {
+        let reply = self
+            .browser
+            .send_with_submission(id, prompt, submitted)
+            .await
+            .map_err(map_browser)?;
         Ok((reply.content, reply.conversation_url))
     }
     async fn cancel(&self, id: &str) {

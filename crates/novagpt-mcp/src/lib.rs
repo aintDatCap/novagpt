@@ -2009,7 +2009,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Resume a waiting subagent after the user confirms manual browser login/verification. Does not bypass verification."
+        description = "Resume a waiting subagent after the user confirms manual browser login, verification or focus. Does not bypass verification."
     )]
     async fn subagent_resume(
         &self,

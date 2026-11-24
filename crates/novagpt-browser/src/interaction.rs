@@ -22,6 +22,8 @@ pub struct InteractionPacing {
     /// How long to wait for the tab to become visible and focused after
     /// Chrome is asked to raise it.
     pub reveal_timeout: Duration,
+    /// Maximum time to observe submission before admitting another worker.
+    pub submission_ack_timeout: Duration,
     /// Dwell after the composer is usable, before any input is dispatched.
     pub settle_after_ready: Duration,
     /// Upper bound of the random addition to `settle_after_ready`.
@@ -54,7 +56,8 @@ impl InteractionPacing {
     /// short pointer path before the submit click.
     pub fn human() -> Self {
         Self {
-            reveal_timeout: Duration::from_secs(3),
+            reveal_timeout: Duration::from_secs(8),
+            submission_ack_timeout: Duration::from_secs(8),
             settle_after_ready: Duration::from_millis(700),
             settle_jitter: Duration::from_millis(500),
             submit_delay: Duration::from_millis(350),
@@ -65,7 +68,7 @@ impl InteractionPacing {
             pointer_steps: 5,
             pointer_delay: Duration::from_millis(18),
             pointer_jitter: Duration::from_millis(14),
-            tab_gap: Duration::from_millis(700),
+            tab_gap: Duration::from_millis(1500),
             tab_gap_jitter: Duration::from_millis(500),
         }
     }
@@ -74,6 +77,7 @@ impl InteractionPacing {
     pub fn instant() -> Self {
         Self {
             reveal_timeout: Duration::from_millis(500),
+            submission_ack_timeout: Duration::from_millis(500),
             settle_after_ready: Duration::ZERO,
             settle_jitter: Duration::ZERO,
             submit_delay: Duration::ZERO,
