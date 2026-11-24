@@ -576,6 +576,8 @@ struct Inner {
     runtime: Mutex<Option<UndetectedChrome>>,
     dev_origin: Option<reqwest::Url>,
     create_lock: Mutex<()>,
+    // Foreground input is shared across tabs; response polling is not.
+    interaction_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
     reporter: Option<DiagnosticReporter>,
     pacing: InteractionPacing,
@@ -624,6 +626,7 @@ impl ChatGptBrowser {
                 runtime: Mutex::new(None),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
+                interaction_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
                 pacing: InteractionPacing::human(),
@@ -652,6 +655,7 @@ impl ChatGptBrowser {
                 runtime: Mutex::new(Some(UndetectedChrome::from_session_for_test(session))),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
+                interaction_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
                 pacing: InteractionPacing::instant(),
@@ -818,7 +822,11 @@ impl ChatGptBrowser {
             self.open_url(id, &start, false).await?;
             self.page(id).await?
         };
-        match project_setup::ensure(&page.transport, &self.inner.config.profile).await {
+        let setup_result = {
+            let _interaction = self.inner.interaction_lock.lock().await;
+            project_setup::ensure(&page.transport, &self.inner.config.profile).await
+        };
+        match setup_result {
             Ok(project) => {
                 self.set_project_url(Some(&project))?;
                 Ok(())
@@ -861,6 +869,7 @@ impl ChatGptBrowser {
                 sleep(gap - elapsed).await;
             }
         }
+        let _interaction = self.inner.interaction_lock.lock().await;
         *self.inner.last_open.lock().await = Some(Instant::now());
         let chrome = self.chrome().await?;
         {
@@ -946,6 +955,7 @@ impl ChatGptBrowser {
                 self.page(BROWSE_TAB).await?
             }
         };
+        let _interaction = self.inner.interaction_lock.lock().await;
         page.ensure_interactive().await
     }
 
@@ -953,6 +963,7 @@ impl ChatGptBrowser {
     /// through MCP. Subagent pages and their conversations are unaffected.
     pub async fn browse_navigate(&self, url: &str) -> Result<BrowsedPage, BrowserError> {
         let target = self.approved_url(url)?;
+        let _interaction = self.inner.interaction_lock.lock().await;
         let page = self.page(BROWSE_TAB).await?;
         let previous = page
             .eval("location.href")
@@ -1135,6 +1146,7 @@ impl ChatGptBrowser {
     /// Click a visible, unobscured element using a physical browser mouse event.
     pub async fn browse_click(&self, selector: &str) -> Result<bool, BrowserError> {
         validate_selector(selector)?;
+        let _interaction = self.inner.interaction_lock.lock().await;
         let page = self.page(BROWSE_TAB).await?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
@@ -1176,6 +1188,7 @@ impl ChatGptBrowser {
         if text.is_empty() || text.len() > MAX_INPUT_TEXT {
             return Err(BrowserError::InvalidControl);
         }
+        let _interaction = self.inner.interaction_lock.lock().await;
         let page = self.page(BROWSE_TAB).await?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
@@ -1479,6 +1492,10 @@ impl ChatGptBrowser {
             // Input into a hidden or unfocused tab is not something a person
             // can do. Raise this tab and refuse to type unless the document
             // confirms it is visible and focused.
+            let _interaction = self.inner.interaction_lock.lock().await;
+            if page.cancelled.load(Ordering::Acquire) {
+                return Err(BrowserError::Cancelled);
+            }
             page.ensure_interactive().await?;
             page.diagnostic("tab_interactive", "").await;
             // Select the actual visible, editable textbox (not its wrapper).
@@ -1503,7 +1520,7 @@ impl ChatGptBrowser {
                 .await?;
             if focused != Value::Bool(true) {
                 page.diagnostic("composer_focus_failed", "").await;
-                return Err(BrowserError::Unavailable);
+                return Err(BrowserError::InteractionBlocked);
             }
             page.diagnostic("composer_focused", "").await;
             let typed = page.type_prompt(prompt).await?;
@@ -1530,7 +1547,7 @@ impl ChatGptBrowser {
                 .collect();
             if !inserted.as_str().is_some_and(|text| text.contains(&prefix)) {
                 page.diagnostic("text_check_failed", "").await;
-                return Err(BrowserError::Unavailable);
+                return Err(BrowserError::ComposerUnavailable);
             }
             page.diagnostic("text_verified", "").await;
             // A verification interstitial can appear after the composer was
@@ -1611,6 +1628,9 @@ impl ChatGptBrowser {
                 }
                 sleep(Duration::from_millis(250)).await;
             };
+            if page.cancelled.load(Ordering::Acquire) {
+                return Err(BrowserError::Cancelled);
+            }
             if obscured {
                 page.diagnostic("send_button_obscured", "").await;
                 return Err(BrowserError::InteractionBlocked);
@@ -3098,6 +3118,44 @@ mod tests {
         );
         assert_eq!(diagnostic.page_count, 1);
         assert_eq!(state.lock().await.inserted, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn foreground_gate_blocks_input_but_not_page_observation() {
+        let (port, state, server) = spawn_mock().await;
+        state.lock().await.verified = true;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-queued").await.expect("open");
+        let gate = browser.inner.interaction_lock.lock().await;
+        let worker = browser.clone();
+        let send = tokio::spawn(async move { worker.send("agent-queued", "Queued prompt").await });
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if browser
+                    .diagnostics(Some("agent-queued"))
+                    .await
+                    .recent_events
+                    .iter()
+                    .any(|e| e == "composer_ready")
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("page observation progresses while input is queued");
+        assert_eq!(state.lock().await.keys, 0);
+        assert_eq!(state.lock().await.inserted, 0);
+        drop(gate);
+        let reply = timeout(Duration::from_secs(8), send)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.content, "Fixture answer");
+        browser.shutdown().await;
         server.abort();
     }
 
