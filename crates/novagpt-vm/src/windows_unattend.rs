@@ -33,6 +33,25 @@ pub struct WindowsInstallResult {
     pub unattended: bool,
 }
 
+/// Interpret libvirt's domiflist output conservatively: malformed output is
+/// not evidence that a VM has no network interface.
+fn no_network_interfaces(output: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(output) else {
+        return false;
+    };
+    let mut lines = text.trim_start_matches(['\n', '\r']).lines();
+    let Some(header) = lines.next() else {
+        return false;
+    };
+    let Some(separator) = lines.next() else {
+        return false;
+    };
+    header.contains("Interface")
+        && header.contains("Type")
+        && separator.contains("---")
+        && lines.all(|line| line.trim().is_empty())
+}
+
 fn valid_user(username: &str) -> bool {
     let lower = username.to_ascii_lowercase();
     !matches!(
@@ -238,7 +257,7 @@ impl VmManager {
                     answer_iso.display()
                 ),
                 "--network".into(),
-                "user,model=e1000e".into(),
+                "none".into(),
                 "--tpm".into(),
                 "backend.type=emulator,model=tpm-crb".into(),
                 "--channel".into(),
@@ -261,6 +280,134 @@ impl VmManager {
                 disk_gib: request.disk_gib,
                 unattended: true,
             })
+        }
+    }
+}
+
+impl VmManager {
+    /// Enable NAT networking after Windows OOBE has reached the desktop.
+    /// The installer starts offline to avoid Windows Update ZDP errors during OOBE.
+    /// Only the owned installer domain may be modified.
+    pub async fn enable_windows_installer_network(&self, name: &str) -> VmResult<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            return Err(VmError::Unsupported("Linux libvirt is required"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !valid_name(name, 48) {
+                return Err(VmError::InvalidName);
+            }
+            let home = self.root().join("installers").join(name);
+            if fs::canonicalize(&home)? != home {
+                return Err(VmError::NotOwned);
+            }
+            let disk = home.join("installed.qcow2");
+            if disk.symlink_metadata()?.file_type().is_symlink() || !disk.is_file() {
+                return Err(VmError::NotOwned);
+            }
+            let domain = format!("novagpt-install-{name}");
+            let disks = crate::run_command(
+                "virsh",
+                &[
+                    "-c".into(),
+                    "qemu:///session".into(),
+                    "domblklist".into(),
+                    "--details".into(),
+                    domain.clone(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+            let disk_text = disk.to_str().ok_or(VmError::InvalidData)?;
+            if !disks.status.success()
+                || !String::from_utf8_lossy(&disks.stdout).lines().any(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    fields.len() >= 4
+                        && fields[0] == "file"
+                        && fields[1] == "disk"
+                        && fields.last() == Some(&disk_text)
+                })
+            {
+                return Err(VmError::NotOwned);
+            }
+            let interfaces = crate::run_command(
+                "virsh",
+                &[
+                    "-c".into(),
+                    "qemu:///session".into(),
+                    "domiflist".into(),
+                    domain.clone(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+            if !interfaces.status.success() {
+                return Err(VmError::CommandFailed);
+            }
+            // Check both the live and persistent definitions to avoid duplicate
+            // NICs after a reboot or an earlier partial configuration.
+            let persistent = crate::run_command(
+                "virsh",
+                &[
+                    "-c".into(),
+                    "qemu:///session".into(),
+                    "domiflist".into(),
+                    "--inactive".into(),
+                    domain.clone(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+            if !persistent.status.success()
+                || !no_network_interfaces(&interfaces.stdout)
+                || !no_network_interfaces(&persistent.stdout)
+            {
+                return Err(VmError::Busy);
+            }
+            let state = crate::run_command(
+                "virsh",
+                &[
+                    "-c".into(),
+                    "qemu:///session".into(),
+                    "domstate".into(),
+                    domain.clone(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+            if !state.status.success() || String::from_utf8_lossy(&state.stdout).trim() != "running"
+            {
+                return Err(VmError::Busy);
+            }
+            // 'virsh attach-interface' does not support type=user; attach a
+            // narrowly scoped libvirt device XML instead.
+            let nic_xml = home.join(format!("nic-{}.xml", uuid::Uuid::new_v4()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&nic_xml)?;
+            use std::io::Write;
+            file.write_all(b"<interface type='user'><model type='e1000e'/></interface>")?;
+            file.sync_all()?;
+            drop(file);
+            let result = run(
+                "virsh",
+                &[
+                    "-c".into(),
+                    "qemu:///session".into(),
+                    "attach-device".into(),
+                    domain,
+                    nic_xml.display().to_string(),
+                    "--live".into(),
+                    "--config".into(),
+                ],
+                30,
+            )
+            .await;
+            fs::remove_file(&nic_xml)?;
+            result
         }
     }
 }
@@ -418,6 +565,15 @@ mod tests {
         assert!(xml.contains("<ProtectYourPC>3</ProtectYourPC>"));
         assert!(xml.contains("<Name>AceTester</Name>"));
         assert!(xml.contains("<Value>1</Value>"));
+    }
+    #[test]
+    fn network_inventory_requires_valid_empty_output() {
+        let empty = b"\n Interface   Type   Source   Model   MAC\n------------------------------------------\n\n";
+        let with_nic = b" Interface   Type   Source   Model   MAC\n------------------------------------------\n -   user   -   e1000e   52:54:00:00:00:01\n";
+        assert!(no_network_interfaces(empty));
+        assert!(!no_network_interfaces(with_nic));
+        assert!(!no_network_interfaces(b""));
+        assert!(!no_network_interfaces(b"unexpected output"));
     }
     #[test]
     fn invalid_names_do_not_become_xml() {

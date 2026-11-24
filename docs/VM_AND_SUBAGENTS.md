@@ -157,7 +157,16 @@ cargo run -p novagpt-cli -- \
   --username AceTester --cpus 4 --memory-mb 16384 --disk-gib 80
 ```
 
-This command creates a new qcow2 disk and a second ISO containing `Autounattend.xml`; it never modifies the original Windows ISO. The answer file configures virtual Disk 0, installs image index 1, accepts the EULA, creates a local Administrator account for **disposable testing only**, and hides selected setup/OOBE screens. **Security limitation:** the current experimental answer file encodes a fixed, weak account password (`Password`) rather than generating a unique credential. It is only suitable for a throwaway guest behind QEMU user-mode NAT with no inbound ports; change the password before any external access or production use. The guest has a SPICE display bound to loopback. OOBE can still show an optional error that needs `Skip`, and Windows may perform normal updates after installation.
+This command creates a new qcow2 disk and a second ISO containing `Autounattend.xml`; it never modifies the original Windows ISO. The answer file configures virtual Disk 0, installs image index 1, accepts the EULA, creates a local Administrator account for **disposable testing only**, and hides selected setup/OOBE screens. **Security limitation:** the current experimental answer file encodes a fixed, weak account password (`Password`) rather than generating a unique credential. It is only suitable for a throwaway guest behind QEMU user-mode NAT with no inbound ports; change the password before any external access or production use. The guest has a SPICE display bound to loopback. **The installer starts without a network interface** to avoid Windows 11's online zero-day-patch (ZDP) update stage during OOBE, which was observed failing with `OOBEZDP` on the disposable VM. This does not disable Windows security updates: **after the local account reaches the desktop**, enable QEMU user-mode NAT with:
+
+```bash
+cargo run -p novagpt-cli -- \
+  --root /path/to/novagpt \
+  --vm-home "$HOME/.local/state/NovaGPT/vms" \
+  vm-enable-windows-network --name win11-ace-test
+```
+
+The network-enabling command requires a running, owned installer VM with no existing interface. As with other VM-home CLI maintenance commands, stop the NovaGPT server holding the VM-home lease before running the CLI command; a concurrent server returns `Busy`. Run Windows Update after networking is restored. Windows Home builds may still require a network during OOBE; this offline workflow is verified only for builds that honor the preconfigured local account. If OOBE cannot finish offline, do not blindly bypass setup or enable network without investigating the guest.
 
 The libvirt domain name is `novagpt-install-<name>`. Use `virsh -c qemu:///session list --all` and `virt-viewer --connect qemu:///session novagpt-install-<name>` to inspect it. Boot media may display `Press any key to boot from CD or DVD`; use the VM console or `virsh send-key` to select the installer. The installation stays registered across NovaGPT server restarts. After Windows finishes and you verify that the guest boots, shut it down and create the baseline snapshot with `cargo run -p novagpt-cli -- --root /path/to/novagpt --vm-home "$HOME/.local/state/NovaGPT/vms" vm-snapshot-windows --name win11-ace-test --snapshot baseline`. The command refuses a running guest. Do not run a second import until the installed disk is known bootable.
 

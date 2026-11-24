@@ -297,6 +297,11 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
     },
+    /// Attach NAT networking to an owned Windows installer after offline OOBE.
+    VmEnableWindowsNetwork {
+        #[arg(long)]
+        name: String,
+    },
     /// Create a checkpoint of a powered-off Windows test guest.
     VmSnapshotWindows {
         #[arg(long)]
@@ -1251,6 +1256,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Created Windows installer VM: {} ({} vCPU, {} MiB RAM, {} GiB disk, unattended={})",
                 result.domain, result.cpus, result.memory_mb, result.disk_gib, result.unattended
             );
+        }
+        Some(Command::VmEnableWindowsNetwork { name }) => {
+            let vm = extras
+                .vm
+                .ok_or("--vm-home or local VM configuration required")?;
+            vm.enable_windows_installer_network(&name).await?;
+            println!("Enabled NAT networking for novagpt-install-{name}");
         }
         Some(Command::VmSnapshotWindows { name, snapshot }) => {
             let vm = extras
