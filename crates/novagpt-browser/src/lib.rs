@@ -562,6 +562,36 @@ impl Page {
         Ok(())
     }
 
+    /// After composition, allow transient focus loss to recover without
+    /// raising Chrome again. The draft and live page are rechecked afterwards.
+    async fn recover_composition_focus(&self) -> Result<(), BrowserError> {
+        let focus = self
+            .eval("({visible:document.visibilityState === 'visible', focused:document.hasFocus()})")
+            .await?;
+        if focus["visible"] == true && focus["focused"] == true {
+            return Ok(());
+        }
+        self.diagnostic(
+            "composition_focus_lost",
+            &format!(
+                "visible={} focused={}",
+                focus["visible"] == true,
+                focus["focused"] == true
+            ),
+        )
+        .await;
+        match self.wait_for_focus().await {
+            Ok(()) => {
+                self.diagnostic("composition_focus_restored", "").await;
+                Ok(())
+            }
+            Err(BrowserError::InteractionBlocked) => Err(self
+                .manual_focus("manual_focus_required_before_submit")
+                .await),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Raise this tab and require the page to report itself visible and
     /// focused before input. A hidden or unfocused document cannot receive
     /// human input, so dispatching keystrokes there is both ineffective and
@@ -575,14 +605,21 @@ impl Page {
                 .await
                 .map_err(BrowserError::from)?;
         }
+        self.wait_for_focus().await
+    }
+
+    async fn wait_for_focus(&self) -> Result<(), BrowserError> {
         let deadline = Instant::now() + self.pacing.reveal_timeout;
+        let mut focused_once = false;
         loop {
             let state = self
                 .eval("({visible:document.visibilityState === 'visible', focused:document.hasFocus()})")
                 .await?;
-            if state["visible"] == true && state["focused"] == true {
+            let focused = state["visible"] == true && state["focused"] == true;
+            if focused && focused_once {
                 return Ok(());
             }
+            focused_once = focused;
             if Instant::now() >= deadline {
                 self.diagnostic(
                     "focus_timeout",
@@ -1537,6 +1574,7 @@ impl ChatGptBrowser {
         page.diagnostic("composer_ready", "").await;
         let pending = *page.pending_before.lock().await;
         let before_users = state["user_count"].as_u64().unwrap_or(0);
+        let before_generating = state["generating"] == true;
         let mut awaiting_ack = pending.is_none();
         if !awaiting_ack && let Some(signal) = submitted.take() {
             let _ = signal.send(());
@@ -1592,7 +1630,7 @@ impl ChatGptBrowser {
             }
             page.diagnostic("composer_focused", "").await;
             let typed = page.type_prompt(prompt).await?;
-            page.require_send_focus().await?;
+            page.recover_composition_focus().await?;
             page.diagnostic(
                 if typed {
                     "text_input_typed"
@@ -1763,8 +1801,9 @@ impl ChatGptBrowser {
             *page.manual.lock().await = None;
             let count = state["assistant_count"].as_u64().unwrap_or(0) as usize;
             if awaiting_ack {
-                let acknowledged =
-                    count > before || state["user_count"].as_u64().unwrap_or(0) > before_users;
+                let acknowledged = count > before
+                    || state["user_count"].as_u64().unwrap_or(0) > before_users
+                    || (!before_generating && state["generating"] == true);
                 if acknowledged || elapsed >= page.pacing.submission_ack_timeout {
                     awaiting_ack = false;
                     page.diagnostic(
@@ -2397,6 +2436,8 @@ mod tests {
         verified: bool,
         reply_ready: bool,
         hold_reply: bool,
+        ack_via_generation_only: bool,
+        focus_loss_after_input: usize,
         generating: bool,
         inserted: usize,
         inserted_text: String,
@@ -2640,8 +2681,9 @@ mod tests {
                     };
                     json!({"url":home,"page_kind":"chatgpt",
                         "composer":true,"challenge":false,"login":false,
-                        "user_count":usize::from(state.released),
-                        "assistant_count":0,"last_text":"","complete":true,
+                        "user_count":usize::from(state.released && !state.ack_via_generation_only),
+                        "generating":state.released && state.ack_via_generation_only,
+                        "assistant_count":0,"last_text":"","complete":!(state.released && state.ack_via_generation_only),
                         "preflight_idle":!state.generating})
                 }
             } else if script.contains("document.activeElement === el") {
@@ -2655,7 +2697,12 @@ mod tests {
                     json!({"x":100.0,"y":40.0,"clear":!state.obscured})
                 }
             } else if script.contains("document.visibilityState") {
-                json!({"visible":!state.not_visible,"focused":!state.not_focused})
+                let transient_loss =
+                    (state.keys > 0 || state.inserted > 0) && state.focus_loss_after_input > 0;
+                if transient_loss {
+                    state.focus_loss_after_input -= 1;
+                }
+                json!({"visible":!state.not_visible,"focused":!state.not_focused && !transient_loss})
             } else if script.contains("ready:document.readyState") {
                 json!({"url":state.url,"ready":"complete"})
             } else if script.contains("document.body?.innerText") {
@@ -3247,7 +3294,7 @@ mod tests {
             state.inserted = 0;
         }
         let reply = timeout(
-            Duration::from_secs(6),
+            Duration::from_secs(8),
             browser.send("agent-verified", "Retained fixture prompt"),
         )
         .await
@@ -3402,6 +3449,7 @@ mod tests {
             let mut guard = state.lock().await;
             guard.verified = true;
             guard.hold_reply = true;
+            guard.ack_via_generation_only = true;
         }
         let browser = ChatGptBrowser::with_test_session(test_session(port).await);
         browser.open("agent-ack").await.unwrap();
@@ -3432,6 +3480,47 @@ mod tests {
                 .unwrap()
                 .content,
             "Fixture answer"
+        );
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transient_focus_loss_after_composition_recovers_without_another_activation() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut guard = state.lock().await;
+            guard.verified = true;
+            guard.focus_loss_after_input = 1;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-transient").await.unwrap();
+        let reply = timeout(
+            Duration::from_secs(5),
+            browser.send("agent-transient", "Fixture prompt"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.content, "Fixture answer");
+        let events = browser
+            .diagnostics(Some("agent-transient"))
+            .await
+            .recent_events;
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "composition_focus_restored")
+        );
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .cdp
+                .iter()
+                .filter(|event| *event == "Page.bringToFront")
+                .count(),
+            1
         );
         browser.shutdown().await;
         server.abort();
