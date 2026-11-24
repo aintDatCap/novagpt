@@ -423,14 +423,14 @@ impl Controller {
                 } else {
                     novagpt_mcp::UsageProfiler::disabled()
                 };
-                let agents = browser.as_ref().map(|browser| {
+                let agents = browser.as_ref().map(|browser| -> Result<_, String> {
                     let agent_audit = audit.clone();
                     let agent_usage = usage.clone();
                     let runtime = session_runtime.clone();
-                    novagpt_agents::AgentManager::new(
+                    Ok(novagpt_agents::AgentManager::new(
                         workspaces.clone(),
                         Arc::new(novagpt_agents::ChatGptBackend::new(browser.clone())),
-                    ).with_diagnostic_reporter(move |id, stage| {
+                    ).with_history(crate::logging::audit_directory(&root).map_err(|_| "Invalid audit directory.")?.join("agent-history.json")).map_err(|_| "Agent history unavailable or locked.")?.with_diagnostic_reporter(move |id, stage| {
                         agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
                     })
                     .with_usage_reporter(move |id, repository_id, input_chars, output_chars, failed| {
@@ -450,8 +450,8 @@ impl Controller {
                                 );
                             }
                         });
-                    })
-                });
+                    }))
+                }).transpose()?;
                 let resolved = token::resolve()
                     .map_err(|err| format!("HTTP token unavailable: {err}"))?;
                 let _ = tx_info.send(OperationEvent::TokenPresent(resolved.description()));

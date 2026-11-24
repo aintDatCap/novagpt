@@ -2,6 +2,7 @@
 mod activity;
 mod backend;
 mod contract;
+mod history;
 mod mutations;
 
 pub use backend::{AgentBackend, BackendFailure, ChatGptBackend};
@@ -163,6 +164,7 @@ struct Inner {
     spawn_gate: Mutex<()>,
     tab_gate: Mutex<()>,
     entries: Mutex<HashMap<String, Entry>>,
+    history: OnceLock<Arc<history::History>>,
     max_agents: usize,
     max_live_tabs: usize,
     /// Monotonic completion order for bounded tab eviction.
@@ -188,6 +190,7 @@ impl AgentManager {
                 spawn_gate: Mutex::new(()),
                 tab_gate: Mutex::new(()),
                 entries: Mutex::new(HashMap::new()),
+                history: OnceLock::new(),
                 max_agents: MAX_AGENTS,
                 max_live_tabs: MAX_LIVE_TABS,
                 next_completed_seq: AtomicU64::new(1),
@@ -196,6 +199,38 @@ impl AgentManager {
                 conversation_recorder: OnceLock::new(),
             }),
         }
+    }
+
+    /// Open the private metadata archive before accepting assignments.
+    pub fn with_history(self, path: PathBuf) -> std::io::Result<Self> {
+        let history = Arc::new(history::History::open(path)?);
+        self.inner
+            .history
+            .set(history)
+            .map_err(|_| std::io::Error::other("Agent history already configured"))?;
+        Ok(self)
+    }
+
+    fn recovered(&self) -> &[AgentInfo] {
+        self.inner
+            .history
+            .get()
+            .map_or(&[], |h| h.recovered.as_slice())
+    }
+
+    async fn remember(&self, info: &AgentInfo) -> AgentResult<()> {
+        if let Some(history) = self.inner.history.get().cloned() {
+            let id = info.id.clone();
+            let info = info.clone();
+            if !matches!(
+                tokio::task::spawn_blocking(move || history.record(&info)).await,
+                Ok(Ok(()))
+            ) {
+                self.emit(&id, AgentLogStage::HistoryWriteFailed);
+                return Err(AgentError::HistoryUnavailable);
+            }
+        }
+        Ok(())
     }
 
     /// Enable explicit per-subagent disposable VM forks. Without this opt-in,
@@ -424,6 +459,12 @@ impl AgentManager {
             epoch: 1,
             activity_sequence: 0,
         };
+        if let Err(error) = self.remember(&info).await {
+            if let (Some(vm), Some(lease)) = (self.inner.vm.get(), &info.vm) {
+                let _ = vm.destroy(&lease.id).await;
+            }
+            return Err(error);
+        }
         {
             let mut agents = self.inner.entries.lock().await;
             if agents.len() >= MAX_RECORDS {
@@ -609,8 +650,12 @@ impl AgentManager {
                 // instead of leaving it open for the life of the process.
                 entry.ready = false;
             }
-            let terminal = agents.get(&id).map(|entry| entry.info.state);
+            let snapshot = agents.get(&id).map(|entry| entry.info.clone());
+            let terminal = snapshot.as_ref().map(|info| info.state);
             drop(agents);
+            if let Some(info) = snapshot {
+                let _ = manager.remember(&info).await;
+            }
             match terminal {
                 Some(AgentState::Completed) => manager.emit(&id, AgentLogStage::Completed),
                 Some(AgentState::Failed) => manager.emit(&id, AgentLogStage::Failed),
@@ -803,6 +848,15 @@ impl AgentManager {
         let created = !entry.ready;
         let info = entry.info.clone();
         drop(agents);
+        if let Err(error) = self.remember(&info).await {
+            if let Some(entry) = self.inner.entries.lock().await.get_mut(id) {
+                entry.info.state = AgentState::Failed;
+                entry.info.error = Some(error.to_string());
+                entry.pending_prompt.clear();
+                entry.updates.send_replace(entry.info.clone());
+            }
+            return Err(error);
+        }
         self.start(
             id.to_owned(),
             prompt,
@@ -871,6 +925,7 @@ impl AgentManager {
         let id = id.to_owned();
         tokio::spawn(async move {
             let _guard = patch_guard;
+            let _ = manager.remember(&info).await;
             manager.inner.backend.cancel(&id).await;
             manager.inner.backend.close(&id).await;
             manager.cleanup_vm(&id).await;
@@ -890,9 +945,24 @@ impl AgentManager {
     pub async fn status(&self, id: Option<&str>) -> AgentResult<AgentStatus> {
         let agents = self.inner.entries.lock().await;
         let statuses = if let Some(id) = id {
-            vec![agents.get(id).ok_or(AgentError::NotFound)?.info.clone()]
+            vec![
+                agents
+                    .get(id)
+                    .map(|e| e.info.clone())
+                    .or_else(|| self.recovered().iter().find(|e| e.id == id).cloned())
+                    .ok_or(AgentError::NotFound)?,
+            ]
         } else {
-            agents.values().map(|e| e.info.clone()).collect()
+            agents
+                .values()
+                .map(|e| e.info.clone())
+                .chain(
+                    self.recovered()
+                        .iter()
+                        .filter(|e| !agents.contains_key(&e.id))
+                        .cloned(),
+                )
+                .collect()
         };
         Ok(AgentStatus {
             agents: statuses
@@ -974,7 +1044,9 @@ impl AgentManager {
             id: entry.info.id.clone(),
             state: AgentState::Completed,
         };
+        let snapshot = entry.info.clone();
         drop(agents);
+        let _ = self.remember(&snapshot).await;
         self.emit(&ack.id, AgentLogStage::Completed);
         self.cleanup_vm(&ack.id).await;
         Ok(ack)
@@ -987,6 +1059,7 @@ impl AgentManager {
             .await
             .get(id)
             .map(|entry| entry.info.clone())
+            .or_else(|| self.recovered().iter().find(|e| e.id == id).cloned())
             .ok_or(AgentError::NotFound)
     }
     pub async fn diagnostics(&self, id: &str) -> AgentResult<serde_json::Value> {

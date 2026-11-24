@@ -43,10 +43,22 @@ impl AgentManager {
         after_sequence: u64,
     ) -> AgentResult<AgentActivity> {
         let entries = self.inner.entries.lock().await;
-        Ok(entries
-            .get(id)
-            .ok_or(AgentError::NotFound)?
-            .activity_since(after_sequence))
+        if let Some(entry) = entries.get(id) {
+            return Ok(entry.activity_since(after_sequence));
+        }
+        let info = self
+            .recovered()
+            .iter()
+            .find(|info| info.id == id)
+            .ok_or(AgentError::NotFound)?;
+        Ok(AgentActivity {
+            id: info.id.clone(),
+            epoch: info.epoch,
+            state: info.state,
+            cursor: 0,
+            dropped_before: 0,
+            events: Vec::new(),
+        })
     }
 
     /// Cursor-based bounded wait for new progress, epoch change or terminal state.
@@ -60,6 +72,14 @@ impl AgentManager {
     ) -> AgentResult<AgentActivityWait> {
         if !(1..=MAX_WAIT_SECONDS).contains(&max_wait_seconds) {
             return Err(AgentError::Invalid);
+        }
+        if self.recovered().iter().any(|info| info.id == id)
+            && !self.inner.entries.lock().await.contains_key(id)
+        {
+            return Ok(AgentActivityWait {
+                activity: self.activity_since(id, after_sequence).await?,
+                timed_out: false,
+            });
         }
         let mut updates = {
             let entries = self.inner.entries.lock().await;
@@ -112,6 +132,14 @@ impl AgentManager {
     pub async fn wait(&self, id: &str, max_wait_seconds: u64) -> AgentResult<AgentWait> {
         if !(1..=MAX_WAIT_SECONDS).contains(&max_wait_seconds) {
             return Err(AgentError::Invalid);
+        }
+        if let Some(info) = self.recovered().iter().find(|info| info.id == id)
+            && !self.inner.entries.lock().await.contains_key(id)
+        {
+            return Ok(AgentWait {
+                agent: info.clone(),
+                timed_out: false,
+            });
         }
         let mut changes = {
             let agents = self.inner.entries.lock().await;

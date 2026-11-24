@@ -107,3 +107,7 @@ python3 -m unittest discover -s script -p 'test_dev.py'
 ```
 
 All runtime behavior and security changes require relevant positive and negative integration tests, plus recorded verification evidence. See [CAPABILITIES.md](CAPABILITIES.md), [QUALITY_GATES.md](QUALITY_GATES.md) and the [architecture decisions](decisions/README.md).
+
+### Restart-safe worker metadata
+
+CLI-managed agent managers keep a private, versioned, atomically replaced history of up to 128 worker IDs, workspace IDs, roles, states and epochs outside the workspace. A per-history OS lock prevents competing writers. Assignments are recorded before dispatch. Recovered running/waiting records are reported as failed/interrupted, and recovered terminal records remain queryable without stored results. No prompts, replies, completion credentials, or mutation authorization are persisted; recovered records cannot be resumed or replayed. Check the actual workspace before issuing a fresh assignment. Terminal history writes are best-effort and failures are audited.

@@ -8,6 +8,8 @@ pub enum AgentError {
     Disabled,
     #[error("Unknown subagent")]
     NotFound,
+    #[error("Private agent history unavailable; no assignment dispatched")]
+    HistoryUnavailable,
     #[error("Maximum concurrent subagent count reached")]
     Capacity,
     #[error(
@@ -58,6 +60,7 @@ pub enum AgentRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentLogStage {
     Created,
+    HistoryWriteFailed,
     BrowserCreated,
     BrowserCreateFailed,
     BrowserReplyReceived,
@@ -73,6 +76,7 @@ pub enum AgentLogStage {
 impl AgentLogStage {
     pub const fn audit_name(self) -> &'static str {
         match self {
+            Self::HistoryWriteFailed => "agent_history_write_failed",
             Self::Created => "agent_created",
             Self::BrowserCreated => "agent_browser_created",
             Self::BrowserCreateFailed => "agent_browser_create_failed",
@@ -90,7 +94,8 @@ impl AgentLogStage {
     pub const fn is_failure(self) -> bool {
         matches!(
             self,
-            Self::BrowserCreateFailed
+            Self::HistoryWriteFailed
+                | Self::BrowserCreateFailed
                 | Self::BrowserReplyFailed
                 | Self::BrowserReplyUncertain
                 | Self::BrowserReplyBlocked

@@ -2453,3 +2453,70 @@ async fn completed_tabs_are_evicted_at_the_live_cap_and_failed_tabs_close() {
         "a failed execution closes its tab"
     );
 }
+
+#[tokio::test]
+async fn history_recovers_interrupted_worker_without_replaying() {
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let registry = WorkspaceRegistry::new(dir.path(), &[]).unwrap();
+    let path = dir.path().join("history.json");
+    let manager = AgentManager::new(registry.clone(), Arc::new(FakeBackend))
+        .with_history(path.clone())
+        .unwrap();
+    let mut info = manager
+        .spawn(SpawnAgent {
+            workspace_id: None,
+            task: "private prompt fixture".into(),
+            role: AgentRole::Tester,
+            paths: vec![],
+            context: None,
+        })
+        .await
+        .unwrap();
+    manager.wait(&info.id, 5).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while Arc::strong_count(&manager.inner) > 1 {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    info.epoch += 1;
+    info.state = AgentState::Running;
+    manager.remember(&info).await.unwrap();
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("private prompt fixture")
+    );
+    assert!(
+        AgentManager::new(registry.clone(), Arc::new(FakeBackend))
+            .with_history(path.clone())
+            .is_err()
+    );
+    let history = Arc::downgrade(manager.inner.history.get().unwrap());
+    drop(manager);
+    while history.strong_count() > 0 {
+        assert!(std::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let recovered = loop {
+        match AgentManager::new(registry.clone(), Arc::new(FakeBackend)).with_history(path.clone())
+        {
+            Ok(manager) => break manager,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let record = recovered.result(&info.id).await.unwrap();
+    assert_eq!(record.state, AgentState::Failed);
+    assert!(record.result.is_none());
+    assert!(record.error.unwrap().contains("restart"));
+    assert!(!recovered.wait(&info.id, 1).await.unwrap().timed_out);
+    assert!(recovered.message(&info.id, "do not replay").await.is_err());
+}

@@ -786,43 +786,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audit_dir = logging::audit_directory(&root)?;
     let audit = novagpt_mcp::AuditTrail::persistent(audit_dir.clone())?;
     let usage = if local.usage_profiler_enabled {
-        novagpt_mcp::UsageProfiler::persistent(audit_dir)?
+        novagpt_mcp::UsageProfiler::persistent(audit_dir.clone())?
     } else {
         novagpt_mcp::UsageProfiler::disabled()
     };
-    let agents = browser.as_ref().map(|browser| {
-        let agent_audit = audit.clone();
-        let agent_usage = usage.clone();
-        let session_runtime = tokio::runtime::Handle::current();
-        AgentManager::new(
-            workspaces.clone(),
-            Arc::new(ChatGptBackend::new(browser.clone())),
-        )
-        .with_diagnostic_reporter(move |id, stage| {
-            agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+    let agents = browser
+        .as_ref()
+        .map(|browser| -> std::io::Result<_> {
+            let agent_audit = audit.clone();
+            let agent_usage = usage.clone();
+            let session_runtime = tokio::runtime::Handle::current();
+            Ok(AgentManager::new(
+                workspaces.clone(),
+                Arc::new(ChatGptBackend::new(browser.clone())),
+            )
+            .with_history(audit_dir.join("agent-history.json"))?
+            .with_diagnostic_reporter(move |id, stage| {
+                agent_audit.record_agent(stage.audit_name(), stage.is_failure(), id);
+            })
+            .with_usage_reporter(
+                move |id, repository_id, input_chars, output_chars, failed| {
+                    agent_usage.observe_model_turn(
+                        id,
+                        repository_id,
+                        input_chars,
+                        output_chars,
+                        failed,
+                    );
+                },
+            )
+            .with_conversation_recorder(move |id, url| {
+                // Owner-private index only: no prompt or reply is written here.
+                let id = id.to_owned();
+                let url = url.to_owned();
+                session_runtime.spawn_blocking(move || {
+                    if let Ok(store) = sessions::SessionStore::open_default() {
+                        let _ = store.record(sessions::SessionKind::Subagent, &id, &url, None);
+                    }
+                });
+            }))
         })
-        .with_usage_reporter(
-            move |id, repository_id, input_chars, output_chars, failed| {
-                agent_usage.observe_model_turn(
-                    id,
-                    repository_id,
-                    input_chars,
-                    output_chars,
-                    failed,
-                );
-            },
-        )
-        .with_conversation_recorder(move |id, url| {
-            // Owner-private index only: no prompt or reply is written here.
-            let id = id.to_owned();
-            let url = url.to_owned();
-            session_runtime.spawn_blocking(move || {
-                if let Ok(store) = sessions::SessionStore::open_default() {
-                    let _ = store.record(sessions::SessionKind::Subagent, &id, &url, None);
-                }
-            });
-        })
-    });
+        .transpose()?;
     let agents = agents.map(|manager| match &vm {
         Some(vm_manager) => manager.with_vm_manager(vm_manager.clone()),
         None => manager,
