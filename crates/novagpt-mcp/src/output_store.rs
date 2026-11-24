@@ -1,5 +1,5 @@
 //! Workspace-scoped, process-local retained Bash output (never persisted to disk).
-//! Four entries maximum; paging uses UTF-16 offsets matching the TS wire contract.
+//! Bounded FIFO retention; paging uses UTF-16 offsets matching the wire contract.
 use serde::Serialize;
 use std::{
     collections::VecDeque,
@@ -7,7 +7,9 @@ use std::{
 };
 use uuid::Uuid;
 
-const MAX_ENTRIES: usize = 4;
+// Keep enough command resources for multiple concurrent workers, while bounding
+// worst-case capture memory (64 entries × 2 streams × 64 Ki Unicode scalars).
+const MAX_ENTRIES: usize = 64;
 const MAX_CAPTURE: usize = 64 * 1024;
 
 #[derive(Debug)]
@@ -142,10 +144,40 @@ mod tests {
         assert_eq!(p2.next_offset, Some(7));
         assert!(store.read("ws_a", &id, "stdout", 6, 2).is_err());
         assert!(store.read("ws_a", &id, "stderr", 0, 1).is_err());
-        for _ in 0..4 {
+        for _ in 0..MAX_ENTRIES {
             store.save("ws_a", "next", "", false).expect("save");
         }
         assert!(store.read("ws_a", &id, "stdout", 0, 100).is_err());
+    }
+
+    #[test]
+    fn five_concurrent_commands_keep_all_resources_readable() {
+        let store = OutputStore::default();
+        let barrier = std::sync::Barrier::new(5);
+        let ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..5)
+                .map(|worker| {
+                    let store = &store;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let value = format!("worker {worker}");
+                        let id = store.save("ws_a", &value, "", false).unwrap();
+                        barrier.wait();
+                        assert_eq!(
+                            store.read("ws_a", &id, "stdout", 0, 100).unwrap().text,
+                            value
+                        );
+                        id
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        assert_eq!(ids.len(), 5);
     }
 
     #[test]
