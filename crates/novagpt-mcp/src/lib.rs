@@ -1613,7 +1613,7 @@ impl NovaMcp {
     }
 
     #[tool(
-        description = "Manage owned disposable VM forks: images/create/status/start/stop/eject_iso/destroy. Stop is graceful by default; force=true explicitly kills the disposable guest. Create accepts an optional human-approved installer_iso name, networks=[nat,none,listen:SEGMENT,connect:SEGMENT], up to four NICs; optional private display and guest_agent. Linux QEMU networking never modifies host interfaces. --vm-home required."
+        description = "Manage owned disposable VM forks: images/create/status/start/stop/eject_iso/destroy. Images also lists explicitly registered persistent libvirt guests; use their libvirt- UUID IDs with status only. Stop is graceful by default; force=true explicitly kills the disposable guest. Create accepts an optional human-approved installer_iso name, networks=[nat,none,listen:SEGMENT,connect:SEGMENT], up to four NICs; optional private display and guest_agent. Linux QEMU networking never modifies host interfaces. --vm-home required."
     )]
     async fn vm(&self, Parameters(args): Parameters<VmArgs>) -> CallToolResult {
         let response = async {

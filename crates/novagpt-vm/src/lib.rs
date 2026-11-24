@@ -1,6 +1,7 @@
 //! Opt-in disposable VM management. Never touches other application VM state.
 pub mod image_promotion;
 pub mod iso;
+mod libvirt;
 pub mod linux_qemu;
 #[cfg(target_os = "linux")]
 mod process_identity;
@@ -148,6 +149,7 @@ pub struct VmImages {
     pub action: &'static str,
     pub images: Vec<VmImage>,
     pub image_count: usize,
+    pub registered_domains: Vec<libvirt::RegisteredDomain>,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,6 +320,7 @@ impl VmManager {
             action: "images",
             images,
             image_count,
+            registered_domains: self.registered_domains()?,
         })
     }
 
@@ -525,6 +528,9 @@ impl VmManager {
     }
 
     pub async fn status(&self, id: &str) -> VmResult<VmStatus> {
+        if id.starts_with("libvirt-") {
+            return self.libvirt_status(id).await;
+        }
         let mut instance = self.load_instance(id)?;
         if instance.backend == VmBackend::Hyperv {
             let name = hyperv_name(id);
