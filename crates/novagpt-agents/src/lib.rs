@@ -62,6 +62,10 @@ pub enum AgentError {
     NotFound,
     #[error("Maximum concurrent subagent count reached")]
     Capacity,
+    #[error(
+        "Subagent registry is full (64 records); completed records are retained until server restart"
+    )]
+    RecordCapacity,
     #[error("Subagent is already running; check status before messaging")]
     Busy,
     #[error("Subagent was cancelled")]
@@ -504,6 +508,7 @@ struct Inner {
     workspaces: WorkspaceRegistry,
     vm: OnceLock<VmManager>,
     spawn_gate: Mutex<()>,
+    tab_gate: Mutex<()>,
     entries: Mutex<HashMap<String, Entry>>,
     max_agents: usize,
     max_live_tabs: usize,
@@ -528,6 +533,7 @@ impl AgentManager {
                 workspaces,
                 vm: OnceLock::new(),
                 spawn_gate: Mutex::new(()),
+                tab_gate: Mutex::new(()),
                 entries: Mutex::new(HashMap::new()),
                 max_agents: MAX_AGENTS,
                 max_live_tabs: MAX_LIVE_TABS,
@@ -670,14 +676,16 @@ impl AgentManager {
         let _spawn_guard = self.inner.spawn_gate.lock().await;
         {
             let agents = self.inner.entries.lock().await;
-            if agents.len() >= MAX_RECORDS
-                || agents
-                    .values()
-                    .filter(|entry| {
-                        matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
-                    })
-                    .count()
-                    >= self.inner.max_agents
+            if agents.len() >= MAX_RECORDS {
+                return Err(AgentError::RecordCapacity);
+            }
+            if agents
+                .values()
+                .filter(|entry| {
+                    matches!(entry.info.state, AgentState::Running | AgentState::Waiting)
+                })
+                .count()
+                >= self.inner.max_agents
             {
                 return Err(AgentError::Capacity);
             }
@@ -765,12 +773,14 @@ impl AgentManager {
         };
         {
             let mut agents = self.inner.entries.lock().await;
-            if agents.len() >= MAX_RECORDS
-                || agents
-                    .values()
-                    .filter(|a| matches!(a.info.state, AgentState::Running | AgentState::Waiting))
-                    .count()
-                    >= self.inner.max_agents
+            if agents.len() >= MAX_RECORDS {
+                return Err(AgentError::RecordCapacity);
+            }
+            if agents
+                .values()
+                .filter(|a| matches!(a.info.state, AgentState::Running | AgentState::Waiting))
+                .count()
+                >= self.inner.max_agents
             {
                 return Err(AgentError::Capacity);
             }
@@ -815,6 +825,10 @@ impl AgentManager {
         tokio::spawn(async move {
             let outcome = async {
                 if must_create {
+                    let _tab_guard = manager.inner.tab_gate.lock().await;
+                    if !manager.is_active(&id, epoch).await {
+                        return Err(BackendFailure::Unavailable);
+                    }
                     manager.evict_completed_tabs().await;
                     let created = manager.inner.backend.create(&id).await;
                     manager.emit(
@@ -826,8 +840,10 @@ impl AgentManager {
                         },
                     );
                     created?;
+                    manager.mark_ready(&id, epoch).await;
+                } else {
+                    manager.mark_ready(&id, epoch).await;
                 }
-                manager.mark_ready(&id, epoch).await;
                 if !manager.is_active(&id, epoch).await {
                     manager.inner.backend.close(&id).await;
                     return Err(BackendFailure::Unavailable);
@@ -849,7 +865,17 @@ impl AgentManager {
                     Err(BackendFailure::Manual(_)) => AgentLogStage::BrowserReplyManual,
                     Err(BackendFailure::Unavailable) => AgentLogStage::BrowserReplyFailed,
                 };
-                manager.emit(&id, stage);
+                let still_observed = {
+                    let entries = manager.inner.entries.lock().await;
+                    entries.get(&id).is_some_and(|entry| {
+                        entry.epoch == epoch
+                            && entry.info.state == AgentState::Running
+                            && !entry.completion_claimed
+                    })
+                };
+                if still_observed {
+                    manager.emit(&id, stage);
+                }
                 reply
             }
             .await;
@@ -960,6 +986,7 @@ impl AgentManager {
         let mut agents = self.inner.entries.lock().await;
         if let Some(entry) = agents.get_mut(id)
             && entry.epoch == epoch
+            && entry.info.state == AgentState::Running
         {
             entry.ready = true;
         }
@@ -1035,7 +1062,12 @@ impl AgentManager {
         }
         let gate = self.patch_gate(id).await?;
         let _patch_guard = gate.lock().await;
+        let _admission = self.inner.spawn_gate.lock().await;
         let mut agents = self.inner.entries.lock().await;
+        let active = agents
+            .values()
+            .filter(|entry| matches!(entry.info.state, AgentState::Running | AgentState::Waiting))
+            .count();
         let entry = agents.get_mut(id).ok_or(AgentError::NotFound)?;
         if entry.completion_claimed {
             return Err(AgentError::Busy);
@@ -1063,6 +1095,9 @@ impl AgentManager {
             AgentState::Waiting if !resume => return Err(AgentError::NotWaiting),
             state if state != AgentState::Waiting && resume => return Err(AgentError::NotWaiting),
             _ => {}
+        }
+        if !resume && active >= self.inner.max_agents {
+            return Err(AgentError::Capacity);
         }
         let prompt = if resume {
             // Manual verification resumes the same task: do not rotate the
@@ -1225,7 +1260,7 @@ impl AgentManager {
             .patch_gate(id)
             .await
             .map_err(|_| AgentError::CompletionDenied)?;
-        let _patch_guard = gate.lock().await;
+        let patch_guard = gate.lock_owned().await;
         {
             let mut agents = self.inner.entries.lock().await;
             let entry = agents.get_mut(id).ok_or(AgentError::CompletionDenied)?;
@@ -1253,6 +1288,17 @@ impl AgentManager {
             entry.pending_prompt.clear();
             entry.completion_code.clear();
         }
+        let manager = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let _patch_guard = patch_guard;
+            manager.finish_claimed(&id).await
+        })
+        .await
+        .map_err(|_| AgentError::Backend)?
+    }
+
+    async fn finish_claimed(&self, id: &str) -> AgentResult<AgentCompletionAck> {
         self.inner.backend.complete(id).await;
         let mut agents = self.inner.entries.lock().await;
         let entry = agents.get_mut(id).ok_or(AgentError::CompletionDenied)?;
@@ -3738,6 +3784,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnected_completion_request_does_not_strand_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(DelayedCompleteBackend {
+            sending: tokio::sync::Notify::new(),
+            completing: tokio::sync::Notify::new(),
+            release_complete: tokio::sync::Notify::new(),
+        });
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(dir.path(), &[]).unwrap(),
+            backend.clone(),
+        );
+        let info = manager.spawn(tab_task(0)).await.unwrap();
+        backend.sending.notified().await;
+        let code = manager.inner.entries.lock().await[&info.id]
+            .completion_code
+            .clone();
+        let worker = manager.clone();
+        let id = info.id.clone();
+        let callback =
+            tokio::spawn(async move { worker.finished(&id, &code, "accepted result").await });
+        backend.completing.notified().await;
+        callback.abort();
+        assert!(callback.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            manager.message(&info.id, "next").await,
+            Err(AgentError::Busy)
+        ));
+        backend.release_complete.notify_one();
+        let done = manager.wait(&info.id, 2).await.unwrap();
+        assert_eq!(done.agent.state, AgentState::Completed);
+        assert_eq!(done.agent.result.unwrap().raw_response, "accepted result");
+    }
+
+    #[tokio::test]
     async fn cancelled_agent_cannot_be_resumed() {
         let dir = tempfile::tempdir().expect("fixture");
         let manager = AgentManager::new(
@@ -3806,7 +3886,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_concurrent_workers_out_of_order_with_isolated_cancellation() {
+    async fn five_concurrent_workers_out_of_order_with_isolated_cancellation() {
         use std::collections::{HashMap, HashSet};
         use tokio::sync::mpsc;
         let root = tempfile::tempdir().expect("owned test workspace");
@@ -3828,6 +3908,7 @@ mod tests {
             AgentRole::Reviewer,
             AgentRole::Tester,
             AgentRole::Implementer,
+            AgentRole::Reviewer,
         ] {
             let info = manager
                 .spawn(SpawnAgent {
@@ -3843,14 +3924,14 @@ mod tests {
             ids.push(info.id);
         }
         let mut gates = HashMap::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             let (id, release) = tokio::time::timeout(Duration::from_secs(3), received.recv())
                 .await
                 .expect("all sessions started")
                 .expect("channel open");
             assert!(gates.insert(id, release).is_none());
         }
-        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 5);
         let cancelled_id = ids[1].clone();
         manager
             .cancel(&cancelled_id)
@@ -3864,7 +3945,7 @@ mod tests {
                 .state,
             AgentState::Cancelled
         );
-        // Complete the other three in reverse registration order.
+        // Complete the other four in reverse registration order.
         for id in ids.iter().rev().filter(|id| *id != &cancelled_id) {
             gates
                 .remove(id)
@@ -3901,6 +3982,51 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&sentinel).expect("source"),
             "user-owned source is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn followups_and_spawns_share_the_same_active_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let (entered, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let manager = AgentManager::new(
+            WorkspaceRegistry::new(root.path(), &[]).unwrap(),
+            Arc::new(OrderedWorkers {
+                entered,
+                cancelled: Mutex::new(Vec::new()),
+                closed: Mutex::new(Vec::new()),
+            }),
+        );
+        let previous = manager.spawn(tab_task(0)).await.unwrap();
+        let (_, release) = received.recv().await.unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            manager.wait(&previous.id, 2).await.unwrap().agent.state,
+            AgentState::Completed
+        );
+        let mut active = Vec::new();
+        let mut releases = Vec::new();
+        for i in 0..MAX_AGENTS {
+            active.push(manager.spawn(tab_task(i + 1)).await.unwrap().id);
+            releases.push(received.recv().await.unwrap().1);
+        }
+        assert!(matches!(
+            manager.message(&previous.id, "followup").await,
+            Err(AgentError::Capacity)
+        ));
+        assert!(matches!(
+            manager.spawn(tab_task(99)).await,
+            Err(AgentError::Capacity)
+        ));
+        releases.pop().unwrap().send(()).unwrap();
+        manager.wait(active.last().unwrap(), 2).await.unwrap();
+        assert_eq!(
+            manager
+                .message(&previous.id, "followup")
+                .await
+                .unwrap()
+                .state,
+            AgentState::Running
         );
     }
 
