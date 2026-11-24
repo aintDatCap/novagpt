@@ -576,8 +576,10 @@ struct Inner {
     runtime: Mutex<Option<UndetectedChrome>>,
     dev_origin: Option<reqwest::Url>,
     create_lock: Mutex<()>,
-    // Foreground input is shared across tabs; response polling is not.
-    interaction_lock: Mutex<()>,
+    /// Only one worker may own the foreground while composing and submitting.
+    /// New tabs also take this lock because Chrome activates them.
+    /// Background reply polling never holds it.
+    foreground_lock: Mutex<()>,
     pages: Mutex<HashMap<String, Arc<Page>>>,
     reporter: Option<DiagnosticReporter>,
     pacing: InteractionPacing,
@@ -626,7 +628,7 @@ impl ChatGptBrowser {
                 runtime: Mutex::new(None),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
-                interaction_lock: Mutex::new(()),
+                foreground_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
                 pacing: InteractionPacing::human(),
@@ -655,7 +657,7 @@ impl ChatGptBrowser {
                 runtime: Mutex::new(Some(UndetectedChrome::from_session_for_test(session))),
                 dev_origin: None,
                 create_lock: Mutex::new(()),
-                interaction_lock: Mutex::new(()),
+                foreground_lock: Mutex::new(()),
                 pages: Mutex::new(HashMap::new()),
                 reporter: None,
                 pacing: InteractionPacing::instant(),
@@ -823,7 +825,7 @@ impl ChatGptBrowser {
             self.page(id).await?
         };
         let setup_result = {
-            let _interaction = self.inner.interaction_lock.lock().await;
+            let _foreground_guard = self.inner.foreground_lock.lock().await;
             project_setup::ensure(&page.transport, &self.inner.config.profile).await
         };
         match setup_result {
@@ -869,7 +871,9 @@ impl ChatGptBrowser {
                 sleep(gap - elapsed).await;
             }
         }
-        let _interaction = self.inner.interaction_lock.lock().await;
+        // Opening a tab can activate it even while another worker is typing.
+        // Never steal the foreground between its focus check and submission.
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         *self.inner.last_open.lock().await = Some(Instant::now());
         let chrome = self.chrome().await?;
         {
@@ -955,7 +959,7 @@ impl ChatGptBrowser {
                 self.page(BROWSE_TAB).await?
             }
         };
-        let _interaction = self.inner.interaction_lock.lock().await;
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         page.ensure_interactive().await
     }
 
@@ -963,7 +967,7 @@ impl ChatGptBrowser {
     /// through MCP. Subagent pages and their conversations are unaffected.
     pub async fn browse_navigate(&self, url: &str) -> Result<BrowsedPage, BrowserError> {
         let target = self.approved_url(url)?;
-        let _interaction = self.inner.interaction_lock.lock().await;
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         let page = self.page(BROWSE_TAB).await?;
         let previous = page
             .eval("location.href")
@@ -1146,7 +1150,7 @@ impl ChatGptBrowser {
     /// Click a visible, unobscured element using a physical browser mouse event.
     pub async fn browse_click(&self, selector: &str) -> Result<bool, BrowserError> {
         validate_selector(selector)?;
-        let _interaction = self.inner.interaction_lock.lock().await;
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         let page = self.page(BROWSE_TAB).await?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
@@ -1188,7 +1192,7 @@ impl ChatGptBrowser {
         if text.is_empty() || text.len() > MAX_INPUT_TEXT {
             return Err(BrowserError::InvalidControl);
         }
-        let _interaction = self.inner.interaction_lock.lock().await;
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         let page = self.page(BROWSE_TAB).await?;
         let location = page.eval("location.href").await?;
         self.approved_url(location.as_str().ok_or(BrowserError::Protocol)?)?;
@@ -1489,10 +1493,12 @@ impl ChatGptBrowser {
                 page.pacing.settle_jitter,
             ))
             .await;
+            // Per-page send locks cannot protect Chrome's shared foreground.
+            // Release this immediately after submitting, not after the reply.
+            let _foreground_guard = self.inner.foreground_lock.lock().await;
             // Input into a hidden or unfocused tab is not something a person
             // can do. Raise this tab and refuse to type unless the document
             // confirms it is visible and focused.
-            let _interaction = self.inner.interaction_lock.lock().await;
             if page.cancelled.load(Ordering::Acquire) {
                 return Err(BrowserError::Cancelled);
             }
@@ -1795,6 +1801,9 @@ impl ChatGptBrowser {
     }
 
     pub async fn close(&self, id: &str) -> Result<(), BrowserError> {
+        // ChromeDriver selects the window to close, potentially activating it.
+        // Do not steal focus from another worker between input and submission.
+        let _foreground_guard = self.inner.foreground_lock.lock().await;
         if let Some(page) = self.inner.pages.lock().await.remove(id) {
             page.cancelled.store(true, Ordering::Release);
             page.transport.close().await.map_err(BrowserError::from)?;
@@ -2321,6 +2330,7 @@ mod tests {
         chat_url: String,
         project_ui_enabled: bool,
         project_exists: bool,
+        project_row_role_button: bool,
         project_ui_missing: bool,
         project_verification: bool,
         project_creations: usize,
@@ -2500,7 +2510,13 @@ mod tests {
                     "missing"
                 } else {
                     match action {
-                        "existing" if state.project_exists => "new-chat",
+                        "existing" if state.project_exists => {
+                            if state.project_row_role_button {
+                                "entry"
+                            } else {
+                                "new-chat"
+                            }
+                        }
                         "new-project" if !state.project_exists => "control",
                         "name-input" | "create-project" if !state.project_exists => "control",
                         "verify"
@@ -2513,7 +2529,7 @@ mod tests {
                     }
                 };
                 state.project_pending = match action {
-                    "existing" if kind == "new-chat" => "new-chat".into(),
+                    "existing" if kind == "new-chat" || kind == "entry" => kind.into(),
                     "new-project" if kind == "control" => "new-project".into(),
                     "name-input" if kind == "control" => "name-input".into(),
                     "create-project" if kind == "control" => "create-project".into(),
@@ -2652,6 +2668,77 @@ mod tests {
         WebDriverSession::create(client, json!({"browserName":"chrome"}))
             .await
             .expect("session")
+    }
+
+    #[tokio::test]
+    async fn foreground_composition_blocks_competing_tab_creation() {
+        let (port, state, server) = spawn_mock().await;
+        state.lock().await.verified = true;
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.open("agent-one").await.expect("first tab");
+
+        // Hold the same foreground gate that protects focus, input and send.
+        // Neither a second tab nor a prompt may activate Chrome until it is
+        // released. Background reads are intentionally not part of this gate.
+        let foreground = browser.inner.foreground_lock.lock().await;
+        let first = browser.clone();
+        let sending = tokio::spawn(async move { first.send("agent-one", "First prompt").await });
+        let second = browser.clone();
+        let opening = tokio::spawn(async move { second.open("agent-two").await });
+        let third = browser.clone();
+        let opening_three = tokio::spawn(async move { third.open("agent-three").await });
+        let fourth = browser.clone();
+        let opening_four = tokio::spawn(async move { fourth.open("agent-four").await });
+        tokio::task::yield_now().await;
+        sleep(Duration::from_millis(80)).await;
+        {
+            let mock = state.lock().await;
+            assert_eq!(mock.handles.len(), 2, "opening another tab must wait");
+            assert!(
+                !mock.cdp.iter().any(|cmd| cmd == "Page.bringToFront"),
+                "the first worker must wait before raising its tab"
+            );
+        }
+        drop(foreground);
+
+        let reply = timeout(Duration::from_secs(8), sending)
+            .await
+            .expect("send deadline")
+            .expect("send task")
+            .expect("send");
+        assert_eq!(reply.content, "Fixture answer");
+        for opening in [opening, opening_three, opening_four] {
+            timeout(Duration::from_secs(8), opening)
+                .await
+                .expect("open deadline")
+                .expect("open task")
+                .expect("worker tab");
+        }
+        let mock = state.lock().await;
+        assert_eq!(mock.handles.len(), 5, "all four worker tabs remain open");
+        assert!(
+            mock.cdp.iter().any(|cmd| cmd == "Page.bringToFront"),
+            "worker input must eventually raise its own tab"
+        );
+        drop(mock);
+
+        // Closing a worker tab also selects it in ChromeDriver; it must not
+        // interrupt another worker that currently owns the foreground.
+        let foreground = browser.inner.foreground_lock.lock().await;
+        let closing_browser = browser.clone();
+        let closing = tokio::spawn(async move { closing_browser.close("agent-two").await });
+        tokio::task::yield_now().await;
+        sleep(Duration::from_millis(80)).await;
+        assert_eq!(state.lock().await.handles.len(), 5, "close must wait");
+        drop(foreground);
+        timeout(Duration::from_secs(8), closing)
+            .await
+            .expect("close deadline")
+            .expect("close task")
+            .expect("close tab");
+        assert_eq!(state.lock().await.handles.len(), 4);
+        browser.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -2847,6 +2934,27 @@ mod tests {
             2,
             "existing project needs only the worker tab"
         );
+        assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
+        drop(mock);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn automatic_subagent_project_opens_role_button_sidebar_row() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.project_ui_enabled = true;
+            mock.project_exists = true;
+            mock.project_row_role_button = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.inner.auto_project.store(true, Ordering::Relaxed);
+        browser.open("agent-role-row").await.expect("project row");
+        let mock = state.lock().await;
+        assert_eq!(mock.project_creations, 0, "must not duplicate the project");
+        assert_eq!(mock.handles.len(), 2);
         assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
         drop(mock);
         browser.shutdown().await;
@@ -3127,7 +3235,7 @@ mod tests {
         state.lock().await.verified = true;
         let browser = ChatGptBrowser::with_test_session(test_session(port).await);
         browser.open("agent-queued").await.expect("open");
-        let gate = browser.inner.interaction_lock.lock().await;
+        let gate = browser.inner.foreground_lock.lock().await;
         let worker = browser.clone();
         let send = tokio::spawn(async move { worker.send("agent-queued", "Queued prompt").await });
         timeout(Duration::from_secs(3), async {

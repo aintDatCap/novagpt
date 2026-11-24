@@ -11,6 +11,18 @@ fn run(root: &std::path::Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn help_parses_without_windows_stack_overflow() {
+    let output = Command::new(env!("CARGO_BIN_EXE_novagpt"))
+        .arg("--help")
+        .output()
+        .expect("NovaGPT help command");
+    assert!(output.status.success(), "{:?}", output.status);
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("Usage:"));
+    assert!(help.contains("doctor"));
+}
+
+#[test]
 fn doctor_and_inspect_are_read_only_and_structured() {
     let workspace = tempfile::tempdir().expect("root");
     fs::write(workspace.path().join("hello.rs"), "fn main() {}\n").expect("file");

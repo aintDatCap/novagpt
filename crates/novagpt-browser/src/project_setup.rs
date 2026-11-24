@@ -56,6 +56,12 @@ if (action === 'existing') {
     const link = controls().find(e => e.tagName === 'A'
         && label(e) === name && (e.getAttribute('href') || '').includes('/g/g-p-'));
     if (link) return {kind: 'link', href: link.href};
+    // Current ChatGPT project rows are clickable role=button divs outside
+    // older aside/nav containers. Prefer the row to hover-only chat actions.
+    const row = controls().find(e => e.getAttribute('role') === 'button'
+        && label(e) === name
+        && !e.closest('main, [role="main"], [role="dialog"]'));
+    if (row) return mark(row, 'entry');
     const newChatLabels = ['New chat in ' + name, 'Nuova chat in ' + name];
     const newChat = controls().find(e => newChatLabels.includes(label(e)));
     if (newChat) return mark(newChat, 'new-chat');
@@ -311,6 +317,8 @@ mod tests {
         assert_eq!(NAME, "NovaGPT - subagents");
         assert!(PROJECT_UI.contains("New chat in "));
         assert!(PROJECT_UI.contains("add new project"));
+        assert!(PROJECT_UI.contains("e.getAttribute('role') === 'button'"));
+        assert!(PROJECT_UI.contains("!e.closest('main, [role=\"main\"], [role=\"dialog\"]')"));
         assert!(PROJECT_UI.contains("document.querySelectorAll"));
         assert!(!PROJECT_UI.contains("fetch("));
     }

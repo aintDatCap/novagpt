@@ -449,9 +449,29 @@ async fn http_stop_signal() {
     }
 }
 
+// On Windows the main executable thread reserves only 1 MiB of stack. Clap's
+// generated command tree exceeds that budget in debug builds, even for --help.
+// Parse on a short-lived thread instead of increasing the stack of every
+// NovaGPT thread or changing the command-line interface.
+fn parse_cli() -> Result<Cli, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        std::thread::Builder::new()
+            .name("novagpt-cli-parser".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(Cli::parse)?
+            .join()
+            .map_err(|_| "NovaGPT command-line parser panicked".into())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Cli::parse())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli = parse_cli()?;
     if cli.setup && cli.command.is_some() {
         return Err("--setup cannot be combined with a server subcommand".into());
     }

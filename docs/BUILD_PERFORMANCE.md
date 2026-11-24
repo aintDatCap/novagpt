@@ -34,6 +34,8 @@ This profile intentionally builds a separate set of artifacts and requires a fir
 
 For rapid POSIX source iteration with an owned server and ngrok tunnel, use `python3 script/dev.py --port 8787 --ngrok`. It shares `target/debug` with normal `cargo build` and keeps the previous working server alive while Rust recompiles. Do not run another service on that port.
 
+On Windows, the large Clap subcommand tree can exhaust the default 1 MiB executable main-thread stack during argument parsing (including `--help` in debug builds). NovaGPT parses CLI arguments on a short-lived 8 MiB stack thread on Windows only. This avoids changing the executable's global stack reserve or the stack size of long-lived Tokio workers. The `cli_diagnostics` integration tests cover help and read-only command startup.
+
 ## Native releases
 
 ```bash
