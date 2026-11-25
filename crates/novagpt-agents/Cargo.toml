@@ -5,19 +5,40 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+browser = ["dep:novagpt-browser"]
+workspaces = ["dep:novagpt-core"]
+vm = ["dep:novagpt-vm"]
+full = ["coding"]
+# The existing workspace-aware browser/VM agent manager is opt-in.
+coding = [
+    "workspaces",
+    "browser",
+    "vm",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:uuid",
+    "dep:base64",
+    "dep:subtle",
+    "dep:tempfile",
+    "dep:fs2",
+    "tokio/rt-multi-thread",
+]
+
 [dependencies]
-novagpt-core = { path = "../novagpt-core" }
-novagpt-browser = { path = "../novagpt-browser" }
-novagpt-vm = { path = "../novagpt-vm" }
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+novagpt-core = { path = "../novagpt-core", optional = true }
+novagpt-browser = { path = "../novagpt-browser", optional = true }
+novagpt-vm = { path = "../novagpt-vm", optional = true }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, optional = true }
 async-trait.workspace = true
-base64.workspace = true
-subtle.workspace = true
+base64 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 
 # Private restart metadata uses existing workspace dependencies.
-tempfile = "3"
-fs2 = "0.4"
+tempfile = { version = "3", optional = true }
+fs2 = { version = "0.4", optional = true }

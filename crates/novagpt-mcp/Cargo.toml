@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 novagpt-core = { path = "../novagpt-core" }
 novagpt-vm = { path = "../novagpt-vm" }
-novagpt-agents = { path = "../novagpt-agents" }
+novagpt-agents = { path = "../novagpt-agents", features = ["full"] }
 novagpt-browser = { path = "../novagpt-browser" }
 rmcp.workspace = true
 tokio.workspace = true

@@ -1,20 +1,45 @@
-//! Untrusted, opt-in asynchronous subagents. No implicit ChatGPT chat identity.
+//! Generic agent runtime, with optional workspace-aware coding subagents.
+//! Enable the `coding` feature for the existing browser/VM manager.
+
+pub mod runtime;
+
+#[cfg(feature = "browser")]
+pub use novagpt_browser as browser;
+#[cfg(feature = "workspaces")]
+pub use novagpt_core as workspaces;
+#[cfg(feature = "vm")]
+pub use novagpt_vm as vm;
+pub use runtime::{
+    AgentRunError, AgentRunResult, AgentRuntime, AgentTask, CancellationToken, RuntimeBackend,
+};
+
+#[cfg(feature = "coding")]
 mod activity;
+#[cfg(feature = "coding")]
 mod backend;
+#[cfg(feature = "coding")]
 mod contract;
+#[cfg(feature = "coding")]
 mod history;
+#[cfg(feature = "coding")]
 mod mutations;
 
+#[cfg(feature = "coding")]
 pub use backend::{AgentBackend, BackendFailure, ChatGptBackend};
+#[cfg(feature = "coding")]
 pub use contract::{
     ActivityEvent, AgentActivity, AgentActivityWait, AgentCompletionAck, AgentCreateReceipt,
     AgentError, AgentInfo, AgentLogStage, AgentOutput, AgentPatchReceipt, AgentResult, AgentRole,
     AgentState, AgentStatus, AgentToolProbe, AgentVmLease, AgentVmState, AgentWait, SpawnAgent,
 };
 
+#[cfg(feature = "coding")]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(feature = "coding")]
 use novagpt_core::WorkspaceRegistry;
+#[cfg(feature = "coding")]
 use novagpt_vm::{VmCreate, VmManager};
+#[cfg(feature = "coding")]
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -24,37 +49,56 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(feature = "coding")]
 use subtle::ConstantTimeEq;
+#[cfg(feature = "coding")]
 use tokio::sync::{Mutex, watch};
+#[cfg(feature = "coding")]
 use uuid::Uuid;
 
+#[cfg(feature = "coding")]
 const MAX_AGENTS: usize = 6;
+#[cfg(feature = "coding")]
 const MAX_RECORDS: usize = 64;
 
 /// Completed conversations stay open for follow-up messages, but the Chrome
 /// window must not accumulate one tab per agent forever. The oldest completed
 /// tab is closed when the cap is reached; a later follow-up then opens a new
 /// conversation instead of reusing the evicted tab.
+#[cfg(feature = "coding")]
 const MAX_LIVE_TABS: usize = 8;
+#[cfg(feature = "coding")]
 const MAX_ACTIVITY_EVENTS: usize = 32;
+#[cfg(feature = "coding")]
 const MAX_ACTIVITY_REPORTS: u16 = 1024;
+#[cfg(feature = "coding")]
 const MAX_TASK: usize = 50_000;
+#[cfg(feature = "coding")]
 const MAX_MESSAGE: usize = 50_000;
+#[cfg(feature = "coding")]
 const MAX_RESULT: usize = 180_000;
+#[cfg(feature = "coding")]
 const MAX_WAIT_SECONDS: u64 = 25;
 // Six URL-safe base64 characters from CSPRNG UUIDv4 bytes: 36 bits.
 // This short code is intentionally online-guess-resistant only with strict
 // per-execution failure limits and the MCP transport's existing authentication.
+#[cfg(feature = "coding")]
 const COMPLETION_KEY_LEN: usize = 6;
+#[cfg(feature = "coding")]
 const MAX_COMPLETION_ATTEMPTS: u8 = 5;
+#[cfg(feature = "coding")]
 const MAX_PATCH_ATTEMPTS: u8 = 16;
+#[cfg(feature = "coding")]
 const MAX_CREATE_ATTEMPTS: u16 = 256;
+#[cfg(feature = "coding")]
 const MAX_AGENT_PATCH_BYTES: usize = 200_000;
 
+#[cfg(feature = "coding")]
 fn completion_code() -> String {
     URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes())[..COMPLETION_KEY_LEN].to_owned()
 }
 
+#[cfg(feature = "coding")]
 #[derive(Clone)]
 struct Entry {
     info: AgentInfo,
@@ -77,6 +121,7 @@ struct Entry {
     updates: watch::Sender<AgentInfo>,
 }
 
+#[cfg(feature = "coding")]
 impl Entry {
     /// Shared, per-execution authentication budget for all worker callbacks.
     fn accept_code(&mut self, code: &str) -> bool {
@@ -151,12 +196,16 @@ impl Entry {
     }
 }
 
+#[cfg(feature = "coding")]
 type AgentDiagnosticReporter = Arc<dyn Fn(&str, AgentLogStage) + Send + Sync>;
 /// Receives (agent id, conversation URL). Must not block.
+#[cfg(feature = "coding")]
 type ConversationRecorder = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// Opaque agent/repository identifiers, request/reply character counts and failure only.
+#[cfg(feature = "coding")]
 type AgentUsageReporter = Arc<dyn Fn(&str, &str, usize, Option<usize>, bool) + Send + Sync>;
 
+#[cfg(feature = "coding")]
 struct Inner {
     backend: Arc<dyn AgentBackend>,
     workspaces: WorkspaceRegistry,
@@ -178,11 +227,13 @@ struct Inner {
     /// the validated conversation URL; never prompts or replies.
     conversation_recorder: OnceLock<ConversationRecorder>,
 }
+#[cfg(feature = "coding")]
 #[derive(Clone)]
 pub struct AgentManager {
     inner: Arc<Inner>,
 }
 
+#[cfg(feature = "coding")]
 impl AgentManager {
     pub fn new(workspaces: WorkspaceRegistry, backend: Arc<dyn AgentBackend>) -> Self {
         Self {
@@ -1137,5 +1188,5 @@ impl AgentManager {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "coding"))]
 mod tests;

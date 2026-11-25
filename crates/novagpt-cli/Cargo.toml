@@ -13,7 +13,7 @@ path = "src/main.rs"
 novagpt-core = { path = "../novagpt-core" }
 novagpt-mcp = { path = "../novagpt-mcp" }
 novagpt-vm = { path = "../novagpt-vm" }
-novagpt-agents = { path = "../novagpt-agents" }
+novagpt-agents = { path = "../novagpt-agents", features = ["full"] }
 novagpt-browser = { path = "../novagpt-browser" }
 tokio.workspace = true
 clap.workspace = true
