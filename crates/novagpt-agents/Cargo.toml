@@ -10,7 +10,8 @@ default = []
 browser = ["dep:novagpt-browser"]
 workspaces = ["dep:novagpt-core"]
 vm = ["dep:novagpt-vm"]
-full = ["coding"]
+full = ["coding", "mcp-client"]
+mcp-client = ["dep:rmcp", "dep:serde", "dep:serde_json", "tokio/io-util"]
 # The existing workspace-aware browser/VM agent manager is opt-in.
 coding = [
     "workspaces",
@@ -38,6 +39,8 @@ uuid = { workspace = true, optional = true }
 async-trait.workspace = true
 base64 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
+# Use the cached official client, without its default server features.
+rmcp = { version = "3.11.0", default-features = false, features = ["client", "transport-async-rw"], optional = true }
 
 # Private restart metadata uses existing workspace dependencies.
 tempfile = { version = "3", optional = true }

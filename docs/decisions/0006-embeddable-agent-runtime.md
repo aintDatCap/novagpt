@@ -10,13 +10,14 @@ VM, browser, MCP server, or coding privileges.
   independent of the coding manager.
 - `browser`, `workspaces`, and `vm` expose optional existing components.
 - `coding` enables the existing workspace-aware agent manager and its
-  dependencies; `full` currently aliases it. CLI and MCP opt in explicitly.
+  dependencies; `full` enables it and the optional MCP client. CLI and MCP opt in explicitly.
 - Feature selection is a build-time dependency decision, not authorization.
   External tool capabilities must be checked at runtime.
 
 The existing coding manager still uses the existing browser/workspace/VM
-contract. Generic MCP tool dispatch, provider implementations, durable job
-persistence and isolated multi-client browser sessions are future slices;
+contract. The optional `mcp-client` feature offers bounded, allowlisted calls over an
+explicit caller-owned asynchronous transport. Provider implementations, durable
+job persistence and isolated multi-client browser sessions are future slices;
 the new runtime does not claim to implement them. Use authorized inference
 providers for automated consumers.
 

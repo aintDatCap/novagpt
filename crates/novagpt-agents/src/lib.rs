@@ -3,6 +3,9 @@
 
 pub mod runtime;
 
+#[cfg(feature = "mcp-client")]
+pub mod mcp_client;
+
 #[cfg(feature = "browser")]
 pub use novagpt_browser as browser;
 #[cfg(feature = "workspaces")]

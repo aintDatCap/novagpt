@@ -1556,6 +1556,7 @@ dependencies = [
  "novagpt-browser",
  "novagpt-core",
  "novagpt-vm",
+ "rmcp",
  "serde",
  "serde_json",
  "subtle",
