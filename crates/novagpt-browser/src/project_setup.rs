@@ -46,29 +46,50 @@ if (controls().some(e => /^(log in|sign in|accedi|iniciar sesi[oó]n)$/i.test(la
     && !document.querySelector('#prompt-textarea, [data-testid="prompt-textarea"]'))
     return {kind: 'authentication'};
 if (action === 'verify') {
+    // A sidebar entry alone does not establish that the current project page
+    // has loaded, especially when two projects have the same display name.
     const matchesHeading = [...document.querySelectorAll('h1, h2, h3, [role="heading"]')]
         .some(e => visible(e) && label(e) === name);
-    const matchesSidebar = [...document.querySelectorAll('aside *, nav *, [role="navigation"] *')]
-        .some(e => visible(e) && label(e) === name && e.children.length < 3);
-    return {kind: matchesHeading || matchesSidebar ? 'verified' : 'missing'};
+    return {kind: matchesHeading ? 'verified' : 'missing'};
 }
 if (action === 'existing') {
-    const link = controls().find(e => e.tagName === 'A'
-        && label(e) === name && (e.getAttribute('href') || '').includes('/g/g-p-'));
-    if (link) return {kind: 'link', href: link.href};
-    // Current ChatGPT project rows are clickable role=button divs outside
-    // older aside/nav containers. Prefer the row to hover-only chat actions.
-    const row = controls().find(e => e.getAttribute('role') === 'button'
-        && label(e) === name
-        && !e.closest('main, [role="main"], [role="dialog"]'));
-    if (row) return mark(row, 'entry');
-    const newChatLabels = ['New chat in ' + name, 'Nuova chat in ' + name];
-    const newChat = controls().find(e => newChatLabels.includes(label(e)));
-    if (newChat) return mark(newChat, 'new-chat');
-    const entry = [...document.querySelectorAll('aside div, nav div, [role="navigation"] div')]
-        .find(e => visible(e) && e.children.length < 3 && label(e) === name);
-    if (entry) return mark(entry, 'entry');
-    return {kind: 'missing'};
+    // Scope discovery and pagination to the Projects section, not the
+    // "Show more" buttons inside individual projects' conversation lists.
+    const header = controls().find(e => /^(projects|progetti)$/i.test(label(e))
+        && e.hasAttribute('data-app-action-sidebar-section-toggle'));
+    const section = header?.closest('[data-app-action-sidebar-section]');
+    if (!section) return {kind: 'missing'};
+    if (header.getAttribute('aria-expanded') === 'false')
+        return mark(header, 'expand-list');
+    if (header.getAttribute('aria-expanded') !== 'true')
+        return {kind: 'missing'};
+    const rowSelector = '[data-app-action-sidebar-project-row]';
+    const list = [...section.querySelectorAll('[role="list"]')]
+        .find(e => visible(e) && !e.closest('[data-sidebar-project-container-id]'));
+    if (!list || section.querySelector('[aria-busy="true"], [role="progressbar"]'))
+        return {kind: 'missing'};
+    const rows = [...list.querySelectorAll(rowSelector)].filter(visible);
+    const matches = rows.filter(e => e.getAttribute('data-app-action-sidebar-project-label') === name);
+    const ids = [...new Set(matches.map(e => e.getAttribute('data-app-action-sidebar-project-id')))];
+    if (ids.length > 1) return {kind: 'ambiguous'};
+    if (ids.some(id => !/^g-p-[A-Za-z0-9_-]{1,128}$/.test(id || '')))
+        return {kind: 'missing'};
+    const more = [...list.querySelectorAll('button')]
+        .find(e => visible(e) && e.closest('[role="list"]') === list
+            && !e.closest('[data-sidebar-project-container-id]')
+            && /^(show more|see more|mostra altro|mostra di pi[uù]|vedi altro)$/i.test(label(e)));
+    if (more) return mark(more, 'expand-list');
+    if (ids.length === 1)
+        return {kind: 'link', href: 'https://chatgpt.com/g/' + ids[0] + '/project'};
+    if (rows.some(e => !e.getAttribute('data-app-action-sidebar-project-label')
+        || !/^g-p-[A-Za-z0-9_-]{1,128}$/.test(e.getAttribute('data-app-action-sidebar-project-id') || '')))
+        return {kind: 'missing'};
+    // An empty skeleton can precede hydration. Only a recognized explicit
+    // empty state establishes absence when the list has no project rows.
+    if (!rows.length && ![...section.querySelectorAll('p, span, [role="status"]')]
+        .some(e => visible(e) && /^(no projects|no projects yet|nessun progetto)$/i.test(label(e))))
+        return {kind: 'missing'};
+    return {kind: 'absent'};
 }
 if (action === 'new-project' || action === 'projects-header') {
     const names = action === 'new-project'
@@ -224,8 +245,11 @@ pub(crate) async fn ensure(tab: &WebDriverTab, profile: &Path) -> Result<String,
     if tab.current_url().await.map_err(BrowserError::from)? != HOME {
         tab.goto(HOME).await.map_err(BrowserError::from)?;
     }
-    // Wait for client-side hydration and check existing projects first.
-    for _ in 0..8 {
+    // A partial or unrecognized sidebar is not evidence that the project
+    // does not exist. Require repeated complete-list observations before
+    // permitting creation, and never choose between duplicate names.
+    let mut absent_observations = 0;
+    for _ in 0..40 {
         let existing = inspect(tab, "existing").await?;
         check_manual(&existing)?;
         match kind(&existing) {
@@ -242,18 +266,25 @@ pub(crate) async fn ensure(tab: &WebDriverTab, profile: &Path) -> Result<String,
                 save(profile, &url).await;
                 return Ok(url);
             }
-            "new-chat" | "entry" => {
+            "ambiguous" => return Err(BrowserError::ProjectAmbiguous),
+            "expand-list" => {
+                absent_observations = 0;
                 click_marked(tab).await?;
-                if let Some(url) = opened_project(tab).await? {
-                    save(profile, &url).await;
-                    return Ok(url);
-                }
-                // An entry can expand on click. The next pass can find its
-                // newly visible "New chat in ..." button.
+                sleep(Duration::from_millis(750)).await;
+                continue;
             }
-            _ => {}
+            "absent" => {
+                absent_observations += 1;
+                if absent_observations >= 3 {
+                    break;
+                }
+            }
+            _ => absent_observations = 0,
         }
-        sleep(Duration::from_millis(300)).await;
+        sleep(Duration::from_millis(500)).await;
+    }
+    if absent_observations < 3 {
+        return Err(BrowserError::ProjectSetup);
     }
     let mut start = inspect(tab, "new-project").await?;
     check_manual(&start)?;
@@ -315,10 +346,10 @@ mod tests {
     #[test]
     fn project_name_and_ui_actions_are_narrowly_scoped() {
         assert_eq!(NAME, "NovaGPT - subagents");
-        assert!(PROJECT_UI.contains("New chat in "));
         assert!(PROJECT_UI.contains("add new project"));
-        assert!(PROJECT_UI.contains("e.getAttribute('role') === 'button'"));
-        assert!(PROJECT_UI.contains("!e.closest('main, [role=\"main\"], [role=\"dialog\"]')"));
+        assert!(PROJECT_UI.contains("data-app-action-sidebar-project-id"));
+        assert!(PROJECT_UI.contains("data-app-action-sidebar-section"));
+        assert!(PROJECT_UI.contains("e.closest('[role=\"list\"]') === list"));
         assert!(PROJECT_UI.contains("document.querySelectorAll"));
         assert!(!PROJECT_UI.contains("fetch("));
     }

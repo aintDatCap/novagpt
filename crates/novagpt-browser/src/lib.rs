@@ -151,6 +151,10 @@ pub enum BrowserError {
         "Could not verify or create the NovaGPT - subagents ChatGPT project; no subagent message was sent"
     )]
     ProjectSetup,
+    #[error(
+        "Multiple NovaGPT - subagents projects exist; configure the intended project URL. No prompt was sent"
+    )]
+    ProjectAmbiguous,
 }
 
 impl From<UpstreamError> for BrowserError {
@@ -2455,7 +2459,9 @@ mod tests {
         chat_url: String,
         project_ui_enabled: bool,
         project_exists: bool,
-        project_row_role_button: bool,
+        project_hidden: bool,
+        project_ambiguous: bool,
+        project_expansions: usize,
         project_ui_missing: bool,
         project_verification: bool,
         project_creations: usize,
@@ -2597,8 +2603,9 @@ mod tests {
             && path.ends_with("/click")
         {
             match state.project_pending.as_str() {
-                "new-chat" | "entry" => {
-                    state.url = "https://chatgpt.com/g/g-p-fixture/project".into()
+                "expand-list" => {
+                    state.project_hidden = false;
+                    state.project_expansions += 1;
                 }
                 "create-project" if state.project_draft == project_setup::NAME => {
                     state.project_exists = true;
@@ -2635,13 +2642,10 @@ mod tests {
                     "missing"
                 } else {
                     match action {
-                        "existing" if state.project_exists => {
-                            if state.project_row_role_button {
-                                "entry"
-                            } else {
-                                "new-chat"
-                            }
-                        }
+                        "existing" if state.project_ambiguous => "ambiguous",
+                        "existing" if state.project_hidden => "expand-list",
+                        "existing" if state.project_exists => "link",
+                        "existing" => "absent",
                         "new-project" if !state.project_exists => "control",
                         "name-input" | "create-project" if !state.project_exists => "control",
                         "verify"
@@ -2654,13 +2658,17 @@ mod tests {
                     }
                 };
                 state.project_pending = match action {
-                    "existing" if kind == "new-chat" || kind == "entry" => kind.into(),
+                    "existing" if kind == "expand-list" => kind.into(),
                     "new-project" if kind == "control" => "new-project".into(),
                     "name-input" if kind == "control" => "name-input".into(),
                     "create-project" if kind == "control" => "create-project".into(),
                     _ => String::new(),
                 };
-                json!({"kind":kind})
+                if kind == "link" {
+                    json!({"kind":kind,"href":"https://chatgpt.com/g/g-p-fixture/project"})
+                } else {
+                    json!({"kind":kind})
+                }
             } else if script.contains("assistant_count:assistants.length") {
                 state.polls += 1;
                 if state.polls <= state.initial_blank {
@@ -3073,22 +3081,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_subagent_project_opens_role_button_sidebar_row() {
+    async fn automatic_subagent_project_expands_paginated_sidebar() {
         let (port, state, server) = spawn_mock().await;
         {
             let mut mock = state.lock().await;
             mock.project_ui_enabled = true;
             mock.project_exists = true;
-            mock.project_row_role_button = true;
+            mock.project_hidden = true;
         }
         let browser = ChatGptBrowser::with_test_session(test_session(port).await);
         browser.inner.auto_project.store(true, Ordering::Relaxed);
         browser.open("agent-role-row").await.expect("project row");
         let mock = state.lock().await;
         assert_eq!(mock.project_creations, 0, "must not duplicate the project");
+        assert_eq!(mock.project_expansions, 1);
         assert_eq!(mock.handles.len(), 2);
         assert_eq!(mock.url, "https://chatgpt.com/g/g-p-fixture/project");
         drop(mock);
+        browser.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn automatic_project_rejects_duplicate_names_without_creating() {
+        let (port, state, server) = spawn_mock().await;
+        {
+            let mut mock = state.lock().await;
+            mock.project_ui_enabled = true;
+            mock.project_exists = true;
+            mock.project_ambiguous = true;
+        }
+        let browser = ChatGptBrowser::with_test_session(test_session(port).await);
+        browser.inner.auto_project.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            browser.open("agent-duplicate").await,
+            Err(BrowserError::ProjectAmbiguous)
+        ));
+        assert_eq!(state.lock().await.project_creations, 0);
+        assert_eq!(
+            browser
+                .diagnostics(Some("agent-duplicate"))
+                .await
+                .page_count,
+            0
+        );
         browser.shutdown().await;
         server.abort();
     }

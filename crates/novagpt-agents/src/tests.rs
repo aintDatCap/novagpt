@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::map_browser;
+use crate::backend::{map_browser, map_create_browser};
 use async_trait::async_trait;
 use novagpt_browser::BrowserError;
 use tokio::time::{Duration, timeout};
@@ -24,6 +24,22 @@ fn browser_failures_have_specific_safe_parent_messages() {
     );
     assert!(matches!(
         map_browser(BrowserError::Manual("verification")),
+        BackendFailure::Manual("verification")
+    ));
+}
+
+#[test]
+fn project_discovery_failure_cannot_be_a_submitted_assignment() {
+    assert!(matches!(
+        map_create_browser(BrowserError::Timeout),
+        BackendFailure::Blocked(_)
+    ));
+    assert!(matches!(
+        map_create_browser(BrowserError::ProjectAmbiguous),
+        BackendFailure::Blocked(_)
+    ));
+    assert!(matches!(
+        map_create_browser(BrowserError::Manual("verification")),
         BackendFailure::Manual("verification")
     ));
 }

@@ -62,7 +62,7 @@ impl AgentBackend for ChatGptBackend {
         "chatgpt-web"
     }
     async fn create(&self, id: &str) -> Result<(), BackendFailure> {
-        self.browser.open(id).await.map_err(map_browser)
+        self.browser.open(id).await.map_err(map_create_browser)
     }
     async fn send(
         &self,
@@ -98,6 +98,17 @@ impl AgentBackend for ChatGptBackend {
         serde_json::to_value(self.browser.diagnostics(Some(id)).await).unwrap_or_default()
     }
 }
+// Creation cannot have submitted the assignment. In particular a timeout
+// here must not leave the agent waiting for a callback that cannot arrive.
+pub(super) fn map_create_browser(error: BrowserError) -> BackendFailure {
+    match error {
+        BrowserError::Timeout | BrowserError::AmbiguousSubmission => {
+            BackendFailure::Blocked("ChatGPT browser setup timed out before prompt submission")
+        }
+        other => map_browser(other),
+    }
+}
+
 pub(super) fn map_browser(error: BrowserError) -> BackendFailure {
     match error {
         BrowserError::Manual(kind) => BackendFailure::Manual(kind),
@@ -125,7 +136,10 @@ pub(super) fn map_browser(error: BrowserError) -> BackendFailure {
             "ChatGPT left the designated subagent project; no message was sent outside it",
         ),
         BrowserError::ProjectSetup => BackendFailure::Blocked(
-            "Could not prepare the NovaGPT - subagents project; inspect the visible browser tab. No prompt was sent",
+            "Could not verify the NovaGPT - subagents project list or page; configure the intended project URL. No prompt was sent",
+        ),
+        BrowserError::ProjectAmbiguous => BackendFailure::Blocked(
+            "Multiple NovaGPT - subagents projects exist; configure the intended project URL. No prompt was sent",
         ),
         _ => BackendFailure::Unavailable,
     }
