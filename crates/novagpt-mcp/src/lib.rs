@@ -401,7 +401,14 @@ struct VmArgs {
     /// Enable virtio QEMU Guest Agent channel (guest package installed separately).
     #[serde(default)]
     guest_agent: Option<bool>,
-    /// Destructive SIGKILL fallback. false requests ACPI poweroff and fails on timeout.
+    /// Destructive SIGKILL fallback on Unix QEMU. false requests ACPI poweroff and fails on timeout.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "Stable MCP schema; force is only interpreted by the Unix QEMU backend"
+        )
+    )]
     #[serde(default)]
     force: Option<bool>,
 }
@@ -448,6 +455,14 @@ enum VmDesktopInputAction {
     Pointer,
 }
 
+// Keep the request schema identical on platforms where QMP input is unsupported.
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "Stable MCP schema; QMP desktop input is Unix-only"
+    )
+)]
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct VmDesktopInputArgs {
     id: String,

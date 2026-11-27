@@ -1124,6 +1124,7 @@ impl VmManager {
             "uefi-vars.fd",
             disk.as_str(),
         ];
+        #[cfg(unix)]
         let sockets = ["qga.sock", "qmp.sock", "display.sock"];
         let mut paths = Vec::new();
         for entry in fs::read_dir(&dir)? {
@@ -1687,6 +1688,12 @@ mod tests {
         #[cfg(not(unix))]
         {
             let mut permissions = fs::metadata(&base).unwrap().permissions();
+            // Clear the read-only attribute on the disposable non-Unix test file.
+            // Unix uses owner-only mode 0600 above, not set_readonly(false).
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Non-Unix test fixture only"
+            )]
             permissions.set_readonly(false);
             fs::set_permissions(&base, permissions).unwrap();
         }

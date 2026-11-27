@@ -35,6 +35,7 @@ pub struct WindowsInstallResult {
 
 /// Interpret libvirt's domiflist output conservatively: malformed output is
 /// not evidence that a VM has no network interface.
+#[cfg(any(target_os = "linux", test))]
 fn no_network_interfaces(output: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(output) else {
         return false;
@@ -292,7 +293,7 @@ impl VmManager {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = name;
-            return Err(VmError::Unsupported("Linux libvirt is required"));
+            Err(VmError::Unsupported("Linux libvirt is required"))
         }
         #[cfg(target_os = "linux")]
         {
