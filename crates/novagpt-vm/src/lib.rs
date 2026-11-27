@@ -263,7 +263,8 @@ impl VmManager {
             .truncate(false)
             .open(&lease_path)?;
         lease.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            // fs2 reports lock contention with a platform-specific OS error.
+            if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
                 VmError::Busy
             } else {
                 VmError::Io(error)

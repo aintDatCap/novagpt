@@ -123,7 +123,7 @@ impl VmManager {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn verify_disk(output: &str, disk: &std::path::Path) -> VmResult<()> {
     let disks: Vec<_> = output
         .lines()
@@ -197,7 +197,7 @@ async fn status(entry: &Entry, action: &'static str) -> VmResult<VmStatus> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

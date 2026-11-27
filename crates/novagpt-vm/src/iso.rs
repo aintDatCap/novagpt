@@ -273,6 +273,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         }
+        #[cfg(not(unix))]
+        {
+            // Clear the read-only attribute only on the disposable test ISO.
+            let mut permissions = fs::metadata(&target).unwrap().permissions();
+            #[expect(
+                clippy::permissions_set_readonly_false,
+                reason = "Non-Unix test fixture only"
+            )]
+            permissions.set_readonly(false);
+            fs::set_permissions(&target, permissions).unwrap();
+        }
         fs::write(&target, b"tampered-test-media").unwrap();
         assert!(matches!(
             manager.verified_iso("iso-test").await,
